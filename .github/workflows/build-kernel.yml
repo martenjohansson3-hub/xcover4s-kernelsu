@@ -1,4 +1,4 @@
-name: Build XCover4s KernelSU Next Manual Hooks
+name: Build XCover4s KernelSU Next
 
 on:
   workflow_dispatch:
@@ -36,11 +36,14 @@ jobs:
         working-directory: kernel
         run: |
           set -eux
-          echo "" >> arch/arm64/configs/lineage_xcover4s_defconfig
-          echo "# KernelSU Next" >> arch/arm64/configs/lineage_xcover4s_defconfig
-          echo "CONFIG_KSU=y" >> arch/arm64/configs/lineage_xcover4s_defconfig
 
-      - name: Apply official manual hooks
+          cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
+
+          # KernelSU Next
+          CONFIG_KSU=y
+          EOF
+
+      - name: Apply manual KernelSU hooks
         working-directory: kernel
         run: |
           set -eux
@@ -55,13 +58,12 @@ jobs:
               if old not in data:
                   raise SystemExit("PATCH TARGET NOT FOUND: " + path)
 
-              data = data.replace(old, new, 1)
-              p.write_text(data)
+              p.write_text(data.replace(old, new, 1))
               print("PATCHED:", path)
 
-          # ==========================================================
+          # =========================================================
           # fs/exec.c
-          # ==========================================================
+          # =========================================================
 
           patch(
               "fs/exec.c",
@@ -71,8 +73,9 @@ jobs:
           {""",
               """#ifdef CONFIG_KSU
           __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-          				void *argv, void *envp, int *flags);
+          extern int ksu_handle_execveat(int *fd,
+          	struct filename **filename_ptr,
+          	void *argv, void *envp, int *flags);
           #endif
 
           int do_execve(struct filename *filename,
@@ -87,28 +90,19 @@ jobs:
           	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
               """	struct user_arg_ptr envp = { .ptr.native = __envp };
           #ifdef CONFIG_KSU
-          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+          	{
+          		int ksu_fd = AT_FDCWD;
+          		int ksu_flags = 0;
+          		ksu_handle_execveat(&ksu_fd, &filename,
+          			&argv, &envp, &ksu_flags);
+          	}
           #endif
           	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
           )
 
-          # 32-bit compatibility path
-          old = """		.ptr.compat = __envp,
-          	};
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
-
-          new = """		.ptr.compat = __envp,
-          	};
-          #ifdef CONFIG_KSU
-          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-          #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
-
-          patch("fs/exec.c", old, new)
-
-          # ==========================================================
+          # =========================================================
           # fs/open.c
-          # ==========================================================
+          # =========================================================
 
           patch(
               "fs/open.c",
@@ -117,8 +111,8 @@ jobs:
               """#ifdef CONFIG_KSU
           __attribute__((hot))
           extern int ksu_handle_faccessat(int *dfd,
-          		const char __user **filename_user,
-          		int *mode, int *flags);
+          	const char __user **filename_user,
+          	int *mode, int *flags);
           #endif
 
           /*
@@ -139,9 +133,9 @@ jobs:
           	if (mode & ~S_IRWXO)"""
           )
 
-          # ==========================================================
+          # =========================================================
           # fs/read_write.c
-          # ==========================================================
+          # =========================================================
 
           patch(
               "fs/read_write.c",
@@ -150,8 +144,9 @@ jobs:
               """#ifdef CONFIG_KSU
           extern bool ksu_vfs_read_hook __read_mostly;
           extern __attribute__((cold)) int ksu_handle_sys_read(
-          		unsigned int fd, char __user **buf_ptr,
-          		size_t *count_ptr);
+          	unsigned int fd,
+          	char __user **buf_ptr,
+          	size_t *count_ptr);
           #endif
 
           SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
@@ -167,15 +162,16 @@ jobs:
 
           #ifdef CONFIG_KSU
           	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(fd, (char __user **)&buf, &count);
+          		ksu_handle_sys_read(fd,
+          			(char __user **)&buf, &count);
           #endif
 
           	if (f.file) {"""
           )
 
-          # ==========================================================
+          # =========================================================
           # fs/stat.c
-          # ==========================================================
+          # =========================================================
 
           patch(
               "fs/stat.c",
@@ -184,8 +180,8 @@ jobs:
               """#ifdef CONFIG_KSU
           __attribute__((hot))
           extern int ksu_handle_stat(int *dfd,
-          		const char __user **filename_user,
-          		int *flags);
+          	const char __user **filename_user,
+          	int *flags);
           #endif
 
           #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
@@ -208,9 +204,9 @@ jobs:
           	error = vfs_fstatat(dfd, filename, &stat, flag);"""
           )
 
-          # ==========================================================
+          # =========================================================
           # kernel/reboot.c
-          # ==========================================================
+          # =========================================================
 
           patch(
               "kernel/reboot.c",
@@ -218,8 +214,9 @@ jobs:
           		void __user *, arg)
           {""",
               """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1, int magic2,
-          		unsigned int cmd, void __user **arg);
+          extern int ksu_handle_sys_reboot(int magic1,
+          	int magic2, unsigned int cmd,
+          	void __user **arg);
           #endif
 
           SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
@@ -241,10 +238,10 @@ jobs:
           	/* We only trust the superuser with rebooting the system. */"""
           )
 
-          print("ALL MANUAL KERNELSU HOOKS APPLIED")
+          print("ALL KERNELSU HOOKS APPLIED")
           PY
 
-      - name: Verify source hooks
+      - name: Verify hooks
         working-directory: kernel
         run: |
           set -eux
@@ -278,15 +275,42 @@ jobs:
       - name: Build kernel
         working-directory: kernel
         run: |
-          set -eux
+          set +e
 
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error"
+            KCFLAGS="-Wno-error" \
+            > build.log 2>&1
 
-      - name: Final verification
+          RESULT=$?
+
+          echo
+          echo "===== BUILD RESULT: $RESULT ====="
+
+          echo
+          echo "===== POSSIBLE REAL ERRORS ====="
+          grep -iE \
+            "error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|FAILED|implicit declaration|undeclared" \
+            build.log | tail -150 || true
+
+          echo
+          echo "===== LAST 200 LINES ====="
+          tail -200 build.log
+
+          exit $RESULT
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-build-log
+          path: kernel/build.log
+          if-no-files-found: warn
+
+      - name: Verify finished KernelSU kernel
+        if: success()
         working-directory: kernel
         run: |
           set -eux
@@ -294,18 +318,18 @@ jobs:
           grep '^CONFIG_KSU=y' out/.config
           test -f out/arch/arm64/boot/Image
 
-          echo "===== KERNELSU SYMBOLS ====="
-          grep -i "kernelsu" out/System.map | head -20 || true
-          grep "ksu_handle_" out/System.map | head -20
+          echo "===== KSU SYMBOLS ====="
+          grep "ksu_handle_" out/System.map | head -30
 
           echo "===== IMAGE ====="
           ls -lh out/arch/arm64/boot/Image
           sha256sum out/arch/arm64/boot/Image
 
       - name: Upload finished kernel
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernelsu-next-manual
+          name: xcover4s-kernelsu-next
           path: |
             kernel/out/arch/arm64/boot/Image
             kernel/out/.config
