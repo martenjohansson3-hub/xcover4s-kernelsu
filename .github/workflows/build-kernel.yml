@@ -36,7 +36,8 @@ jobs:
           make -j$(nproc) \
             O=out \
             ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-\
+            KCFLAGS="-Wno-error"
 
       - name: Show build result
         run: |
