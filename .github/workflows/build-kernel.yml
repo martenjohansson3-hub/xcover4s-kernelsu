@@ -37,7 +37,7 @@ jobs:
             O=out \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu-\
-            KCFLAGS="-Wno-error"
+            KCFLAGS="-Wno-error -mno-outline-atomics"
 
       - name: Show build result
         run: |
