@@ -1,1 +1,28 @@
 
+name: Check XCover4s Kernel
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download kernel source
+        run: |
+          git clone --depth=1 -b lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+
+      - name: Find XCover4s configuration
+        run: |
+          echo "=== XCover4s configs ==="
+          find kernel/arch/arm64/configs -type f | grep -Ei "xcover|g398" || true
+
+          echo "=== Other relevant configs ==="
+          find kernel/arch/arm64/configs -type f | grep -Ei "7884|7885|lineage|universal" || true
+
+      - name: Kernel information
+        run: |
+          cd kernel
+          head -n 10 Makefile
