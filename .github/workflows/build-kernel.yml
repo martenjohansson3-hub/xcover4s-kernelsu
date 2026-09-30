@@ -37,8 +37,7 @@ jobs:
             O=out \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu-\
-            KCFLAGS="-Wno-error -mno-outline-atomics"
-
+            KCFLAGS="-Wno-error -mno-outline-atomics -Wno-error=psabi"
       - name: Show build result
         run: |
           echo "=== Kernel output ==="
