@@ -1,8 +1,10 @@
-name: Build XCover4s KernelSU Next
+name: Build XCover4s KernelSU Next Legacy
 
 on:
   workflow_dispatch:
   push:
+    paths:
+      - ".github/workflows/build-kernel.yml"
 
 jobs:
   build:
@@ -13,67 +15,95 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential bc bison flex libssl-dev libelf-dev \
-            clang lld gcc-aarch64-linux-gnu curl git
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            clang \
+            lld \
+            gcc-aarch64-linux-gnu \
+            curl \
+            git
 
       - name: Download kernel source
         run: |
-          git clone --depth=1 -b lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git clone \
+            --depth=1 \
+            --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
-      - name: Integrate KernelSU Next
+      - name: Integrate KernelSU Next Legacy
+        working-directory: kernel
         run: |
-          cd kernel
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          set -eux
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s legacy
 
-      - name: Enable KernelSU
+      - name: Configure kernel and enable KernelSU
+        working-directory: kernel
         run: |
-          cd kernel
-          mkdir -p out
-          make O=out \
-            ARCH=arm64 \
+          set -eux
+
+          make O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
-          ./scripts/config --file out/.config \
-            -e KSU
+          ./scripts/config --file out/.config -e KPROBES
+          ./scripts/config --file out/.config -e KPROBE_EVENTS
+          ./scripts/config --file out/.config -e EXT4_FS
+          ./scripts/config --file out/.config -e KSU_KPROBE_HOOKS
+          ./scripts/config --file out/.config -e KSU
 
-          make O=out \
-            ARCH=arm64 \
+          make O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          grep -E "CONFIG_KSU" out/.config || true
+          echo "===== KernelSU config check ====="
+          grep '^CONFIG_KPROBES=y' out/.config
+          grep '^CONFIG_KPROBE_EVENTS=y' out/.config
+          grep '^CONFIG_EXT4_FS=y' out/.config
+          grep '^CONFIG_KSU_KPROBE_HOOKS=y' out/.config
+          grep '^CONFIG_KSU=y' out/.config
 
       - name: Build KernelSU kernel
+        working-directory: kernel
         run: |
-          cd kernel
-          make -j$(nproc) \
-            O=out \
-            ARCH=arm64 \
+          set -eux
+          make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error"
 
       - name: Show build result
+        working-directory: kernel
         run: |
-          echo "=== KernelSU config ==="
-          grep -E "CONFIG_KSU" kernel/out/.config || true
-          echo "=== Kernel output ==="
-          find kernel/out/arch/arm64/boot -maxdepth 2 -type f -printf '%p %s bytes\n' || true
+          echo "===== FINAL KERNELSU CONFIG ====="
+          grep '^CONFIG_KPROBES=y' out/.config
+          grep '^CONFIG_KPROBE_EVENTS=y' out/.config
+          grep '^CONFIG_EXT4_FS=y' out/.config
+          grep '^CONFIG_KSU_KPROBE_HOOKS=y' out/.config
+          grep '^CONFIG_KSU=y' out/.config
+
+          echo
+          echo "===== KERNEL FILES ====="
+          ls -lh out/arch/arm64/boot/
 
       - name: Upload KernelSU kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernelsu-next
+          name: xcover4s-kernelsu-next-legacy
           path: |
             kernel/out/arch/arm64/boot/Image
             kernel/out/arch/arm64/boot/Image.gz
             kernel/out/arch/arm64/boot/Image.gz-dtb
             kernel/out/.config
-          if-no-files-found: error
+          if-no-files-found: warn
