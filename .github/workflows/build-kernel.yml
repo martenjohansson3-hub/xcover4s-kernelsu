@@ -1,4 +1,4 @@
-name: Build XCover4s Kernel
+name: Build XCover4s KernelSU Next
 
 on:
   workflow_dispatch:
@@ -14,14 +14,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison flex libssl-dev libelf-dev \
-            clang lld gcc-aarch64-linux-gnu
+            clang lld gcc-aarch64-linux-gnu curl git
 
       - name: Download kernel source
         run: |
           git clone --depth=1 -b lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
 
-      - name: Configure XCover4s
+      - name: Integrate KernelSU Next
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+
+      - name: Enable KernelSU
         run: |
           cd kernel
           mkdir -p out
@@ -32,7 +37,19 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
-      - name: Build kernel
+          ./scripts/config --file out/.config \
+            -e KSU
+
+          make O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          grep -E "CONFIG_KSU" out/.config || true
+
+      - name: Build KernelSU kernel
         run: |
           cd kernel
           make -j$(nproc) \
@@ -45,15 +62,18 @@ jobs:
 
       - name: Show build result
         run: |
+          echo "=== KernelSU config ==="
+          grep -E "CONFIG_KSU" kernel/out/.config || true
           echo "=== Kernel output ==="
           find kernel/out/arch/arm64/boot -maxdepth 2 -type f -printf '%p %s bytes\n' || true
 
-      - name: Upload kernel
+      - name: Upload KernelSU kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernel
+          name: xcover4s-kernelsu-next
           path: |
             kernel/out/arch/arm64/boot/Image
             kernel/out/arch/arm64/boot/Image.gz
             kernel/out/arch/arm64/boot/Image.gz-dtb
-          if-no-files-found: warn
+            kernel/out/.config
+          if-no-files-found: error
