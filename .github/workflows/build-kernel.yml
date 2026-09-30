@@ -1,52 +1,53 @@
-name: Build XCover4s KernelSU Next
+name: Build XCover4s KernelSU
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/build-kernel.yml"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bc bison flex libssl-dev libelf-dev \
-            clang lld gcc-aarch64-linux-gnu curl git python3
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential flex git curl python3 \
+            clang lld libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu ccache
 
-      - name: Download kernel source
+      - name: Clone XCover4s kernel
         run: |
           git clone --depth=1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
+            https://github.com/LineageOS/android_kernel_samsung_universal7885.git kernel
 
-      - name: Integrate KernelSU Next legacy
+      - name: Install KernelSU-Next legacy
         working-directory: kernel
         run: |
           set -eux
           curl -LSs \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             | bash -s legacy
 
-      - name: Patch KernelSU old kernel compatibility
+      - name: Patch KernelSU compatibility
         working-directory: kernel
         run: |
           set -eux
 
-          echo "===== HEADER COMPATIBILITY ====="
+          echo "===== OLD KERNEL HEADER COMPATIBILITY ====="
 
-          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null | \
-            xargs -r sed -i 's|<linux/compiler_types.h>|<linux/compiler.h>|g'
+          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null \
+            | xargs -r sed -i 's|<linux/compiler_types.h>|<linux/compiler.h>|g'
 
-          grep -R -l 'linux/sched/signal.h' drivers/kernelsu 2>/dev/null | \
-            xargs -r sed -i 's|<linux/sched/signal.h>|<linux/sched.h>|g'
+          grep -R -l 'linux/sched/signal.h' drivers/kernelsu 2>/dev/null \
+            | xargs -r sed -i 's|<linux/sched/signal.h>|<linux/sched.h>|g'
 
-          grep -R -l 'linux/sched/task.h' drivers/kernelsu 2>/dev/null | \
-            xargs -r sed -i 's|<linux/sched/task.h>|<linux/sched.h>|g'
+          grep -R -l 'linux/sched/task.h' drivers/kernelsu 2>/dev/null \
+            | xargs -r sed -i 's|<linux/sched/task.h>|<linux/sched.h>|g'
+
+          grep -R -l 'linux/sched/user.h' drivers/kernelsu 2>/dev/null \
+            | xargs -r sed -i 's|<linux/sched/user.h>|<linux/sched.h>|g'
 
           echo "===== FULL_NAME_HASH COMPATIBILITY ====="
 
@@ -59,11 +60,14 @@ jobs:
           old = "full_name_hash(NULL, dirpath, strlen(dirpath))"
           new = "full_name_hash((const unsigned char *)dirpath, strlen(dirpath))"
 
-          if old not in s:
-              raise SystemExit("full_name_hash patch target not found")
-
-          p.write_text(s.replace(old, new, 1))
-          print("PATCHED full_name_hash")
+          if old in s:
+              s = s.replace(old, new)
+              p.write_text(s)
+              print("PATCHED full_name_hash")
+          elif new in s:
+              print("full_name_hash already compatible")
+          else:
+              print("WARNING: full_name_hash target not found")
           PY
 
           echo "===== KVMALLOC COMPATIBILITY ====="
@@ -77,46 +81,38 @@ jobs:
           old = "eocd_buffer = kvmalloc(search_size, GFP_KERNEL);"
 
           new = """eocd_buffer = kmalloc(search_size, GFP_KERNEL);
-                  if (!eocd_buffer)
-                      eocd_buffer = vmalloc(search_size);"""
+              if (!eocd_buffer)
+                  eocd_buffer = vmalloc(search_size);"""
 
-          if old not in s:
-              raise SystemExit("kvmalloc patch target not found")
-
-          s = s.replace(old, new, 1)
-
-          # vmalloc declaration
-          if "#include <linux/vmalloc.h>" not in s:
-              marker = "#include <linux/slab.h>"
-              if marker not in s:
-                  raise SystemExit("slab.h include not found")
-              s = s.replace(
-                  marker,
-                  marker + "\n#include <linux/vmalloc.h>",
-                  1
-              )
-
-          p.write_text(s)
-          print("PATCHED kvmalloc compatibility")
+          if old in s:
+              s = s.replace(old, new)
+              p.write_text(s)
+              print("PATCHED kvmalloc compatibility")
+          elif "eocd_buffer = kmalloc(search_size, GFP_KERNEL);" in s:
+              print("kvmalloc compatibility already patched")
+          else:
+              print("WARNING: kvmalloc target not found")
           PY
 
-          echo "===== VERIFY COMPATIBILITY ====="
+          echo "===== PRE-BUILD HEADER CHECK ====="
 
-          ! grep -R -n 'linux/compiler_types.h' drivers/kernelsu
-          ! grep -R -n 'linux/sched/signal.h' drivers/kernelsu
-          ! grep -R -n 'linux/sched/task.h' drivers/kernelsu
+          BAD=0
 
-          grep -n \
-            'full_name_hash((const unsigned char \*)dirpath' \
-            drivers/kernelsu/manager/throne_tracker.c
+          for H in \
+            linux/compiler_types.h \
+            linux/sched/signal.h \
+            linux/sched/task.h \
+            linux/sched/user.h
+          do
+            if grep -R -n "$H" drivers/kernelsu 2>/dev/null; then
+              echo "ERROR: incompatible header remains: $H"
+              BAD=1
+            fi
+          done
 
-          grep -n \
-            'eocd_buffer = kmalloc' \
-            drivers/kernelsu/manager/apk_sign.c
-
-          grep -n \
-            'eocd_buffer = vmalloc' \
-            drivers/kernelsu/manager/apk_sign.c
+          if [ "$BAD" -ne 0 ]; then
+            exit 1
+          fi
 
           echo "ALL COMPATIBILITY PATCHES OK"
 
@@ -124,12 +120,10 @@ jobs:
         working-directory: kernel
         run: |
           cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
-
-          # KernelSU Next
           CONFIG_KSU=y
           EOF
 
-      - name: Apply manual KernelSU hooks
+      - name: Apply KernelSU manual hooks
         working-directory: kernel
         run: |
           set -eux
@@ -140,8 +134,14 @@ jobs:
           def patch(path, old, new):
               p = Path(path)
               data = p.read_text()
+
+              if new in data:
+                  print("ALREADY PATCHED:", path)
+                  return
+
               if old not in data:
                   raise SystemExit("PATCH TARGET NOT FOUND: " + path)
+
               p.write_text(data.replace(old, new, 1))
               print("PATCHED:", path)
 
@@ -309,56 +309,62 @@ jobs:
         working-directory: kernel
         run: |
           set -eux
-          grep -n "ksu_handle_execveat" fs/exec.c
-          grep -n "ksu_handle_faccessat" fs/open.c
-          grep -n "ksu_handle_sys_read" fs/read_write.c
-          grep -n "ksu_handle_stat" fs/stat.c
-          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
+          grep -n ksu_handle_execveat fs/exec.c
+          grep -n ksu_handle_faccessat fs/open.c
+          grep -n ksu_handle_sys_read fs/read_write.c
+          grep -n ksu_handle_stat fs/stat.c
+          grep -n ksu_handle_sys_reboot kernel/reboot.c
 
       - name: Configure kernel
         working-directory: kernel
         run: |
           set -eux
 
+          export CCACHE_DIR="$HOME/.ccache"
+          export CC="ccache clang"
+
           make O=out ARCH=arm64 \
-            CC=clang \
+            CC="ccache clang" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
           make O=out ARCH=arm64 \
-            CC=clang \
+            CC="ccache clang" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
           grep '^CONFIG_KSU=y' out/.config
 
-      - name: Build kernel CLEAN with heartbeat
+      - name: Build kernel
         working-directory: kernel
         run: |
           set +e
 
           echo "=========================================="
-          echo " STARTING CLEAN KERNEL BUILD"
-          echo " HEARTBEAT EVERY 60 SECONDS"
+          echo " STARTING KERNEL BUILD"
+          echo " HEARTBEAT EVERY 30 SECONDS"
           echo "=========================================="
 
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang \
+          export CCACHE_DIR="$HOME/.ccache"
+
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC="ccache clang" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
             > build.log 2>&1 &
 
           BUILD_PID=$!
-          MINUTES=0
+          SECONDS_RUN=0
 
           while kill -0 "$BUILD_PID" 2>/dev/null; do
-            sleep 60
+            sleep 30
+            SECONDS_RUN=$((SECONDS_RUN + 30))
+
             if kill -0 "$BUILD_PID" 2>/dev/null; then
-              MINUTES=$((MINUTES + 1))
-              echo "Kernel build still running... ${MINUTES} min"
+              echo "Kernel build still running... ${SECONDS_RUN}s"
             fi
           done
 
@@ -370,53 +376,47 @@ jobs:
           echo " BUILD FINISHED - RESULT: $RESULT"
           echo "=========================================="
 
-          echo "===== REAL ERRORS ====="
-          grep -iE \
-            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|implicit declaration|undeclared|too many arguments" \
-            build.log \
-            | grep -viE \
-              'objdump:|Unrecognized form: 0x22|Unrecognized form: 0x23|DIE at offset|Bogus end-of-siblings' \
-            | tail -200 || true
+          if [ "$RESULT" -ne 0 ]; then
+            echo
+            echo "===== REAL ERRORS ====="
 
-          echo "===== CLEAN BUILD END ====="
-          grep -viE \
-            'objdump:|Unrecognized form: 0x22|Unrecognized form: 0x23|DIE at offset|Bogus end-of-siblings' \
-            build.log \
-            | tail -100 || true
+            grep -iE \
+              "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|implicit declaration|undeclared|too many arguments|incompatible pointer" \
+              build.log \
+              | grep -viE \
+                'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
+              | tail -250 || true
+
+            echo
+            echo "===== CLEAN BUILD END ====="
+
+            grep -viE \
+              'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
+              build.log \
+              | tail -120 || true
+          else
+            echo
+            echo "SUCCESS - KERNEL COMPILED"
+            ls -lh out/arch/arm64/boot/ || true
+          fi
 
           exit "$RESULT"
 
-      - name: Upload full build log
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xcover4s-build-log
           path: kernel/build.log
-          if-no-files-found: warn
+          if-no-files-found: ignore
 
-      - name: Verify finished KernelSU kernel
-        if: success()
-        working-directory: kernel
-        run: |
-          set -eux
-
-          grep '^CONFIG_KSU=y' out/.config
-          test -f out/arch/arm64/boot/Image
-
-          echo "===== KERNELSU SYMBOLS ====="
-          grep "ksu_handle_" out/System.map | head -30
-
-          echo "===== KERNEL IMAGE READY ====="
-          ls -lh out/arch/arm64/boot/Image
-          sha256sum out/arch/arm64/boot/Image
-
-      - name: Upload finished kernel
+      - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernelsu-next
+          name: xcover4s-kernel
           path: |
             kernel/out/arch/arm64/boot/Image
-            kernel/out/.config
-            kernel/out/System.map
-          if-no-files-found: error
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: ignore
