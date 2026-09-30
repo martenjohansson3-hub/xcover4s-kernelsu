@@ -13,12 +13,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential bc bison flex libssl-dev \
-            libelf-dev gcc-aarch64-linux-gnu
-
-      - name: Download GCC 4.9 toolchain
-        run: |
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc49
+            build-essential bc bison flex libssl-dev libelf-dev \
+            clang lld gcc-aarch64-linux-gnu
 
       - name: Download kernel source
         run: |
@@ -31,7 +27,9 @@ jobs:
           mkdir -p out
           make O=out \
             ARCH=arm64 \
-            CROSS_COMPILE=$GITHUB_WORKSPACE/gcc49/bin/aarch64-linux-android- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
       - name: Build kernel
@@ -40,7 +38,9 @@ jobs:
           make -j$(nproc) \
             O=out \
             ARCH=arm64 \
-            CROSS_COMPILE=$GITHUB_WORKSPACE/gcc49/bin/aarch64-linux-android- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error"
 
       - name: Show build result
