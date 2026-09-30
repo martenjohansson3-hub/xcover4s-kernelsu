@@ -1,170 +1,639 @@
-Kernel build still running... 30s
-Kernel build still running... 60s
-Kernel build still running... 90s
-Kernel build still running... 120s
-Kernel build still running... 150s
-Kernel build still running... 180s
-Kernel build still running... 210s
-Kernel build still running... 240s
-Kernel build still running... 270s
-Kernel build still running... 300s
-Kernel build still running... 330s
-Kernel build still running... 360s
-Kernel build still running... 390s
-Kernel build still running... 420s
-Kernel build still running... 450s
-Kernel build still running... 480s
-Kernel build still running... 510s
-Kernel build still running... 540s
-==========================================
- BUILD FINISHED - RESULT: 2
-==========================================
-===== REAL ERRORS =====
-../drivers/kernelsu/policy/allowlist.c:454:23: warning: incompatible pointer types passing 'u32 *' (aka 'unsigned int *') to parameter of type 'const char *' [-Wincompatible-pointer-types]
-../drivers/kernelsu/policy/allowlist.c:459:23: warning: incompatible pointer types passing 'u32 *' (aka 'unsigned int *') to parameter of type 'const char *' [-Wincompatible-pointer-types]
-../drivers/kernelsu/policy/allowlist.c:475:30: warning: incompatible pointer types passing 'struct app_profile *' to parameter of type 'const char *' [-Wincompatible-pointer-types]
-../drivers/kernelsu/feature/adb_root.c:80:29: error: implicit declaration of function 'ALIGN_DOWN' [-Werror,-Wimplicit-function-declaration]
-make[3]: *** [../scripts/Makefile.build:280: drivers/kernelsu/feature/adb_root.o] Error 1
-make[2]: *** [../scripts/Makefile.build:487: drivers/kernelsu] Error 2
-make[1]: *** [/home/runner/work/xcover4s-kernelsu/xcover4s-kernelsu/kernel/Makefile:1068: drivers] Error 2
-make: *** [Makefile:152: sub-make] Error 2
-===== CLEAN BUILD END =====
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v3_11_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v3_1_1/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v3_20_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v4_0_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v4_3_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v5_10_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v5_15_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v5_2_0/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/setup-fimc-is.o
-  CC      drivers/media/platform/exynos/mfc/s5p_mfc_buf.o
-  CC      drivers/media/platform/exynos/fimc-is2/hardware/fimc-is-hw-mcscaler-v2.o
-  LD      drivers/media/platform/exynos/fimc-is2/interface/built-in.o
-  CC      drivers/media/platform/exynos/smfc/smfc.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/setup-fimc-is-sensor.o
-  CC      drivers/media/platform/exynos/mfc/s5p_mfc_utils.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-hw-pwr.o
-  CC      drivers/media/platform/exynos/fimc-is2/hardware/fimc-is-hw-tdnr-v2.o
-  CC      drivers/media/platform/exynos/smfc/smfc-v4l2-ioctls.o
-  CC      drivers/media/platform/exynos/mfc/s5p_mfc_qos.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-hw-chain.o
-  CC      drivers/media/platform/exynos/smfc/smfc-regs.o
-  CC      drivers/media/platform/exynos/fimc-is2/hardware/api/fimc-is-hw-api-common.o
-  CC      drivers/media/platform/exynos/mfc/s5p_mfc_mem.o
-  CC      drivers/media/platform/exynos/fimc-is2/hardware/api/fimc-is-hw-api-vra.o
-  CC      drivers/media/platform/exynos/smfc/smfc-stream-parser.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-hw-dvfs.o
-  CC      drivers/media/platform/exynos/mfc/s5p_mfc_debugfs.o
-  CC      drivers/media/platform/exynos/fimc-is2/hardware/api/fimc-is-hw-api-mcscaler-v420.o
-  LD      drivers/media/platform/exynos/smfc/built-in.o
-  CC      drivers/media/v4l2-core/v4l2-dev.o
-  LD      drivers/media/platform/exynos/mfc/s5p-mfc.o
-  LD      drivers/media/platform/exynos/mfc/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-3aa.o
-  CC      drivers/media/v4l2-core/v4l2-ioctl.o
-  LD      drivers/media/platform/exynos/fimc-is2/hardware/api/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/hardware/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/fimc-is-helper-i2c.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-3ac.o
-  CC      drivers/media/media-device.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/csi2/fimc-is-hw-csi-v5_0.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-3ap.o
-  CC      drivers/media/v4l2-core/v4l2-device.o
-  CC      drivers/media/media-devnode.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/csi2/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-interface-sensor.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-isp.o
-  CC      drivers/media/media-entity.o
-  CC      drivers/media/v4l2-core/v4l2-fh.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-ixc.o
-  CC      drivers/media/v4l2-core/v4l2-event.o
-  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-vender.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-interface-actuator.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-ixp.o
-  CC      drivers/media/v4l2-core/v4l2-ctrls.o
-  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-sec-define.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-control-sensor.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-mcs.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-control-actuator.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-mcsp.o
-  CC      drivers/media/v4l2-core/v4l2-subdev.o
-  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/crc32.o
-  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-sysfs.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-device-sensor-peri.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-vra.o
-  CC      drivers/media/v4l2-core/v4l2-clk.o
-  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-device-eeprom.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor.o
-  CC      drivers/media/v4l2-core/v4l2-async.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/actuator/fimc-is-helper-actuator-i2c.o
-  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-sec-util.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc0.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/actuator/fimc-is-actuator-zc535.o
-  CC      drivers/media/v4l2-core/v4l2-compat-ioctl32.o
-  LD      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/vendor/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/fimc-is.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc1.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/actuator/built-in.o
-  CC      drivers/media/v4l2-core/v4l2-of.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc2.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis-5e9.o
-  CC      drivers/media/m2m1shot.o
-  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc3.o
-  CC      drivers/media/m2m1shot-helper.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis-2p6.o
-  CC      drivers/media/v4l2-core/vb2-trace.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/ischain/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/flash/fimc-is-flash-gpio.o
-  CC      drivers/media/v4l2-core/v4l2-trace.o
-  CC      drivers/media/m2m1shot2.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/built-in.o
-  CC      drivers/media/v4l2-core/v4l2-common.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/flash/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/iris/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/fimc-is-device-module-base.o
-  CC      drivers/media/v4l2-core/v4l2-dv-timings.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/ois/built-in.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/fimc-is-device-module-5e9.o
-  CC      drivers/media/v4l2-core/v4l2-mem2mem.o
-  CC      drivers/media/v4l2-core/videobuf2-core.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/pdp/built-in.o
-  LD      drivers/media/media.o
-  CC      drivers/media/v4l2-core/videobuf2-v4l2.o
-  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/fimc-is-device-module-2p6.o
-  CC      drivers/media/v4l2-core/videobuf2-memops.o
-  CC      drivers/media/v4l2-core/videobuf2-ion.o
-  LD      drivers/media/v4l2-core/videodev.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/sensor/built-in.o
-  LD      drivers/media/platform/exynos/fimc-is2/built-in.o
-  LD      drivers/media/platform/exynos/built-in.o
-  LD      drivers/media/platform/built-in.o
-  LD      drivers/media/v4l2-core/built-in.o
-  LD      drivers/media/built-in.o
-make[1]: *** [/home/runner/work/xcover4s-kernelsu/xcover4s-kernelsu/kernel/Makefile:1068: drivers] Error 2
-make[1]: Leaving directory '/home/runner/work/xcover4s-kernelsu/xcover4s-kernelsu/kernel/out'
-make: *** [Makefile:152: sub-make] Error 2
-Error: Process completed with exit code 2.
-1s
-Run actions/upload-artifact@v4
-(node:40904) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
-(Use `node --trace-deprecation ...` to show where the warning was created)
-With the provided path, there will be 1 file uploaded
-Artifact name is valid!
-Root directory input is valid!
-Beginning upload of artifact content to blob storage
-(node:40904) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
-Uploaded bytes 179289
-Finished uploading artifact content to blob storage!
-SHA256 digest of uploaded artifact zip is 48a337a9f76f521a3b1f85efff69c29ce2aea648a7e4c4d1604a1408f8150e1b
-Finalizing artifact upload
-Artifact xcover4s-build-log.zip successfully finalized. Artifact ID 11124056106
-Artifact xcover4s-build-log has been successfully uploaded! Final size is 179289 bytes. Artifact ID is 11124056106
-Artifact download URL: https://github.com/martenjohansson3-hub/xcover4s-kernelsu/actions/runs/36770082702/artifacts/11124056106
-0s
-0s
+name: XCover4s KernelSU Next Build + Diagnostics
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: System information
+        run: |
+          set -x
+          uname -a
+          lsb_release -a || true
+          df -h
+          free -h
+          nproc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            clang \
+            curl \
+            flex \
+            gcc-aarch64-linux-gnu \
+            git \
+            libelf-dev \
+            libssl-dev \
+            lld \
+            python3
+
+      - name: Show compiler versions
+        run: |
+          echo "===== GCC ====="
+          aarch64-linux-gnu-gcc --version || true
+
+          echo "===== CLANG ====="
+          clang --version || true
+
+          echo "===== LLD ====="
+          ld.lld --version || true
+
+          echo "===== MAKE ====="
+          make --version || true
+
+      - name: Clone XCover4s kernel
+        run: |
+          git clone --depth=1 --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+
+          cd kernel
+
+          echo "===== KERNEL COMMIT ====="
+          git log -1 --oneline
+
+          echo "===== TOP LEVEL ====="
+          ls -la
+
+          echo "===== DEFCONFIG SEARCH ====="
+          find arch/arm64/configs -maxdepth 1 -type f | sort | grep -i xcover || true
+
+      - name: Install KernelSU Next legacy
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          rm -rf KernelSU-Next drivers/kernelsu
+
+          git clone --depth=1 \
+            --branch v3.4.0-legacy \
+            https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+
+          echo "===== KERNELSU COMMIT ====="
+          cd KernelSU-Next
+          git log -1 --oneline
+          cd ..
+
+          cp -a KernelSU-Next/kernel drivers/kernelsu
+
+          echo "===== KERNELSU FILES ====="
+          find drivers/kernelsu -maxdepth 2 -type f | sort | head -200
+
+      - name: Apply old-kernel compatibility fixes
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== BEFORE PATCHES ====="
+
+          grep -R -n "full_name_hash" drivers/kernelsu || true
+          grep -R -n "kvmalloc" drivers/kernelsu || true
+          grep -R -n "ALIGN_DOWN" drivers/kernelsu || true
+
+          # ----------------------------------------------------------
+          # Old kernel full_name_hash() compatibility
+          #
+          # Newer kernels:
+          # full_name_hash(salt, name, len)
+          #
+          # This Samsung kernel uses the older:
+          # full_name_hash(name, len)
+          # ----------------------------------------------------------
+
+          grep -RIl 'full_name_hash([^,]*,[^,]*,[^,]*)' drivers/kernelsu \
+            | while read -r f; do
+                sed -E -i \
+                  's/full_name_hash\([^,]+,[[:space:]]*([^,]+),[[:space:]]*([^)]+)\)/full_name_hash(\1, \2)/g' \
+                  "$f" || true
+              done
+
+          # Known KernelSU usage.
+          sed -i \
+            's/full_name_hash(NULL, name, len)/full_name_hash(name, len)/g' \
+            drivers/kernelsu/*.c 2>/dev/null || true
+
+          sed -i \
+            's/full_name_hash(NULL, name, strlen(name))/full_name_hash(name, strlen(name))/g' \
+            drivers/kernelsu/*.c 2>/dev/null || true
+
+          # ----------------------------------------------------------
+          # kvmalloc() compatibility
+          #
+          # Older Samsung kernel doesn't provide kvmalloc.
+          # vmalloc is adequate for the KernelSU buffer here.
+          # ----------------------------------------------------------
+
+          if grep -R -q '\bkvmalloc(' drivers/kernelsu; then
+            grep -RIl '\bkvmalloc(' drivers/kernelsu | while read -r f; do
+              sed -i 's/\bkvmalloc(/vmalloc(/g' "$f"
+
+              if ! grep -q 'linux/vmalloc.h' "$f"; then
+                sed -i '1i#include <linux/vmalloc.h>' "$f"
+              fi
+            done
+          fi
+
+          # ----------------------------------------------------------
+          # ALIGN_DOWN compatibility
+          #
+          # The diagnostic build showed:
+          #
+          # adb_root.c:
+          # implicit declaration of function ALIGN_DOWN
+          #
+          # Provide it only when the old kernel does not.
+          # ----------------------------------------------------------
+
+          ADBROOT="drivers/kernelsu/feature/adb_root.c"
+
+          if [ -f "$ADBROOT" ]; then
+            if grep -q 'ALIGN_DOWN' "$ADBROOT"; then
+              if ! grep -q '#define ALIGN_DOWN' "$ADBROOT"; then
+
+                sed -i '1i\
+          #ifndef ALIGN_DOWN\
+          #define ALIGN_DOWN(x, a) ALIGN((x) - ((a) - 1), (a))\
+          #endif\
+          ' "$ADBROOT"
+
+              fi
+            fi
+          fi
+
+          echo "===== AFTER PATCHES ====="
+
+          echo "--- full_name_hash ---"
+          grep -R -n "full_name_hash" drivers/kernelsu || true
+
+          echo "--- kvmalloc ---"
+          grep -R -n "kvmalloc" drivers/kernelsu || true
+
+          echo "--- vmalloc ---"
+          grep -R -n "vmalloc" drivers/kernelsu || true
+
+          echo "--- ALIGN_DOWN ---"
+          grep -R -n "ALIGN_DOWN" drivers/kernelsu || true
+
+      - name: Add KernelSU to kernel build system
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          if ! grep -q 'kernelsu/' drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            sed -i '/endmenu/i\
+          source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+
+          echo "===== DRIVERS MAKEFILE ====="
+          tail -30 drivers/Makefile
+
+          echo "===== KCONFIG KSU ====="
+          grep -n -C3 kernelsu drivers/Kconfig || true
+
+      - name: Inspect KernelSU hooks
+        working-directory: kernel
+        run: |
+          echo "=========================================="
+          echo " KERNELSU HOOK DIAGNOSTICS"
+          echo "=========================================="
+
+          echo "===== exec hooks ====="
+          grep -R -n \
+            "ksu_handle_execve\|ksu_handle_execveat" \
+            fs kernel security drivers/kernelsu 2>/dev/null || true
+
+          echo "===== vfs hooks ====="
+          grep -R -n \
+            "ksu_handle_vfs_read\|ksu_handle_vfs_write\|ksu_handle_stat" \
+            fs kernel security drivers/kernelsu 2>/dev/null || true
+
+          echo "===== input hooks ====="
+          grep -R -n \
+            "ksu_handle_input_handle_event" \
+            drivers input fs security 2>/dev/null || true
+
+          echo "===== KernelSU symbols ====="
+          grep -R -n \
+            "ksu_handle_" \
+            drivers/kernelsu | head -200 || true
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          rm -rf out
+          mkdir -p out
+
+          make O=out lineage_xcover4s_defconfig
+
+          echo "CONFIG_KSU=y" >> out/.config
+
+          make O=out olddefconfig
+
+          echo "=========================================="
+          echo " CONFIG DIAGNOSTICS"
+          echo "=========================================="
+
+          grep '^CONFIG_KSU' out/.config || true
+
+          echo "===== CONFIG INFO ====="
+          grep -E \
+            'CONFIG_(ARM64|KSU|MODULES|SECURITY|KALLSYMS|OVERLAY_FS|TMPFS)' \
+            out/.config || true
+
+          cp out/.config kernel-config.txt
+
+      - name: Pre-build source diagnostics
+        working-directory: kernel
+        run: |
+          {
+            echo "=========================================="
+            echo " XCover4s PRE-BUILD DIAGNOSTICS"
+            echo "=========================================="
+
+            echo
+            echo "===== DATE ====="
+            date
+
+            echo
+            echo "===== KERNEL VERSION ====="
+            make kernelversion || true
+
+            echo
+            echo "===== COMPILER ====="
+            aarch64-linux-gnu-gcc --version || true
+
+            echo
+            echo "===== ALIGN_DOWN DEFINITIONS ====="
+            grep -R -n \
+              '#define ALIGN_DOWN' \
+              include drivers/kernelsu 2>/dev/null || true
+
+            echo
+            echo "===== ALIGN_DOWN USAGE ====="
+            grep -R -n \
+              'ALIGN_DOWN' \
+              drivers/kernelsu 2>/dev/null || true
+
+            echo
+            echo "===== FULL_NAME_HASH ====="
+            grep -R -n \
+              'full_name_hash' \
+              drivers/kernelsu include/linux 2>/dev/null || true
+
+            echo
+            echo "===== KVMALLOC ====="
+            grep -R -n \
+              'kvmalloc' \
+              drivers/kernelsu 2>/dev/null || true
+
+            echo
+            echo "===== VMALLOC ====="
+            grep -R -n \
+              'vmalloc' \
+              drivers/kernelsu 2>/dev/null || true
+
+            echo
+            echo "===== KSU CONFIG ====="
+            grep CONFIG_KSU out/.config || true
+
+            echo
+            echo "===== KSU MAKEFILE ====="
+            cat drivers/kernelsu/Makefile || true
+
+            echo
+            echo "===== KSU KCONFIG ====="
+            head -100 drivers/kernelsu/Kconfig || true
+
+          } | tee prebuild-diagnostics.txt
+
+      - name: Build kernel with heartbeat
+        working-directory: kernel
+        shell: bash
+        run: |
+          set +e
+
+          echo "=========================================="
+          echo " STARTING KERNEL BUILD"
+          echo " HEARTBEAT EVERY 30 SECONDS"
+          echo "=========================================="
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          BUILD_LOG="$PWD/build.log"
+
+          (
+            make \
+              O=out \
+              ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              KCFLAGS="-Wno-error" \
+              -j"$(nproc)" \
+              2>&1
+
+            echo "${PIPESTATUS[0]}" > build-result.txt
+          ) | tee "$BUILD_LOG" &
+
+          BUILD_PID=$!
+
+          SECONDS_RUNNING=0
+
+          while kill -0 "$BUILD_PID" 2>/dev/null; do
+            sleep 30
+            SECONDS_RUNNING=$((SECONDS_RUNNING + 30))
+            echo "Kernel build still running... ${SECONDS_RUNNING}s"
+          done
+
+          wait "$BUILD_PID"
+          PIPE_RESULT=$?
+
+          if [ -f build-result.txt ]; then
+            RESULT=$(cat build-result.txt)
+          else
+            RESULT=$PIPE_RESULT
+          fi
+
+          echo
+          echo "=========================================="
+          echo " BUILD FINISHED - RESULT: $RESULT"
+          echo "=========================================="
+
+          echo "$RESULT" > final-build-result.txt
+
+          # Do not fail here.
+          # Diagnostics and artifacts must still run.
+          exit 0
+
+      - name: Analyze build result
+        if: always()
+        working-directory: kernel
+        shell: bash
+        run: |
+          set +e
+
+          echo "==========================================" | tee build-summary.txt
+          echo " XCover4s BUILD ANALYSIS" | tee -a build-summary.txt
+          echo "==========================================" | tee -a build-summary.txt
+
+          if [ -f final-build-result.txt ]; then
+            echo "Build result: $(cat final-build-result.txt)" \
+              | tee -a build-summary.txt
+          else
+            echo "Build result file missing" \
+              | tee -a build-summary.txt
+          fi
+
+          echo "" | tee -a build-summary.txt
+          echo "===== REAL ERRORS =====" \
+            | tee -a build-summary.txt
+
+          if [ -f build.log ]; then
+            grep -iE \
+              '(^|[ :])(fatal error:|error:|undefined reference|implicit declaration|No such file|Error [0-9]+|FAILED)' \
+              build.log \
+              | tail -300 \
+              | tee real-errors.txt \
+              | tee -a build-summary.txt || true
+          else
+            echo "build.log missing" \
+              | tee -a build-summary.txt
+          fi
+
+          echo "" | tee -a build-summary.txt
+          echo "===== WARNINGS =====" \
+            | tee -a build-summary.txt
+
+          if [ -f build.log ]; then
+            grep -i 'warning:' build.log \
+              | tail -300 \
+              > warnings.txt || true
+
+            cat warnings.txt \
+              | tee -a build-summary.txt || true
+          fi
+
+          echo "" | tee -a build-summary.txt
+          echo "===== KERNELSU ERRORS/WARNINGS =====" \
+            | tee -a build-summary.txt
+
+          if [ -f build.log ]; then
+            grep -iE \
+              'kernelsu|ksu|adb_root|apk_sign|allowlist|full_name_hash|ALIGN_DOWN|kvmalloc' \
+              build.log \
+              | tail -500 \
+              > kernelsu-build-lines.txt || true
+
+            cat kernelsu-build-lines.txt \
+              | tee -a build-summary.txt || true
+          fi
+
+      - name: Inspect generated kernel files
+        if: always()
+        working-directory: kernel
+        run: |
+          {
+            echo "=========================================="
+            echo " GENERATED FILE DIAGNOSTICS"
+            echo "=========================================="
+
+            echo
+            echo "===== ARM64 BOOT DIRECTORY ====="
+            ls -lah out/arch/arm64/boot/ 2>/dev/null || true
+
+            echo
+            echo "===== POSSIBLE KERNEL IMAGES ====="
+            find out -type f \
+              \( \
+                -name 'Image' \
+                -o -name 'Image.gz' \
+                -o -name 'Image.gz-dtb' \
+                -o -name 'zImage' \
+                -o -name '*.dtb' \
+              \) \
+              -print \
+              2>/dev/null || true
+
+            echo
+            echo "===== LARGE OUTPUT FILES ====="
+            find out -type f -size +1M \
+              -printf '%s %p\n' \
+              2>/dev/null \
+              | sort -nr \
+              | head -100 || true
+
+          } | tee output-files.txt
+
+      - name: Hash generated kernel images
+        if: always()
+        working-directory: kernel
+        shell: bash
+        run: |
+          set +e
+
+          : > kernel-hashes.txt
+
+          while IFS= read -r f; do
+            echo "===== $f =====" >> kernel-hashes.txt
+            ls -lh "$f" >> kernel-hashes.txt
+            sha256sum "$f" >> kernel-hashes.txt
+            file "$f" >> kernel-hashes.txt
+            echo >> kernel-hashes.txt
+          done < <(
+            find out/arch/arm64/boot \
+              -maxdepth 2 \
+              -type f \
+              \( \
+                -name 'Image' \
+                -o -name 'Image.gz' \
+                -o -name 'Image.gz-dtb' \
+                -o -name '*.dtb' \
+              \) \
+              2>/dev/null
+          )
+
+          cat kernel-hashes.txt
+
+      - name: Final diagnostic report
+        if: always()
+        working-directory: kernel
+        shell: bash
+        run: |
+          {
+            echo "=========================================="
+            echo " FINAL XCover4s DIAGNOSTIC REPORT"
+            echo "=========================================="
+
+            echo
+            echo "Kernel source:"
+            git remote -v || true
+
+            echo
+            echo "Kernel commit:"
+            git log -1 --oneline || true
+
+            echo
+            echo "KernelSU commit:"
+            git -C KernelSU-Next log -1 --oneline || true
+
+            echo
+            echo "Build result:"
+            cat final-build-result.txt 2>/dev/null || echo UNKNOWN
+
+            echo
+            echo "CONFIG_KSU:"
+            grep CONFIG_KSU out/.config 2>/dev/null || true
+
+            echo
+            echo "Kernel images:"
+            find out/arch/arm64/boot \
+              -maxdepth 2 \
+              -type f \
+              \( \
+                -name 'Image' \
+                -o -name 'Image.gz' \
+                -o -name 'Image.gz-dtb' \
+              \) \
+              -exec ls -lh {} \; \
+              2>/dev/null || true
+
+            echo
+            echo "Number of errors:"
+            grep -ciE \
+              'fatal error:|error:|undefined reference|implicit declaration' \
+              build.log 2>/dev/null || true
+
+            echo
+            echo "Number of warnings:"
+            grep -ci 'warning:' \
+              build.log 2>/dev/null || true
+
+            echo
+            echo "ALIGN_DOWN remaining references:"
+            grep -R -n ALIGN_DOWN \
+              drivers/kernelsu 2>/dev/null || true
+
+            echo
+            echo "kvmalloc remaining references:"
+            grep -R -n '\bkvmalloc(' \
+              drivers/kernelsu 2>/dev/null || true
+
+            echo
+            echo "=========================================="
+            echo " END REPORT"
+            echo "=========================================="
+
+          } | tee final-diagnostic-report.txt
+
+      - name: Prepare successful kernel artifact
+        if: always()
+        working-directory: kernel
+        shell: bash
+        run: |
+          mkdir -p kernel-artifact
+
+          cp out/arch/arm64/boot/Image \
+            kernel-artifact/ 2>/dev/null || true
+
+          cp out/arch/arm64/boot/Image.gz \
+            kernel-artifact/ 2>/dev/null || true
+
+          cp out/arch/arm64/boot/Image.gz-dtb \
+            kernel-artifact/ 2>/dev/null || true
+
+          find out/arch/arm64/boot \
+            -type f \
+            -name '*.dtb' \
+            -exec cp {} kernel-artifact/ \; \
+            2>/dev/null || true
+
+          cp kernel-hashes.txt \
+            kernel-artifact/ 2>/dev/null || true
+
+          ls -lah kernel-artifact
+
+      - name: Upload complete diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-full-diagnostics
+          if-no-files-found: warn
+          path: |
+            kernel/build.log
+            kernel/build-summary.txt
+            kernel/real-errors.txt
+            kernel/warnings.txt
+            kernel/kernelsu-build-lines.txt
+            kernel/prebuild-diagnostics.txt
+            kernel/output-files.txt
+            kernel/kernel-hashes.txt
+            kernel/final-diagnostic-report.txt
+            kernel/kernel-config.txt
+            kernel/final-build-result.txt
+
+      - name: Upload built kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-kernelsu-next
+          if-no-files-found: warn
+          path: kernel/kernel-artifact/
