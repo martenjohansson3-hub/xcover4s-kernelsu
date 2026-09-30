@@ -1,4 +1,4 @@
-name: Build XCover4s KernelSU Next Legacy
+name: Build XCover4s KernelSU Next Manual
 
 on:
   workflow_dispatch:
@@ -15,23 +15,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            clang \
-            lld \
-            gcc-aarch64-linux-gnu \
-            curl \
-            git
+            build-essential bc bison flex libssl-dev libelf-dev \
+            clang lld gcc-aarch64-linux-gnu curl git python3
 
       - name: Download kernel source
         run: |
-          git clone \
-            --depth=1 \
-            --branch lineage-18.1 \
+          git clone --depth=1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
@@ -43,7 +32,134 @@ jobs:
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
 
-      - name: Configure kernel and enable KernelSU
+      - name: Enable KernelSU
+        working-directory: kernel
+        run: |
+          set -eux
+          echo "" >> arch/arm64/configs/lineage_xcover4s_defconfig
+          echo "# KernelSU Next" >> arch/arm64/configs/lineage_xcover4s_defconfig
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/lineage_xcover4s_defconfig
+
+      - name: Add manual KernelSU hooks
+        working-directory: kernel
+        run: |
+          set -eux
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(file, old, new):
+              p = Path(file)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"Could not find hook location in {file}")
+              p.write_text(s.replace(old, new, 1))
+              print("Patched", file)
+
+          # exec.c
+          p = Path("fs/exec.c")
+          s = p.read_text()
+
+          marker = "int do_execve(struct filename *filename,"
+          if marker not in s:
+              raise SystemExit("Could not find do_execve in fs/exec.c")
+
+          declaration = """#ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+                          void *argv, void *envp, int *flags);
+          #endif
+
+          """
+
+          s = s.replace(marker, declaration + marker, 1)
+
+          old = """struct user_arg_ptr envp = { .ptr.native = __envp };
+              return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
+
+          new = """struct user_arg_ptr envp = { .ptr.native = __envp };
+          #ifdef CONFIG_KSU
+              ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+          #endif
+              return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
+
+          if old not in s:
+              raise SystemExit("Could not find execve hook location")
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          print("Patched fs/exec.c")
+
+          # open.c
+          p = Path("fs/open.c")
+          s = p.read_text()
+
+          marker = "SYSCALL_DEFINE3(faccessat, int, dfd,"
+          pos = s.find(marker)
+          if pos < 0:
+              raise SystemExit("Could not find faccessat")
+
+          decl = """#ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_faccessat(int *dfd,
+                          const char __user **filename_user,
+                          int *mode, int *flags);
+          #endif
+
+          """
+
+          s = s[:pos] + decl + s[pos:]
+
+          needle = "unsigned int lookup_flags = LOOKUP_FOLLOW;"
+          pos = s.find(needle, s.find(marker))
+          if pos < 0:
+              raise SystemExit("Could not find faccessat hook location")
+
+          end = pos + len(needle)
+          hook = """
+          #ifdef CONFIG_KSU
+              ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif"""
+          s = s[:end] + hook + s[end:]
+          p.write_text(s)
+          print("Patched fs/open.c")
+
+          # read_write.c
+          p = Path("fs/read_write.c")
+          s = p.read_text()
+
+          marker = "SYSCALL_DEFINE3(read, unsigned int, fd,"
+          pos = s.find(marker)
+          if pos < 0:
+              raise SystemExit("Could not find read syscall")
+
+          decl = """#ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern __attribute__((cold)) int ksu_handle_sys_read(
+                          unsigned int fd, char __user **buf_ptr,
+                          size_t *count_ptr);
+          #endif
+
+          """
+
+          s = s[:pos] + decl + s[pos:]
+
+          needle = "ssize_t ret = -EBADF;"
+          pos = s.find(needle, s.find(marker))
+          if pos < 0:
+              raise SystemExit("Could not find read hook location")
+
+          end = pos + len(needle)
+          hook = """
+          #ifdef CONFIG_KSU
+              if (unlikely(ksu_vfs_read_hook))
+                  ksu_handle_sys_read(fd, &buf, &count);
+          #endif"""
+          s = s[:end] + hook + s[end:]
+          p.write_text(s)
+          print("Patched fs/read_write.c")
+          PY
+
+      - name: Configure kernel
         working-directory: kernel
         run: |
           set -eux
@@ -54,56 +170,48 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
-          ./scripts/config --file out/.config -e KPROBES
-          ./scripts/config --file out/.config -e KPROBE_EVENTS
-          ./scripts/config --file out/.config -e EXT4_FS
-          ./scripts/config --file out/.config -e KSU_KPROBE_HOOKS
-          ./scripts/config --file out/.config -e KSU
-
           make O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          echo "===== KernelSU config check ====="
-          grep '^CONFIG_KPROBES=y' out/.config
-          grep '^CONFIG_KPROBE_EVENTS=y' out/.config
-          grep '^CONFIG_EXT4_FS=y' out/.config
-          grep '^CONFIG_KSU_KPROBE_HOOKS=y' out/.config
+          echo "===== KernelSU verification ====="
           grep '^CONFIG_KSU=y' out/.config
+          test -d KernelSU
+          grep -R "ksu_handle_execveat" fs/exec.c
+          grep -R "ksu_handle_faccessat" fs/open.c
+          grep -R "ksu_handle_sys_read" fs/read_write.c
 
-      - name: Build KernelSU kernel
+      - name: Build kernel
         working-directory: kernel
         run: |
           set -eux
+
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error"
 
-      - name: Show build result
+      - name: Final verification
         working-directory: kernel
         run: |
-          echo "===== FINAL KERNELSU CONFIG ====="
-          grep '^CONFIG_KPROBES=y' out/.config
-          grep '^CONFIG_KPROBE_EVENTS=y' out/.config
-          grep '^CONFIG_EXT4_FS=y' out/.config
-          grep '^CONFIG_KSU_KPROBE_HOOKS=y' out/.config
+          set -eux
+
           grep '^CONFIG_KSU=y' out/.config
 
-          echo
-          echo "===== KERNEL FILES ====="
-          ls -lh out/arch/arm64/boot/
+          test -f out/arch/arm64/boot/Image
 
-      - name: Upload KernelSU kernel
+          echo "===== RESULT ====="
+          ls -lh out/arch/arm64/boot/Image
+          sha256sum out/arch/arm64/boot/Image
+
+      - name: Upload kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernelsu-next-legacy
+          name: xcover4s-kernelsu-manual
           path: |
             kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/Image.gz
-            kernel/out/arch/arm64/boot/Image.gz-dtb
             kernel/out/.config
-          if-no-files-found: warn
+          if-no-files-found: error
