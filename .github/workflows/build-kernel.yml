@@ -113,35 +113,56 @@ jobs:
               print("kvmalloc pattern changed - skipping")
           PY
 
-          echo "===== IN_COMPAT_SYSCALL COMPATIBILITY ====="
+          echo "===== IN_COMPAT_SYSCALL GLOBAL COMPATIBILITY ====="
 
           python3 <<'PY'
           from pathlib import Path
 
-          p = Path("drivers/kernelsu/sulog/event.c")
-          s = p.read_text()
+          root = Path("drivers/kernelsu")
+          patched = 0
 
-          if "in_compat_syscall()" in s:
+          for p in root.rglob("*"):
+              if not p.is_file():
+                  continue
+
+              try:
+                  s = p.read_text()
+              except (UnicodeDecodeError, PermissionError):
+                  continue
+
+              if "in_compat_syscall()" not in s:
+                  continue
+
               s = s.replace(
                   "in_compat_syscall()",
                   "is_compat_task()"
               )
 
-              if "#include <linux/compat.h>" not in s:
-                  lines = s.splitlines()
+              if p.suffix in (".c", ".h"):
+                  if "#include <linux/compat.h>" not in s:
+                      lines = s.splitlines()
+                      pos = 0
 
-                  pos = 0
-                  for i, line in enumerate(lines):
-                      if line.startswith("#include"):
-                          pos = i + 1
+                      for i, line in enumerate(lines):
+                          if line.startswith("#include"):
+                              pos = i + 1
 
-                  lines.insert(pos, "#include <linux/compat.h>")
-                  s = "\n".join(lines) + "\n"
+                      lines.insert(
+                          pos,
+                          "#include <linux/compat.h>"
+                      )
+
+                      s = "\n".join(lines) + "\n"
 
               p.write_text(s)
-              print("PATCHED in_compat_syscall -> is_compat_task")
-          else:
-              print("No in_compat_syscall call remains")
+
+              patched += 1
+              print("PATCHED:", p)
+
+          print(
+              "in_compat_syscall files patched:",
+              patched
+          )
           PY
 
           echo "===== SULOG TIME COMPATIBILITY ====="
@@ -194,7 +215,7 @@ jobs:
           echo "===== COMPATIBILITY SUMMARY ====="
 
           grep -R -n "is_compat_task" \
-            drivers/kernelsu/sulog/event.c || true
+            drivers/kernelsu || true
 
           grep -n "full_name_hash" \
             drivers/kernelsu/manager/throne_tracker.c || true
@@ -237,6 +258,7 @@ jobs:
               p.write_text(
                   data.replace(old, new, 1)
               )
+
               print("PATCHED:", path)
 
           # =========================================================
@@ -271,11 +293,17 @@ jobs:
           	{
           		int ksu_fd = AT_FDCWD;
           		int ksu_flags = 0;
-          		ksu_handle_execveat(&ksu_fd, &filename,
-          			&argv, &envp, &ksu_flags);
+
+          		ksu_handle_execveat(
+          			&ksu_fd,
+          			&filename,
+          			&argv,
+          			&envp,
+          			&ksu_flags);
           	}
           #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
+          	return do_execveat_common(
+          		AT_FDCWD, filename, argv, envp, 0);"""
           )
 
           # =========================================================
@@ -288,9 +316,11 @@ jobs:
            * access() needs to use the real uid/gid, not the effective uid/gid.""",
               """#ifdef CONFIG_KSU
           __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd,
+          extern int ksu_handle_faccessat(
+          	int *dfd,
           	const char __user **filename_user,
-          	int *mode, int *flags);
+          	int *mode,
+          	int *flags);
           #endif
 
           /*
@@ -306,7 +336,10 @@ jobs:
 
           #ifdef CONFIG_KSU
           	ksu_handle_faccessat(
-          		&dfd, &filename, &mode, NULL);
+          		&dfd,
+          		&filename,
+          		&mode,
+          		NULL);
           #endif
 
           	if (mode & ~S_IRWXO)"""
@@ -381,11 +414,16 @@ jobs:
 
           #ifdef CONFIG_KSU
           	ksu_handle_stat(
-          		&dfd, &filename, &flag);
+          		&dfd,
+          		&filename,
+          		&flag);
           #endif
 
           	error = vfs_fstatat(
-          		dfd, filename, &stat, flag);"""
+          		dfd,
+          		filename,
+          		&stat,
+          		flag);"""
           )
 
           # =========================================================
@@ -419,7 +457,10 @@ jobs:
 
           #ifdef CONFIG_KSU
           	ksu_handle_sys_reboot(
-          		magic1, magic2, cmd, &arg);
+          		magic1,
+          		magic2,
+          		cmd,
+          		&arg);
           #endif
 
           	/* We only trust the superuser with rebooting the system. */"""
@@ -525,6 +566,7 @@ jobs:
               'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
               build.log \
               | tail -120 || true
+
           else
             echo
             echo "=========================================="
