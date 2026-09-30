@@ -38,29 +38,29 @@ jobs:
         run: |
           set -eux
 
-          echo "===== OLD KERNEL HEADER CHECK ====="
+          echo "===== CHECK OLD KERNEL HEADER ====="
           test -f include/linux/compiler.h
 
-          echo "===== compiler_types.h REFERENCES BEFORE ====="
+          echo "===== compiler_types.h REFERENCES ====="
           grep -R -n 'linux/compiler_types.h' drivers/kernelsu || true
 
-          echo "===== PATCHING ====="
+          echo "===== PATCH compiler_types.h -> compiler.h ====="
 
           grep -R -l 'linux/compiler_types.h' drivers/kernelsu | while read -r FILE; do
-            echo "Patching: $FILE"
+            echo "Patching $FILE"
             sed -i \
               's|<linux/compiler_types.h>|<linux/compiler.h>|g' \
               "$FILE"
           done
 
-          echo "===== VERIFY PATCH ====="
+          echo "===== VERIFY HEADER PATCH ====="
 
           if grep -R -n 'linux/compiler_types.h' drivers/kernelsu; then
-            echo "ERROR: compiler_types.h still referenced"
+            echo "ERROR: compiler_types.h reference remains"
             exit 1
           fi
 
-          grep -R -n 'linux/compiler.h' drivers/kernelsu | head -30 || true
+          echo "Header compatibility patch OK"
 
       - name: Enable KernelSU
         working-directory: kernel
@@ -306,32 +306,37 @@ jobs:
         working-directory: kernel
         run: |
           set +e
+          set -o pipefail
+
+          echo "===== STARTING KERNEL BUILD ====="
+          echo "Build output is LIVE and also saved to build.log"
 
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            > build.log 2>&1
+            2>&1 | tee build.log
 
-          RESULT=$?
+          RESULT=${PIPESTATUS[0]}
 
           echo
           echo "===== BUILD RESULT: $RESULT ====="
 
-          echo
-          echo "===== POSSIBLE REAL ERRORS ====="
+          if [ "$RESULT" -ne 0 ]; then
+            echo
+            echo "===== POSSIBLE REAL ERRORS ====="
 
-          grep -iE \
-            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|FAILED|implicit declaration|undeclared" \
-            build.log | tail -200 || true
+            grep -iE \
+              "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|FAILED|implicit declaration|undeclared" \
+              build.log | tail -200 || true
 
-          echo
-          echo "===== LAST 200 LINES ====="
+            echo
+            echo "===== LAST 100 LINES ====="
+            tail -100 build.log
+          fi
 
-          tail -200 build.log
-
-          exit $RESULT
+          exit "$RESULT"
 
       - name: Upload build log
         if: always()
