@@ -20,34 +20,40 @@ jobs:
       - name: Clone XCover4s kernel
         run: |
           git clone --depth=1 --branch lineage-18.1 \
-            https://github.com/LineageOS/android_kernel_samsung_universal7885.git kernel
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
       - name: Install KernelSU-Next legacy
         working-directory: kernel
         run: |
           set -eux
+
           curl -LSs \
-            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
 
-      - name: Patch KernelSU compatibility
+      - name: Patch KernelSU old-kernel compatibility
         working-directory: kernel
         run: |
           set -eux
 
-          echo "===== OLD KERNEL HEADER COMPATIBILITY ====="
+          echo "===== HEADER COMPATIBILITY ====="
 
           grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i 's|<linux/compiler_types.h>|<linux/compiler.h>|g'
+            | xargs -r sed -i \
+              's|<linux/compiler_types.h>|<linux/compiler.h>|g'
 
           grep -R -l 'linux/sched/signal.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i 's|<linux/sched/signal.h>|<linux/sched.h>|g'
+            | xargs -r sed -i \
+              's|<linux/sched/signal.h>|<linux/sched.h>|g'
 
           grep -R -l 'linux/sched/task.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i 's|<linux/sched/task.h>|<linux/sched.h>|g'
+            | xargs -r sed -i \
+              's|<linux/sched/task.h>|<linux/sched.h>|g'
 
           grep -R -l 'linux/sched/user.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i 's|<linux/sched/user.h>|<linux/sched.h>|g'
+            | xargs -r sed -i \
+              's|<linux/sched/user.h>|<linux/sched.h>|g'
 
           echo "===== FULL_NAME_HASH COMPATIBILITY ====="
 
@@ -61,13 +67,13 @@ jobs:
           new = "full_name_hash((const unsigned char *)dirpath, strlen(dirpath))"
 
           if old in s:
-              s = s.replace(old, new)
+              s = s.replace(old, new, 1)
               p.write_text(s)
               print("PATCHED full_name_hash")
           elif new in s:
               print("full_name_hash already compatible")
           else:
-              print("WARNING: full_name_hash target not found")
+              raise SystemExit("full_name_hash patch target not found")
           PY
 
           echo "===== KVMALLOC COMPATIBILITY ====="
@@ -81,20 +87,35 @@ jobs:
           old = "eocd_buffer = kvmalloc(search_size, GFP_KERNEL);"
 
           new = """eocd_buffer = kmalloc(search_size, GFP_KERNEL);
-              if (!eocd_buffer)
-                  eocd_buffer = vmalloc(search_size);"""
+                  if (!eocd_buffer)
+                      eocd_buffer = vmalloc(search_size);"""
 
           if old in s:
-              s = s.replace(old, new)
+              s = s.replace(old, new, 1)
+
+              if "#include <linux/vmalloc.h>" not in s:
+                  marker = "#include <linux/slab.h>"
+
+                  if marker not in s:
+                      raise SystemExit("slab.h include not found")
+
+                  s = s.replace(
+                      marker,
+                      marker + "\n#include <linux/vmalloc.h>",
+                      1
+                  )
+
               p.write_text(s)
               print("PATCHED kvmalloc compatibility")
+
           elif "eocd_buffer = kmalloc(search_size, GFP_KERNEL);" in s:
               print("kvmalloc compatibility already patched")
+
           else:
-              print("WARNING: kvmalloc target not found")
+              raise SystemExit("kvmalloc patch target not found")
           PY
 
-          echo "===== PRE-BUILD HEADER CHECK ====="
+          echo "===== PRE-BUILD COMPATIBILITY CHECK ====="
 
           BAD=0
 
@@ -110,7 +131,23 @@ jobs:
             fi
           done
 
+          grep -n \
+            'full_name_hash((const unsigned char \*)dirpath' \
+            drivers/kernelsu/manager/throne_tracker.c \
+            || BAD=1
+
+          grep -n \
+            'eocd_buffer = kmalloc' \
+            drivers/kernelsu/manager/apk_sign.c \
+            || BAD=1
+
+          grep -n \
+            'eocd_buffer = vmalloc' \
+            drivers/kernelsu/manager/apk_sign.c \
+            || BAD=1
+
           if [ "$BAD" -ne 0 ]; then
+            echo "COMPATIBILITY CHECK FAILED"
             exit 1
           fi
 
@@ -120,6 +157,8 @@ jobs:
         working-directory: kernel
         run: |
           cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
+
+          # KernelSU Next
           CONFIG_KSU=y
           EOF
 
@@ -144,6 +183,10 @@ jobs:
 
               p.write_text(data.replace(old, new, 1))
               print("PATCHED:", path)
+
+          # =========================================================
+          # fs/exec.c
+          # =========================================================
 
           patch(
               "fs/exec.c",
@@ -180,6 +223,10 @@ jobs:
           	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
           )
 
+          # =========================================================
+          # fs/open.c
+          # =========================================================
+
           patch(
               "fs/open.c",
               """/*
@@ -208,6 +255,10 @@ jobs:
 
           	if (mode & ~S_IRWXO)"""
           )
+
+          # =========================================================
+          # fs/read_write.c
+          # =========================================================
 
           patch(
               "fs/read_write.c",
@@ -241,6 +292,10 @@ jobs:
           	if (f.file) {"""
           )
 
+          # =========================================================
+          # fs/stat.c
+          # =========================================================
+
           patch(
               "fs/stat.c",
               """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
@@ -271,6 +326,10 @@ jobs:
 
           	error = vfs_fstatat(dfd, filename, &stat, flag);"""
           )
+
+          # =========================================================
+          # kernel/reboot.c
+          # =========================================================
 
           patch(
               "kernel/reboot.c",
@@ -305,15 +364,18 @@ jobs:
           print("ALL KERNELSU HOOKS APPLIED")
           PY
 
-      - name: Verify hooks
+      - name: Verify KernelSU hooks
         working-directory: kernel
         run: |
           set -eux
-          grep -n ksu_handle_execveat fs/exec.c
-          grep -n ksu_handle_faccessat fs/open.c
-          grep -n ksu_handle_sys_read fs/read_write.c
-          grep -n ksu_handle_stat fs/stat.c
-          grep -n ksu_handle_sys_reboot kernel/reboot.c
+
+          grep -n "ksu_handle_execveat" fs/exec.c
+          grep -n "ksu_handle_faccessat" fs/open.c
+          grep -n "ksu_handle_sys_read" fs/read_write.c
+          grep -n "ksu_handle_stat" fs/stat.c
+          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
+
+          echo "ALL HOOKS VERIFIED"
 
       - name: Configure kernel
         working-directory: kernel
@@ -321,7 +383,6 @@ jobs:
           set -eux
 
           export CCACHE_DIR="$HOME/.ccache"
-          export CC="ccache clang"
 
           make O=out ARCH=arm64 \
             CC="ccache clang" \
@@ -334,6 +395,8 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
+
+          echo "===== KERNELSU CONFIG ====="
 
           grep '^CONFIG_KSU=y' out/.config
 
@@ -359,11 +422,13 @@ jobs:
           BUILD_PID=$!
           SECONDS_RUN=0
 
-          while kill -0 "$BUILD_PID" 2>/dev/null; do
+          while kill -0 "$BUILD_PID" 2>/dev/null
+          do
             sleep 30
-            SECONDS_RUN=$((SECONDS_RUN + 30))
 
-            if kill -0 "$BUILD_PID" 2>/dev/null; then
+            if kill -0 "$BUILD_PID" 2>/dev/null
+            then
+              SECONDS_RUN=$((SECONDS_RUN + 30))
               echo "Kernel build still running... ${SECONDS_RUN}s"
             fi
           done
@@ -376,7 +441,8 @@ jobs:
           echo " BUILD FINISHED - RESULT: $RESULT"
           echo "=========================================="
 
-          if [ "$RESULT" -ne 0 ]; then
+          if [ "$RESULT" -ne 0 ]
+          then
             echo
             echo "===== REAL ERRORS ====="
 
@@ -396,7 +462,10 @@ jobs:
               | tail -120 || true
           else
             echo
-            echo "SUCCESS - KERNEL COMPILED"
+            echo "=========================================="
+            echo " SUCCESS - KERNEL COMPILED"
+            echo "=========================================="
+
             ls -lh out/arch/arm64/boot/ || true
           fi
 
@@ -410,13 +479,33 @@ jobs:
           path: kernel/build.log
           if-no-files-found: ignore
 
-      - name: Upload kernel
+      - name: Verify finished kernel
+        if: success()
+        working-directory: kernel
+        run: |
+          set -eux
+
+          grep '^CONFIG_KSU=y' out/.config
+
+          if [ -f out/arch/arm64/boot/Image ]; then
+            echo "Image found"
+            ls -lh out/arch/arm64/boot/Image
+            sha256sum out/arch/arm64/boot/Image
+          else
+            echo "ERROR: kernel Image not found"
+            exit 1
+          fi
+
+          echo "===== KERNELSU SYMBOLS ====="
+          grep "ksu_handle_" out/System.map | head -30 || true
+
+      - name: Upload finished kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernel
+          name: xcover4s-kernelsu-next
           path: |
             kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/Image.gz
-            kernel/out/arch/arm64/boot/Image.gz-dtb
-          if-no-files-found: ignore
+            kernel/out/.config
+            kernel/out/System.map
+          if-no-files-found: error
