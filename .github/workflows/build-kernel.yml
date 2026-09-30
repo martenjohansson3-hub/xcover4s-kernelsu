@@ -1,621 +1,170 @@
-name: Build XCover4s KernelSU
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-
-    steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git curl python3 \
-            clang lld libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu ccache
-
-      - name: Clone XCover4s kernel
-        run: |
-          git clone --depth=1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
-      - name: Install KernelSU-Next legacy
-        working-directory: kernel
-        run: |
-          set -eux
-
-          curl -LSs \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s legacy
-
-      - name: Patch KernelSU old-kernel compatibility
-        working-directory: kernel
-        run: |
-          set -eux
-
-          echo "===== HEADER COMPATIBILITY ====="
-
-          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i \
-              's|<linux/compiler_types.h>|<linux/compiler.h>|g'
-
-          grep -R -l 'linux/sched/signal.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i \
-              's|<linux/sched/signal.h>|<linux/sched.h>|g'
-
-          grep -R -l 'linux/sched/task.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i \
-              's|<linux/sched/task.h>|<linux/sched.h>|g'
-
-          grep -R -l 'linux/sched/user.h' drivers/kernelsu 2>/dev/null \
-            | xargs -r sed -i \
-              's|<linux/sched/user.h>|<linux/sched.h>|g'
-
-          echo "===== FULL_NAME_HASH COMPATIBILITY ====="
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          p = Path("drivers/kernelsu/manager/throne_tracker.c")
-          s = p.read_text()
-
-          old = "full_name_hash(NULL, dirpath, strlen(dirpath))"
-          new = "full_name_hash((const unsigned char *)dirpath, strlen(dirpath))"
-
-          if old in s:
-              s = s.replace(old, new, 1)
-              p.write_text(s)
-              print("PATCHED full_name_hash")
-          elif new in s:
-              print("full_name_hash already compatible")
-          else:
-              print("full_name_hash pattern changed - skipping")
-          PY
-
-          echo "===== KVMALLOC COMPATIBILITY ====="
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          p = Path("drivers/kernelsu/manager/apk_sign.c")
-          s = p.read_text()
-
-          old = "eocd_buffer = kvmalloc(search_size, GFP_KERNEL);"
-
-          new = """eocd_buffer = kmalloc(search_size, GFP_KERNEL);
-                  if (!eocd_buffer)
-                      eocd_buffer = vmalloc(search_size);"""
-
-          if old in s:
-              s = s.replace(old, new, 1)
-
-              if "#include <linux/vmalloc.h>" not in s:
-                  marker = "#include <linux/slab.h>"
-
-                  if marker in s:
-                      s = s.replace(
-                          marker,
-                          marker + "\n#include <linux/vmalloc.h>",
-                          1
-                      )
-
-              p.write_text(s)
-              print("PATCHED kvmalloc compatibility")
-
-          elif "eocd_buffer = kmalloc(search_size, GFP_KERNEL);" in s:
-              print("kvmalloc compatibility already patched")
-
-          else:
-              print("kvmalloc pattern changed - skipping")
-          PY
-
-          echo "===== IN_COMPAT_SYSCALL GLOBAL COMPATIBILITY ====="
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          root = Path("drivers/kernelsu")
-          patched = 0
-
-          for p in root.rglob("*"):
-              if not p.is_file():
-                  continue
-
-              try:
-                  s = p.read_text()
-              except (UnicodeDecodeError, PermissionError):
-                  continue
-
-              if "in_compat_syscall()" not in s:
-                  continue
-
-              s = s.replace(
-                  "in_compat_syscall()",
-                  "is_compat_task()"
-              )
-
-              if p.suffix in (".c", ".h"):
-                  if "#include <linux/compat.h>" not in s:
-                      lines = s.splitlines()
-                      pos = 0
-
-                      for i, line in enumerate(lines):
-                          if line.startswith("#include"):
-                              pos = i + 1
-
-                      lines.insert(
-                          pos,
-                          "#include <linux/compat.h>"
-                      )
-
-                      s = "\n".join(lines) + "\n"
-
-              p.write_text(s)
-
-              patched += 1
-              print("PATCHED:", p)
-
-          print(
-              "in_compat_syscall files patched:",
-              patched
-          )
-          PY
-
-          echo "===== SULOG TIME COMPATIBILITY ====="
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          p = Path("drivers/kernelsu/sulog/event.c")
-          s = p.read_text()
-
-          old = "#if KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE"
-          new = "#if KERNEL_VERSION(4, 14, 0) <= LINUX_VERSION_CODE"
-
-          if old in s:
-              s = s.replace(old, new)
-              p.write_text(s)
-              print("PATCHED sulog time compatibility")
-          else:
-              print("No sulog 4.19 conditional requiring patch")
-          PY
-
-          echo "===== PRE-BUILD COMPATIBILITY CHECK ====="
-
-          BAD=0
-
-          for H in \
-            linux/compiler_types.h \
-            linux/sched/signal.h \
-            linux/sched/task.h \
-            linux/sched/user.h
-          do
-            if grep -R -n "$H" drivers/kernelsu 2>/dev/null; then
-              echo "ERROR: incompatible header remains: $H"
-              BAD=1
-            fi
-          done
-
-          if grep -R -n 'in_compat_syscall()' \
-            drivers/kernelsu 2>/dev/null
-          then
-            echo "ERROR: in_compat_syscall remains"
-            BAD=1
-          fi
-
-          if [ "$BAD" -ne 0 ]; then
-            echo "COMPATIBILITY CHECK FAILED"
-            exit 1
-          fi
-
-          echo "===== COMPATIBILITY SUMMARY ====="
-
-          grep -R -n "is_compat_task" \
-            drivers/kernelsu || true
-
-          grep -n "full_name_hash" \
-            drivers/kernelsu/manager/throne_tracker.c || true
-
-          grep -n "eocd_buffer = .*malloc" \
-            drivers/kernelsu/manager/apk_sign.c || true
-
-          echo "ALL COMPATIBILITY PATCHES OK"
-
-      - name: Enable KernelSU
-        working-directory: kernel
-        run: |
-          cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
-
-          # KernelSU Next
-          CONFIG_KSU=y
-          EOF
-
-      - name: Apply KernelSU manual hooks
-        working-directory: kernel
-        run: |
-          set -eux
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          def patch(path, old, new):
-              p = Path(path)
-              data = p.read_text()
-
-              if new in data:
-                  print("ALREADY PATCHED:", path)
-                  return
-
-              if old not in data:
-                  raise SystemExit(
-                      "PATCH TARGET NOT FOUND: " + path
-                  )
-
-              p.write_text(
-                  data.replace(old, new, 1)
-              )
-
-              print("PATCHED:", path)
-
-          # =========================================================
-          # fs/exec.c
-          # =========================================================
-
-          patch(
-              "fs/exec.c",
-              """int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd,
-          	struct filename **filename_ptr,
-          	void *argv, void *envp, int *flags);
-          #endif
-
-          int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {"""
-          )
-
-          patch(
-              "fs/exec.c",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          #ifdef CONFIG_KSU
-          	{
-          		int ksu_fd = AT_FDCWD;
-          		int ksu_flags = 0;
-
-          		ksu_handle_execveat(
-          			&ksu_fd,
-          			&filename,
-          			&argv,
-          			&envp,
-          			&ksu_flags);
-          	}
-          #endif
-          	return do_execveat_common(
-          		AT_FDCWD, filename, argv, envp, 0);"""
-          )
-
-          # =========================================================
-          # fs/open.c
-          # =========================================================
-
-          patch(
-              "fs/open.c",
-              """/*
-           * access() needs to use the real uid/gid, not the effective uid/gid.""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(
-          	int *dfd,
-          	const char __user **filename_user,
-          	int *mode,
-          	int *flags);
-          #endif
-
-          /*
-           * access() needs to use the real uid/gid, not the effective uid/gid."""
-          )
-
-          patch(
-              "fs/open.c",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          	if (mode & ~S_IRWXO)""",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_faccessat(
-          		&dfd,
-          		&filename,
-          		&mode,
-          		NULL);
-          #endif
-
-          	if (mode & ~S_IRWXO)"""
-          )
-
-          # =========================================================
-          # fs/read_write.c
-          # =========================================================
-
-          patch(
-              "fs/read_write.c",
-              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern __attribute__((cold)) int ksu_handle_sys_read(
-          	unsigned int fd,
-          	char __user **buf_ptr,
-          	size_t *count_ptr);
-          #endif
-
-          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {"""
-          )
-
-          patch(
-              "fs/read_write.c",
-              """	ssize_t ret = -EBADF;
-
-          	if (f.file) {""",
-              """	ssize_t ret = -EBADF;
-
-          #ifdef CONFIG_KSU
-          	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(
-          			fd,
-          			(char __user **)&buf,
-          			&count);
-          #endif
-
-          	if (f.file) {"""
-          )
-
-          # =========================================================
-          # fs/stat.c
-          # =========================================================
-
-          patch(
-              "fs/stat.c",
-              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_stat(
-          	int *dfd,
-          	const char __user **filename_user,
-          	int *flags);
-          #endif
-
-          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat"""
-          )
-
-          patch(
-              "fs/stat.c",
-              """	struct kstat stat;
-          	int error;
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);""",
-              """	struct kstat stat;
-          	int error;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_stat(
-          		&dfd,
-          		&filename,
-          		&flag);
-          #endif
-
-          	error = vfs_fstatat(
-          		dfd,
-          		filename,
-          		&stat,
-          		flag);"""
-          )
-
-          # =========================================================
-          # kernel/reboot.c
-          # =========================================================
-
-          patch(
-              "kernel/reboot.c",
-              """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(
-          	int magic1,
-          	int magic2,
-          	unsigned int cmd,
-          	void __user **arg);
-          #endif
-
-          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {"""
-          )
-
-          patch(
-              "kernel/reboot.c",
-              """	int ret = 0;
-
-          	/* We only trust the superuser with rebooting the system. */""",
-              """	int ret = 0;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_sys_reboot(
-          		magic1,
-          		magic2,
-          		cmd,
-          		&arg);
-          #endif
-
-          	/* We only trust the superuser with rebooting the system. */"""
-          )
-
-          print("ALL KERNELSU HOOKS APPLIED")
-          PY
-
-      - name: Verify KernelSU hooks
-        working-directory: kernel
-        run: |
-          set -eux
-
-          grep -n "ksu_handle_execveat" fs/exec.c
-          grep -n "ksu_handle_faccessat" fs/open.c
-          grep -n "ksu_handle_sys_read" fs/read_write.c
-          grep -n "ksu_handle_stat" fs/stat.c
-          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
-
-          echo "ALL HOOKS VERIFIED"
-
-      - name: Configure kernel
-        working-directory: kernel
-        run: |
-          set -eux
-
-          export CCACHE_DIR="$HOME/.ccache"
-
-          make O=out ARCH=arm64 \
-            CC="ccache clang" \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            lineage_xcover4s_defconfig
-
-          make O=out ARCH=arm64 \
-            CC="ccache clang" \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            olddefconfig
-
-          echo "===== KERNELSU CONFIG ====="
-
-          grep '^CONFIG_KSU=y' out/.config
-
-      - name: Build kernel
-        working-directory: kernel
-        run: |
-          set +e
-
-          echo "=========================================="
-          echo " STARTING KERNEL BUILD"
-          echo " HEARTBEAT EVERY 30 SECONDS"
-          echo "=========================================="
-
-          export CCACHE_DIR="$HOME/.ccache"
-
-          make -j"$(nproc)" O=out ARCH=arm64 \
-            CC="ccache clang" \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" \
-            > build.log 2>&1 &
-
-          BUILD_PID=$!
-          SECONDS_RUN=0
-
-          while kill -0 "$BUILD_PID" 2>/dev/null
-          do
-            sleep 30
-
-            if kill -0 "$BUILD_PID" 2>/dev/null
-            then
-              SECONDS_RUN=$((SECONDS_RUN + 30))
-              echo \
-                "Kernel build still running... ${SECONDS_RUN}s"
-            fi
-          done
-
-          wait "$BUILD_PID"
-          RESULT=$?
-
-          echo
-          echo "=========================================="
-          echo " BUILD FINISHED - RESULT: $RESULT"
-          echo "=========================================="
-
-          if [ "$RESULT" -ne 0 ]
-          then
-            echo
-            echo "===== REAL ERRORS ====="
-
-            grep -iE \
-              "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|implicit declaration|undeclared|too many arguments|incompatible pointer" \
-              build.log \
-              | grep -viE \
-                'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-              | tail -250 || true
-
-            echo
-            echo "===== CLEAN BUILD END ====="
-
-            grep -viE \
-              'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-              build.log \
-              | tail -120 || true
-
-          else
-            echo
-            echo "=========================================="
-            echo " SUCCESS - KERNEL COMPILED"
-            echo "=========================================="
-
-            ls -lh out/arch/arm64/boot/ || true
-          fi
-
-          exit "$RESULT"
-
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcover4s-build-log
-          path: kernel/build.log
-          if-no-files-found: ignore
-
-      - name: Verify finished kernel
-        if: success()
-        working-directory: kernel
-        run: |
-          set -eux
-
-          grep '^CONFIG_KSU=y' out/.config
-
-          if [ -f out/arch/arm64/boot/Image ]; then
-            echo "Image found"
-            ls -lh out/arch/arm64/boot/Image
-            sha256sum out/arch/arm64/boot/Image
-          else
-            echo "ERROR: kernel Image not found"
-            exit 1
-          fi
-
-          echo "===== KERNELSU SYMBOLS ====="
-
-          grep "ksu_handle_" \
-            out/System.map \
-            | head -30 || true
-
-      - name: Upload finished kernel
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcover4s-kernelsu-next
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/.config
-            kernel/out/System.map
-          if-no-files-found: error
+Kernel build still running... 30s
+Kernel build still running... 60s
+Kernel build still running... 90s
+Kernel build still running... 120s
+Kernel build still running... 150s
+Kernel build still running... 180s
+Kernel build still running... 210s
+Kernel build still running... 240s
+Kernel build still running... 270s
+Kernel build still running... 300s
+Kernel build still running... 330s
+Kernel build still running... 360s
+Kernel build still running... 390s
+Kernel build still running... 420s
+Kernel build still running... 450s
+Kernel build still running... 480s
+Kernel build still running... 510s
+Kernel build still running... 540s
+==========================================
+ BUILD FINISHED - RESULT: 2
+==========================================
+===== REAL ERRORS =====
+../drivers/kernelsu/policy/allowlist.c:454:23: warning: incompatible pointer types passing 'u32 *' (aka 'unsigned int *') to parameter of type 'const char *' [-Wincompatible-pointer-types]
+../drivers/kernelsu/policy/allowlist.c:459:23: warning: incompatible pointer types passing 'u32 *' (aka 'unsigned int *') to parameter of type 'const char *' [-Wincompatible-pointer-types]
+../drivers/kernelsu/policy/allowlist.c:475:30: warning: incompatible pointer types passing 'struct app_profile *' to parameter of type 'const char *' [-Wincompatible-pointer-types]
+../drivers/kernelsu/feature/adb_root.c:80:29: error: implicit declaration of function 'ALIGN_DOWN' [-Werror,-Wimplicit-function-declaration]
+make[3]: *** [../scripts/Makefile.build:280: drivers/kernelsu/feature/adb_root.o] Error 1
+make[2]: *** [../scripts/Makefile.build:487: drivers/kernelsu] Error 2
+make[1]: *** [/home/runner/work/xcover4s-kernelsu/xcover4s-kernelsu/kernel/Makefile:1068: drivers] Error 2
+make: *** [Makefile:152: sub-make] Error 2
+===== CLEAN BUILD END =====
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v3_11_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v3_1_1/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v3_20_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v4_0_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v4_3_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v5_10_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v5_15_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v5_2_0/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/setup-fimc-is.o
+  CC      drivers/media/platform/exynos/mfc/s5p_mfc_buf.o
+  CC      drivers/media/platform/exynos/fimc-is2/hardware/fimc-is-hw-mcscaler-v2.o
+  LD      drivers/media/platform/exynos/fimc-is2/interface/built-in.o
+  CC      drivers/media/platform/exynos/smfc/smfc.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/setup-fimc-is-sensor.o
+  CC      drivers/media/platform/exynos/mfc/s5p_mfc_utils.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-hw-pwr.o
+  CC      drivers/media/platform/exynos/fimc-is2/hardware/fimc-is-hw-tdnr-v2.o
+  CC      drivers/media/platform/exynos/smfc/smfc-v4l2-ioctls.o
+  CC      drivers/media/platform/exynos/mfc/s5p_mfc_qos.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-hw-chain.o
+  CC      drivers/media/platform/exynos/smfc/smfc-regs.o
+  CC      drivers/media/platform/exynos/fimc-is2/hardware/api/fimc-is-hw-api-common.o
+  CC      drivers/media/platform/exynos/mfc/s5p_mfc_mem.o
+  CC      drivers/media/platform/exynos/fimc-is2/hardware/api/fimc-is-hw-api-vra.o
+  CC      drivers/media/platform/exynos/smfc/smfc-stream-parser.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-hw-dvfs.o
+  CC      drivers/media/platform/exynos/mfc/s5p_mfc_debugfs.o
+  CC      drivers/media/platform/exynos/fimc-is2/hardware/api/fimc-is-hw-api-mcscaler-v420.o
+  LD      drivers/media/platform/exynos/smfc/built-in.o
+  CC      drivers/media/v4l2-core/v4l2-dev.o
+  LD      drivers/media/platform/exynos/mfc/s5p-mfc.o
+  LD      drivers/media/platform/exynos/mfc/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-3aa.o
+  CC      drivers/media/v4l2-core/v4l2-ioctl.o
+  LD      drivers/media/platform/exynos/fimc-is2/hardware/api/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/hardware/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/fimc-is-helper-i2c.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-3ac.o
+  CC      drivers/media/media-device.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/csi2/fimc-is-hw-csi-v5_0.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-3ap.o
+  CC      drivers/media/v4l2-core/v4l2-device.o
+  CC      drivers/media/media-devnode.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/csi2/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-interface-sensor.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-isp.o
+  CC      drivers/media/media-entity.o
+  CC      drivers/media/v4l2-core/v4l2-fh.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-ixc.o
+  CC      drivers/media/v4l2-core/v4l2-event.o
+  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-vender.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-interface-actuator.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-ixp.o
+  CC      drivers/media/v4l2-core/v4l2-ctrls.o
+  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-sec-define.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-control-sensor.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-mcs.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-control-actuator.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-mcsp.o
+  CC      drivers/media/v4l2-core/v4l2-subdev.o
+  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/crc32.o
+  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-sysfs.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/fimc-is-device-sensor-peri.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-vra.o
+  CC      drivers/media/v4l2-core/v4l2-clk.o
+  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-device-eeprom.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor.o
+  CC      drivers/media/v4l2-core/v4l2-async.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/actuator/fimc-is-helper-actuator-i2c.o
+  CC      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/fimc-is-sec-util.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc0.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/actuator/fimc-is-actuator-zc535.o
+  CC      drivers/media/v4l2-core/v4l2-compat-ioctl32.o
+  LD      drivers/media/platform/exynos/fimc-is2/vendor/mcd_v2/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/vendor/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/fimc-is.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc1.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/actuator/built-in.o
+  CC      drivers/media/v4l2-core/v4l2-of.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc2.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis-5e9.o
+  CC      drivers/media/m2m1shot.o
+  CC      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/fimc-is-subdev-sensor_vc3.o
+  CC      drivers/media/m2m1shot-helper.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis-2p6.o
+  CC      drivers/media/v4l2-core/vb2-trace.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/fimc-is-v6_20_0/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/ischain/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/flash/fimc-is-flash-gpio.o
+  CC      drivers/media/v4l2-core/v4l2-trace.o
+  CC      drivers/media/m2m1shot2.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/built-in.o
+  CC      drivers/media/v4l2-core/v4l2-common.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/flash/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/iris/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/fimc-is-device-module-base.o
+  CC      drivers/media/v4l2-core/v4l2-dv-timings.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/ois/built-in.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/fimc-is-device-module-5e9.o
+  CC      drivers/media/v4l2-core/v4l2-mem2mem.o
+  CC      drivers/media/v4l2-core/videobuf2-core.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/pdp/built-in.o
+  LD      drivers/media/media.o
+  CC      drivers/media/v4l2-core/videobuf2-v4l2.o
+  CC      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/fimc-is-device-module-2p6.o
+  CC      drivers/media/v4l2-core/videobuf2-memops.o
+  CC      drivers/media/v4l2-core/videobuf2-ion.o
+  LD      drivers/media/v4l2-core/videodev.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/module_framework/modules/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/sensor/built-in.o
+  LD      drivers/media/platform/exynos/fimc-is2/built-in.o
+  LD      drivers/media/platform/exynos/built-in.o
+  LD      drivers/media/platform/built-in.o
+  LD      drivers/media/v4l2-core/built-in.o
+  LD      drivers/media/built-in.o
+make[1]: *** [/home/runner/work/xcover4s-kernelsu/xcover4s-kernelsu/kernel/Makefile:1068: drivers] Error 2
+make[1]: Leaving directory '/home/runner/work/xcover4s-kernelsu/xcover4s-kernelsu/kernel/out'
+make: *** [Makefile:152: sub-make] Error 2
+Error: Process completed with exit code 2.
+1s
+Run actions/upload-artifact@v4
+(node:40904) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+With the provided path, there will be 1 file uploaded
+Artifact name is valid!
+Root directory input is valid!
+Beginning upload of artifact content to blob storage
+(node:40904) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+Uploaded bytes 179289
+Finished uploading artifact content to blob storage!
+SHA256 digest of uploaded artifact zip is 48a337a9f76f521a3b1f85efff69c29ce2aea648a7e4c4d1604a1408f8150e1b
+Finalizing artifact upload
+Artifact xcover4s-build-log.zip successfully finalized. Artifact ID 11124056106
+Artifact xcover4s-build-log has been successfully uploaded! Final size is 179289 bytes. Artifact ID is 11124056106
+Artifact download URL: https://github.com/martenjohansson3-hub/xcover4s-kernelsu/actions/runs/36770082702/artifacts/11124056106
+0s
+0s
