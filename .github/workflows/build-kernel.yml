@@ -1,4 +1,4 @@
-name: Build XCover4s KernelSU Next
+name: Inspect KernelSU Legacy
 
 on:
   workflow_dispatch:
@@ -7,17 +7,10 @@ on:
       - ".github/workflows/build-kernel.yml"
 
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bc bison flex libssl-dev libelf-dev \
-            clang lld gcc-aarch64-linux-gnu curl git python3
-
       - name: Download kernel source
         run: |
           git clone --depth=1 --branch lineage-18.1 \
@@ -28,423 +21,32 @@ jobs:
         working-directory: kernel
         run: |
           set -eux
-
           curl -LSs \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
 
-      - name: Patch KernelSU for old kernel headers
+      - name: Show exact compatibility code
         working-directory: kernel
         run: |
-          set -eux
-
-          echo "=========================================="
-          echo " OLD KERNEL COMPATIBILITY PATCHES"
-          echo "=========================================="
-
-          test -f include/linux/compiler.h
-          test -f include/linux/sched.h
+          echo "========== APK SIGN =========="
+          grep -n -B20 -A40 \
+            'kvmalloc\|kvfree\|eocd_buffer' \
+            drivers/kernelsu/manager/apk_sign.c || true
 
           echo
-          echo "1. compiler_types.h -> compiler.h"
-
-          grep -R -l \
-            'linux/compiler_types.h' \
-            drivers/kernelsu 2>/dev/null | \
-          while read -r FILE; do
-            echo "Patching $FILE"
-            sed -i \
-              's|<linux/compiler_types.h>|<linux/compiler.h>|g' \
-              "$FILE"
-          done
+          echo "========== THRONE TRACKER =========="
+          grep -n -B10 -A15 \
+            'full_name_hash' \
+            drivers/kernelsu/manager/throne_tracker.c || true
 
           echo
-          echo "2. sched/signal.h -> sched.h"
-
-          grep -R -l \
-            'linux/sched/signal.h' \
-            drivers/kernelsu 2>/dev/null | \
-          while read -r FILE; do
-            echo "Patching $FILE"
-            sed -i \
-              's|<linux/sched/signal.h>|<linux/sched.h>|g' \
-              "$FILE"
-          done
+          echo "========== KERNEL ALLOCATION API =========="
+          grep -R -n \
+            'kvmalloc\|kvfree' \
+            include/linux mm 2>/dev/null | head -100 || true
 
           echo
-          echo "3. sched/task.h -> sched.h"
-
-          grep -R -l \
-            'linux/sched/task.h' \
-            drivers/kernelsu 2>/dev/null | \
-          while read -r FILE; do
-            echo "Patching $FILE"
-            sed -i \
-              's|<linux/sched/task.h>|<linux/sched.h>|g' \
-              "$FILE"
-          done
-
-          echo
-          echo "===== VERIFY OLD-KERNEL PATCHES ====="
-
-          REMAINING=0
-
-          if grep -R -n \
-            'linux/compiler_types.h' \
-            drivers/kernelsu 2>/dev/null; then
-            echo "ERROR: compiler_types.h remains"
-            REMAINING=1
-          fi
-
-          if grep -R -n \
-            'linux/sched/signal.h' \
-            drivers/kernelsu 2>/dev/null; then
-            echo "ERROR: sched/signal.h remains"
-            REMAINING=1
-          fi
-
-          if grep -R -n \
-            'linux/sched/task.h' \
-            drivers/kernelsu 2>/dev/null; then
-            echo "ERROR: sched/task.h remains"
-            REMAINING=1
-          fi
-
-          if [ "$REMAINING" -ne 0 ]; then
-            exit 1
-          fi
-
-          echo
-          echo "ALL OLD-KERNEL HEADER PATCHES OK"
-
-      - name: Enable KernelSU
-        working-directory: kernel
-        run: |
-          cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
-
-          # KernelSU Next
-          CONFIG_KSU=y
-          EOF
-
-      - name: Apply manual KernelSU hooks
-        working-directory: kernel
-        run: |
-          set -eux
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          def patch(path, old, new):
-              p = Path(path)
-              data = p.read_text()
-
-              if old not in data:
-                  raise SystemExit("PATCH TARGET NOT FOUND: " + path)
-
-              p.write_text(data.replace(old, new, 1))
-              print("PATCHED:", path)
-
-          # =========================================================
-          # fs/exec.c
-          # =========================================================
-
-          patch(
-              "fs/exec.c",
-              """int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd,
-          	struct filename **filename_ptr,
-          	void *argv, void *envp, int *flags);
-          #endif
-
-          int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {"""
-          )
-
-          patch(
-              "fs/exec.c",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          #ifdef CONFIG_KSU
-          	{
-          		int ksu_fd = AT_FDCWD;
-          		int ksu_flags = 0;
-          		ksu_handle_execveat(&ksu_fd, &filename,
-          			&argv, &envp, &ksu_flags);
-          	}
-          #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
-          )
-
-          # =========================================================
-          # fs/open.c
-          # =========================================================
-
-          patch(
-              "fs/open.c",
-              """/*
-           * access() needs to use the real uid/gid, not the effective uid/gid.""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd,
-          	const char __user **filename_user,
-          	int *mode, int *flags);
-          #endif
-
-          /*
-           * access() needs to use the real uid/gid, not the effective uid/gid."""
-          )
-
-          patch(
-              "fs/open.c",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          	if (mode & ~S_IRWXO)""",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-
-          	if (mode & ~S_IRWXO)"""
-          )
-
-          # =========================================================
-          # fs/read_write.c
-          # =========================================================
-
-          patch(
-              "fs/read_write.c",
-              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern __attribute__((cold)) int ksu_handle_sys_read(
-          	unsigned int fd,
-          	char __user **buf_ptr,
-          	size_t *count_ptr);
-          #endif
-
-          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {"""
-          )
-
-          patch(
-              "fs/read_write.c",
-              """	ssize_t ret = -EBADF;
-
-          	if (f.file) {""",
-              """	ssize_t ret = -EBADF;
-
-          #ifdef CONFIG_KSU
-          	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(fd,
-          			(char __user **)&buf, &count);
-          #endif
-
-          	if (f.file) {"""
-          )
-
-          # =========================================================
-          # fs/stat.c
-          # =========================================================
-
-          patch(
-              "fs/stat.c",
-              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd,
-          	const char __user **filename_user,
-          	int *flags);
-          #endif
-
-          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat"""
-          )
-
-          patch(
-              "fs/stat.c",
-              """	struct kstat stat;
-          	int error;
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);""",
-              """	struct kstat stat;
-          	int error;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_stat(&dfd, &filename, &flag);
-          #endif
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);"""
-          )
-
-          # =========================================================
-          # kernel/reboot.c
-          # =========================================================
-
-          patch(
-              "kernel/reboot.c",
-              """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1,
-          	int magic2, unsigned int cmd,
-          	void __user **arg);
-          #endif
-
-          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {"""
-          )
-
-          patch(
-              "kernel/reboot.c",
-              """	int ret = 0;
-
-          	/* We only trust the superuser with rebooting the system. */""",
-              """	int ret = 0;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-          #endif
-
-          	/* We only trust the superuser with rebooting the system. */"""
-          )
-
-          print("ALL KERNELSU HOOKS APPLIED")
-          PY
-
-      - name: Verify hooks
-        working-directory: kernel
-        run: |
-          set -eux
-
-          grep -n "ksu_handle_execveat" fs/exec.c
-          grep -n "ksu_handle_faccessat" fs/open.c
-          grep -n "ksu_handle_sys_read" fs/read_write.c
-          grep -n "ksu_handle_stat" fs/stat.c
-          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
-
-      - name: Configure kernel
-        working-directory: kernel
-        run: |
-          set -eux
-
-          make O=out ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            lineage_xcover4s_defconfig
-
-          make O=out ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            olddefconfig
-
-          echo "===== KERNELSU CONFIG ====="
-          grep '^CONFIG_KSU=y' out/.config
-
-      - name: Build kernel CLEAN with heartbeat
-        working-directory: kernel
-        run: |
-          set +e
-
-          echo "=========================================="
-          echo " STARTING CLEAN KERNEL BUILD"
-          echo " OBJDUMP WARNINGS ARE HIDDEN"
-          echo " HEARTBEAT EVERY 60 SECONDS"
-          echo "=========================================="
-
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" \
-            > build.log 2>&1 &
-
-          BUILD_PID=$!
-          MINUTES=0
-
-          while kill -0 "$BUILD_PID" 2>/dev/null; do
-            sleep 60
-
-            if kill -0 "$BUILD_PID" 2>/dev/null; then
-              MINUTES=$((MINUTES + 1))
-              echo "Kernel build still running... ${MINUTES} min"
-            fi
-          done
-
-          wait "$BUILD_PID"
-          RESULT=$?
-
-          echo
-          echo "=========================================="
-          echo " BUILD FINISHED - RESULT: $RESULT"
-          echo "=========================================="
-
-          echo
-          echo "===== REAL ERRORS ====="
-
-          grep -iE \
-            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|implicit declaration|undeclared" \
-            build.log \
-            | grep -viE \
-              'objdump:|Unrecognized form: 0x22|Unrecognized form: 0x23|DIE at offset' \
-            | tail -200 || true
-
-          echo
-          echo "===== CLEAN BUILD END ====="
-
-          grep -viE \
-            'objdump:|Unrecognized form: 0x22|Unrecognized form: 0x23|DIE at offset' \
-            build.log \
-            | tail -100 || true
-
-          exit "$RESULT"
-
-      - name: Upload full build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcover4s-build-log
-          path: kernel/build.log
-          if-no-files-found: warn
-
-      - name: Verify finished KernelSU kernel
-        if: success()
-        working-directory: kernel
-        run: |
-          set -eux
-
-          grep '^CONFIG_KSU=y' out/.config
-          test -f out/arch/arm64/boot/Image
-
-          echo "===== KERNELSU SYMBOLS ====="
-          grep "ksu_handle_" out/System.map | head -30
-
-          echo
-          echo "===== KERNEL IMAGE READY ====="
-          ls -lh out/arch/arm64/boot/Image
-          sha256sum out/arch/arm64/boot/Image
-
-      - name: Upload finished kernel
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcover4s-kernelsu-next
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/.config
-            kernel/out/System.map
-          if-no-files-found: error
+          echo "========== FULL_NAME_HASH DECLARATION =========="
+          grep -R -n \
+            'full_name_hash' \
+            include/linux/dcache.h fs 2>/dev/null | head -50 || true
