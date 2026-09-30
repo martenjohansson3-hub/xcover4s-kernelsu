@@ -1,28 +1,57 @@
-
-name: Check XCover4s Kernel
+name: Build XCover4s Kernel
 
 on:
   workflow_dispatch:
   push:
 
 jobs:
-  check:
+  build:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev \
+            libelf-dev gcc-aarch64-linux-gnu
+
       - name: Download kernel source
         run: |
-          git clone --depth=1 -b lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git clone --depth=1 -b lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
 
-      - name: Find XCover4s configuration
-        run: |
-          echo "=== XCover4s configs ==="
-          find kernel/arch/arm64/configs -type f | grep -Ei "xcover|g398" || true
-
-          echo "=== Other relevant configs ==="
-          find kernel/arch/arm64/configs -type f | grep -Ei "7884|7885|lineage|universal" || true
-
-      - name: Kernel information
+      - name: Configure XCover4s
         run: |
           cd kernel
-          head -n 10 Makefile
+          mkdir -p out
+          make O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            lineage_xcover4s_defconfig
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          make -j$(nproc) \
+            O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu-
+
+      - name: Show build result
+        run: |
+          echo "=== Kernel output ==="
+          find kernel/out/arch/arm64/boot \
+            -maxdepth 2 -type f \
+            \( -name "Image*" -o -name "*.dtb" -o -name "*.dtbo" \) \
+            -ls
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-kernel-test
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/*.dtb
+            kernel/out/arch/arm64/boot/*.dtbo
+          if-no-files-found: warn
