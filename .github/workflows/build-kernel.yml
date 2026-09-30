@@ -38,22 +38,52 @@ jobs:
         run: |
           set -eux
 
-          test -f include/linux/compiler.h
+          echo "===== OLD KERNEL COMPATIBILITY PATCHES ====="
 
-          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null | \
+          test -f include/linux/compiler.h
+          test -f include/linux/sched.h
+
+          echo "Patch compiler_types.h -> compiler.h"
+
+          grep -R -l \
+            'linux/compiler_types.h' \
+            drivers/kernelsu 2>/dev/null | \
           while read -r FILE; do
-            echo "Patching $FILE"
+            echo "Patching compiler header in $FILE"
             sed -i \
               's|<linux/compiler_types.h>|<linux/compiler.h>|g' \
               "$FILE"
           done
 
-          if grep -R -n 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null; then
+          echo "Patch sched/signal.h -> sched.h"
+
+          grep -R -l \
+            'linux/sched/signal.h' \
+            drivers/kernelsu 2>/dev/null | \
+          while read -r FILE; do
+            echo "Patching sched header in $FILE"
+            sed -i \
+              's|<linux/sched/signal.h>|<linux/sched.h>|g' \
+              "$FILE"
+          done
+
+          echo "===== VERIFY COMPATIBILITY PATCHES ====="
+
+          if grep -R -n \
+            'linux/compiler_types.h' \
+            drivers/kernelsu 2>/dev/null; then
             echo "ERROR: compiler_types.h reference remains"
             exit 1
           fi
 
-          echo "Old-kernel header patch OK"
+          if grep -R -n \
+            'linux/sched/signal.h' \
+            drivers/kernelsu 2>/dev/null; then
+            echo "ERROR: sched/signal.h reference remains"
+            exit 1
+          fi
+
+          echo "Old-kernel compatibility patches OK"
 
       - name: Enable KernelSU
         working-directory: kernel
