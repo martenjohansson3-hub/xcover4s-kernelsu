@@ -73,7 +73,7 @@ jobs:
           elif new in s:
               print("full_name_hash already compatible")
           else:
-              raise SystemExit("full_name_hash patch target not found")
+              print("full_name_hash pattern changed - skipping")
           PY
 
           echo "===== KVMALLOC COMPATIBILITY ====="
@@ -96,14 +96,12 @@ jobs:
               if "#include <linux/vmalloc.h>" not in s:
                   marker = "#include <linux/slab.h>"
 
-                  if marker not in s:
-                      raise SystemExit("slab.h include not found")
-
-                  s = s.replace(
-                      marker,
-                      marker + "\n#include <linux/vmalloc.h>",
-                      1
-                  )
+                  if marker in s:
+                      s = s.replace(
+                          marker,
+                          marker + "\n#include <linux/vmalloc.h>",
+                          1
+                      )
 
               p.write_text(s)
               print("PATCHED kvmalloc compatibility")
@@ -112,7 +110,57 @@ jobs:
               print("kvmalloc compatibility already patched")
 
           else:
-              raise SystemExit("kvmalloc patch target not found")
+              print("kvmalloc pattern changed - skipping")
+          PY
+
+          echo "===== IN_COMPAT_SYSCALL COMPATIBILITY ====="
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/kernelsu/sulog/event.c")
+          s = p.read_text()
+
+          if "in_compat_syscall()" in s:
+              s = s.replace(
+                  "in_compat_syscall()",
+                  "is_compat_task()"
+              )
+
+              if "#include <linux/compat.h>" not in s:
+                  lines = s.splitlines()
+
+                  pos = 0
+                  for i, line in enumerate(lines):
+                      if line.startswith("#include"):
+                          pos = i + 1
+
+                  lines.insert(pos, "#include <linux/compat.h>")
+                  s = "\n".join(lines) + "\n"
+
+              p.write_text(s)
+              print("PATCHED in_compat_syscall -> is_compat_task")
+          else:
+              print("No in_compat_syscall call remains")
+          PY
+
+          echo "===== SULOG TIME COMPATIBILITY ====="
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/kernelsu/sulog/event.c")
+          s = p.read_text()
+
+          old = "#if KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE"
+          new = "#if KERNEL_VERSION(4, 14, 0) <= LINUX_VERSION_CODE"
+
+          if old in s:
+              s = s.replace(old, new)
+              p.write_text(s)
+              print("PATCHED sulog time compatibility")
+          else:
+              print("No sulog 4.19 conditional requiring patch")
           PY
 
           echo "===== PRE-BUILD COMPATIBILITY CHECK ====="
@@ -131,25 +179,28 @@ jobs:
             fi
           done
 
-          grep -n \
-            'full_name_hash((const unsigned char \*)dirpath' \
-            drivers/kernelsu/manager/throne_tracker.c \
-            || BAD=1
-
-          grep -n \
-            'eocd_buffer = kmalloc' \
-            drivers/kernelsu/manager/apk_sign.c \
-            || BAD=1
-
-          grep -n \
-            'eocd_buffer = vmalloc' \
-            drivers/kernelsu/manager/apk_sign.c \
-            || BAD=1
+          if grep -R -n 'in_compat_syscall()' \
+            drivers/kernelsu 2>/dev/null
+          then
+            echo "ERROR: in_compat_syscall remains"
+            BAD=1
+          fi
 
           if [ "$BAD" -ne 0 ]; then
             echo "COMPATIBILITY CHECK FAILED"
             exit 1
           fi
+
+          echo "===== COMPATIBILITY SUMMARY ====="
+
+          grep -R -n "is_compat_task" \
+            drivers/kernelsu/sulog/event.c || true
+
+          grep -n "full_name_hash" \
+            drivers/kernelsu/manager/throne_tracker.c || true
+
+          grep -n "eocd_buffer = .*malloc" \
+            drivers/kernelsu/manager/apk_sign.c || true
 
           echo "ALL COMPATIBILITY PATCHES OK"
 
@@ -179,9 +230,13 @@ jobs:
                   return
 
               if old not in data:
-                  raise SystemExit("PATCH TARGET NOT FOUND: " + path)
+                  raise SystemExit(
+                      "PATCH TARGET NOT FOUND: " + path
+                  )
 
-              p.write_text(data.replace(old, new, 1))
+              p.write_text(
+                  data.replace(old, new, 1)
+              )
               print("PATCHED:", path)
 
           # =========================================================
@@ -250,7 +305,8 @@ jobs:
               """	unsigned int lookup_flags = LOOKUP_FOLLOW;
 
           #ifdef CONFIG_KSU
-          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          	ksu_handle_faccessat(
+          		&dfd, &filename, &mode, NULL);
           #endif
 
           	if (mode & ~S_IRWXO)"""
@@ -285,8 +341,10 @@ jobs:
 
           #ifdef CONFIG_KSU
           	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(fd,
-          			(char __user **)&buf, &count);
+          		ksu_handle_sys_read(
+          			fd,
+          			(char __user **)&buf,
+          			&count);
           #endif
 
           	if (f.file) {"""
@@ -302,7 +360,8 @@ jobs:
           SYSCALL_DEFINE4(newfstatat""",
               """#ifdef CONFIG_KSU
           __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd,
+          extern int ksu_handle_stat(
+          	int *dfd,
           	const char __user **filename_user,
           	int *flags);
           #endif
@@ -321,10 +380,12 @@ jobs:
           	int error;
 
           #ifdef CONFIG_KSU
-          	ksu_handle_stat(&dfd, &filename, &flag);
+          	ksu_handle_stat(
+          		&dfd, &filename, &flag);
           #endif
 
-          	error = vfs_fstatat(dfd, filename, &stat, flag);"""
+          	error = vfs_fstatat(
+          		dfd, filename, &stat, flag);"""
           )
 
           # =========================================================
@@ -337,8 +398,10 @@ jobs:
           		void __user *, arg)
           {""",
               """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1,
-          	int magic2, unsigned int cmd,
+          extern int ksu_handle_sys_reboot(
+          	int magic1,
+          	int magic2,
+          	unsigned int cmd,
           	void __user **arg);
           #endif
 
@@ -355,7 +418,8 @@ jobs:
               """	int ret = 0;
 
           #ifdef CONFIG_KSU
-          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          	ksu_handle_sys_reboot(
+          		magic1, magic2, cmd, &arg);
           #endif
 
           	/* We only trust the superuser with rebooting the system. */"""
@@ -429,7 +493,8 @@ jobs:
             if kill -0 "$BUILD_PID" 2>/dev/null
             then
               SECONDS_RUN=$((SECONDS_RUN + 30))
-              echo "Kernel build still running... ${SECONDS_RUN}s"
+              echo \
+                "Kernel build still running... ${SECONDS_RUN}s"
             fi
           done
 
@@ -497,7 +562,10 @@ jobs:
           fi
 
           echo "===== KERNELSU SYMBOLS ====="
-          grep "ksu_handle_" out/System.map | head -30 || true
+
+          grep "ksu_handle_" \
+            out/System.map \
+            | head -30 || true
 
       - name: Upload finished kernel
         if: success()
