@@ -28,9 +28,39 @@ jobs:
         working-directory: kernel
         run: |
           set -eux
+
           curl -LSs \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
+
+      - name: Patch KernelSU for old kernel headers
+        working-directory: kernel
+        run: |
+          set -eux
+
+          echo "===== OLD KERNEL HEADER CHECK ====="
+          test -f include/linux/compiler.h
+
+          echo "===== compiler_types.h REFERENCES BEFORE ====="
+          grep -R -n 'linux/compiler_types.h' drivers/kernelsu || true
+
+          echo "===== PATCHING ====="
+
+          grep -R -l 'linux/compiler_types.h' drivers/kernelsu | while read -r FILE; do
+            echo "Patching: $FILE"
+            sed -i \
+              's|<linux/compiler_types.h>|<linux/compiler.h>|g' \
+              "$FILE"
+          done
+
+          echo "===== VERIFY PATCH ====="
+
+          if grep -R -n 'linux/compiler_types.h' drivers/kernelsu; then
+            echo "ERROR: compiler_types.h still referenced"
+            exit 1
+          fi
+
+          grep -R -n 'linux/compiler.h' drivers/kernelsu | head -30 || true
 
       - name: Enable KernelSU
         working-directory: kernel
@@ -291,12 +321,14 @@ jobs:
 
           echo
           echo "===== POSSIBLE REAL ERRORS ====="
+
           grep -iE \
-            "error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|FAILED|implicit declaration|undeclared" \
-            build.log | tail -150 || true
+            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|FAILED|implicit declaration|undeclared" \
+            build.log | tail -200 || true
 
           echo
           echo "===== LAST 200 LINES ====="
+
           tail -200 build.log
 
           exit $RESULT
