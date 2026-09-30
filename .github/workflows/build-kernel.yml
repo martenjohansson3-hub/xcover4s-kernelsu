@@ -1,4 +1,4 @@
-name: Inspect KernelSU Legacy
+name: Build XCover4s KernelSU Next
 
 on:
   workflow_dispatch:
@@ -7,10 +7,17 @@ on:
       - ".github/workflows/build-kernel.yml"
 
 jobs:
-  inspect:
+  build:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            clang lld gcc-aarch64-linux-gnu curl git python3
+
       - name: Download kernel source
         run: |
           git clone --depth=1 --branch lineage-18.1 \
@@ -25,28 +32,391 @@ jobs:
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
 
-      - name: Show exact compatibility code
+      - name: Patch KernelSU old kernel compatibility
         working-directory: kernel
         run: |
-          echo "========== APK SIGN =========="
-          grep -n -B20 -A40 \
-            'kvmalloc\|kvfree\|eocd_buffer' \
-            drivers/kernelsu/manager/apk_sign.c || true
+          set -eux
+
+          echo "===== HEADER COMPATIBILITY ====="
+
+          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null | \
+            xargs -r sed -i 's|<linux/compiler_types.h>|<linux/compiler.h>|g'
+
+          grep -R -l 'linux/sched/signal.h' drivers/kernelsu 2>/dev/null | \
+            xargs -r sed -i 's|<linux/sched/signal.h>|<linux/sched.h>|g'
+
+          grep -R -l 'linux/sched/task.h' drivers/kernelsu 2>/dev/null | \
+            xargs -r sed -i 's|<linux/sched/task.h>|<linux/sched.h>|g'
+
+          echo "===== FULL_NAME_HASH COMPATIBILITY ====="
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/kernelsu/manager/throne_tracker.c")
+          s = p.read_text()
+
+          old = "full_name_hash(NULL, dirpath, strlen(dirpath))"
+          new = "full_name_hash((const unsigned char *)dirpath, strlen(dirpath))"
+
+          if old not in s:
+              raise SystemExit("full_name_hash patch target not found")
+
+          p.write_text(s.replace(old, new, 1))
+          print("PATCHED full_name_hash")
+          PY
+
+          echo "===== KVMALLOC COMPATIBILITY ====="
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/kernelsu/manager/apk_sign.c")
+          s = p.read_text()
+
+          old = "eocd_buffer = kvmalloc(search_size, GFP_KERNEL);"
+
+          new = """eocd_buffer = kmalloc(search_size, GFP_KERNEL);
+                  if (!eocd_buffer)
+                      eocd_buffer = vmalloc(search_size);"""
+
+          if old not in s:
+              raise SystemExit("kvmalloc patch target not found")
+
+          s = s.replace(old, new, 1)
+
+          # vmalloc declaration
+          if "#include <linux/vmalloc.h>" not in s:
+              marker = "#include <linux/slab.h>"
+              if marker not in s:
+                  raise SystemExit("slab.h include not found")
+              s = s.replace(
+                  marker,
+                  marker + "\n#include <linux/vmalloc.h>",
+                  1
+              )
+
+          p.write_text(s)
+          print("PATCHED kvmalloc compatibility")
+          PY
+
+          echo "===== VERIFY COMPATIBILITY ====="
+
+          ! grep -R -n 'linux/compiler_types.h' drivers/kernelsu
+          ! grep -R -n 'linux/sched/signal.h' drivers/kernelsu
+          ! grep -R -n 'linux/sched/task.h' drivers/kernelsu
+
+          grep -n \
+            'full_name_hash((const unsigned char \*)dirpath' \
+            drivers/kernelsu/manager/throne_tracker.c
+
+          grep -n \
+            'eocd_buffer = kmalloc' \
+            drivers/kernelsu/manager/apk_sign.c
+
+          grep -n \
+            'eocd_buffer = vmalloc' \
+            drivers/kernelsu/manager/apk_sign.c
+
+          echo "ALL COMPATIBILITY PATCHES OK"
+
+      - name: Enable KernelSU
+        working-directory: kernel
+        run: |
+          cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
+
+          # KernelSU Next
+          CONFIG_KSU=y
+          EOF
+
+      - name: Apply manual KernelSU hooks
+        working-directory: kernel
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          def patch(path, old, new):
+              p = Path(path)
+              data = p.read_text()
+              if old not in data:
+                  raise SystemExit("PATCH TARGET NOT FOUND: " + path)
+              p.write_text(data.replace(old, new, 1))
+              print("PATCHED:", path)
+
+          patch(
+              "fs/exec.c",
+              """int do_execve(struct filename *filename,
+          	const char __user *const __user *__argv,
+          	const char __user *const __user *__envp)
+          {""",
+              """#ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_execveat(int *fd,
+          	struct filename **filename_ptr,
+          	void *argv, void *envp, int *flags);
+          #endif
+
+          int do_execve(struct filename *filename,
+          	const char __user *const __user *__argv,
+          	const char __user *const __user *__envp)
+          {"""
+          )
+
+          patch(
+              "fs/exec.c",
+              """	struct user_arg_ptr envp = { .ptr.native = __envp };
+          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
+              """	struct user_arg_ptr envp = { .ptr.native = __envp };
+          #ifdef CONFIG_KSU
+          	{
+          		int ksu_fd = AT_FDCWD;
+          		int ksu_flags = 0;
+          		ksu_handle_execveat(&ksu_fd, &filename,
+          			&argv, &envp, &ksu_flags);
+          	}
+          #endif
+          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
+          )
+
+          patch(
+              "fs/open.c",
+              """/*
+           * access() needs to use the real uid/gid, not the effective uid/gid.""",
+              """#ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_faccessat(int *dfd,
+          	const char __user **filename_user,
+          	int *mode, int *flags);
+          #endif
+
+          /*
+           * access() needs to use the real uid/gid, not the effective uid/gid."""
+          )
+
+          patch(
+              "fs/open.c",
+              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
+
+          	if (mode & ~S_IRWXO)""",
+              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
+
+          #ifdef CONFIG_KSU
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+
+          	if (mode & ~S_IRWXO)"""
+          )
+
+          patch(
+              "fs/read_write.c",
+              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {""",
+              """#ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern __attribute__((cold)) int ksu_handle_sys_read(
+          	unsigned int fd,
+          	char __user **buf_ptr,
+          	size_t *count_ptr);
+          #endif
+
+          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {"""
+          )
+
+          patch(
+              "fs/read_write.c",
+              """	ssize_t ret = -EBADF;
+
+          	if (f.file) {""",
+              """	ssize_t ret = -EBADF;
+
+          #ifdef CONFIG_KSU
+          	if (unlikely(ksu_vfs_read_hook))
+          		ksu_handle_sys_read(fd,
+          			(char __user **)&buf, &count);
+          #endif
+
+          	if (f.file) {"""
+          )
+
+          patch(
+              "fs/stat.c",
+              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+          SYSCALL_DEFINE4(newfstatat""",
+              """#ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_stat(int *dfd,
+          	const char __user **filename_user,
+          	int *flags);
+          #endif
+
+          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+          SYSCALL_DEFINE4(newfstatat"""
+          )
+
+          patch(
+              "fs/stat.c",
+              """	struct kstat stat;
+          	int error;
+
+          	error = vfs_fstatat(dfd, filename, &stat, flag);""",
+              """	struct kstat stat;
+          	int error;
+
+          #ifdef CONFIG_KSU
+          	ksu_handle_stat(&dfd, &filename, &flag);
+          #endif
+
+          	error = vfs_fstatat(dfd, filename, &stat, flag);"""
+          )
+
+          patch(
+              "kernel/reboot.c",
+              """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+          		void __user *, arg)
+          {""",
+              """#ifdef CONFIG_KSU
+          extern int ksu_handle_sys_reboot(int magic1,
+          	int magic2, unsigned int cmd,
+          	void __user **arg);
+          #endif
+
+          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+          		void __user *, arg)
+          {"""
+          )
+
+          patch(
+              "kernel/reboot.c",
+              """	int ret = 0;
+
+          	/* We only trust the superuser with rebooting the system. */""",
+              """	int ret = 0;
+
+          #ifdef CONFIG_KSU
+          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          #endif
+
+          	/* We only trust the superuser with rebooting the system. */"""
+          )
+
+          print("ALL KERNELSU HOOKS APPLIED")
+          PY
+
+      - name: Verify hooks
+        working-directory: kernel
+        run: |
+          set -eux
+          grep -n "ksu_handle_execveat" fs/exec.c
+          grep -n "ksu_handle_faccessat" fs/open.c
+          grep -n "ksu_handle_sys_read" fs/read_write.c
+          grep -n "ksu_handle_stat" fs/stat.c
+          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          set -eux
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            lineage_xcover4s_defconfig
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          grep '^CONFIG_KSU=y' out/.config
+
+      - name: Build kernel CLEAN with heartbeat
+        working-directory: kernel
+        run: |
+          set +e
+
+          echo "=========================================="
+          echo " STARTING CLEAN KERNEL BUILD"
+          echo " HEARTBEAT EVERY 60 SECONDS"
+          echo "=========================================="
+
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error" \
+            > build.log 2>&1 &
+
+          BUILD_PID=$!
+          MINUTES=0
+
+          while kill -0 "$BUILD_PID" 2>/dev/null; do
+            sleep 60
+            if kill -0 "$BUILD_PID" 2>/dev/null; then
+              MINUTES=$((MINUTES + 1))
+              echo "Kernel build still running... ${MINUTES} min"
+            fi
+          done
+
+          wait "$BUILD_PID"
+          RESULT=$?
 
           echo
-          echo "========== THRONE TRACKER =========="
-          grep -n -B10 -A15 \
-            'full_name_hash' \
-            drivers/kernelsu/manager/throne_tracker.c || true
+          echo "=========================================="
+          echo " BUILD FINISHED - RESULT: $RESULT"
+          echo "=========================================="
 
-          echo
-          echo "========== KERNEL ALLOCATION API =========="
-          grep -R -n \
-            'kvmalloc\|kvfree' \
-            include/linux mm 2>/dev/null | head -100 || true
+          echo "===== REAL ERRORS ====="
+          grep -iE \
+            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|implicit declaration|undeclared|too many arguments" \
+            build.log \
+            | grep -viE \
+              'objdump:|Unrecognized form: 0x22|Unrecognized form: 0x23|DIE at offset|Bogus end-of-siblings' \
+            | tail -200 || true
 
-          echo
-          echo "========== FULL_NAME_HASH DECLARATION =========="
-          grep -R -n \
-            'full_name_hash' \
-            include/linux/dcache.h fs 2>/dev/null | head -50 || true
+          echo "===== CLEAN BUILD END ====="
+          grep -viE \
+            'objdump:|Unrecognized form: 0x22|Unrecognized form: 0x23|DIE at offset|Bogus end-of-siblings' \
+            build.log \
+            | tail -100 || true
+
+          exit "$RESULT"
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-build-log
+          path: kernel/build.log
+          if-no-files-found: warn
+
+      - name: Verify finished KernelSU kernel
+        if: success()
+        working-directory: kernel
+        run: |
+          set -eux
+
+          grep '^CONFIG_KSU=y' out/.config
+          test -f out/arch/arm64/boot/Image
+
+          echo "===== KERNELSU SYMBOLS ====="
+          grep "ksu_handle_" out/System.map | head -30
+
+          echo "===== KERNEL IMAGE READY ====="
+          ls -lh out/arch/arm64/boot/Image
+          sha256sum out/arch/arm64/boot/Image
+
+      - name: Upload finished kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-kernelsu-next
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            kernel/out/System.map
+          if-no-files-found: error
