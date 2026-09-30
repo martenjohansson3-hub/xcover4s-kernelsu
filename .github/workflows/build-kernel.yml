@@ -38,35 +38,26 @@ jobs:
         run: |
           set -eux
 
-          echo "===== CHECK OLD KERNEL HEADER ====="
           test -f include/linux/compiler.h
 
-          echo "===== compiler_types.h REFERENCES ====="
-          grep -R -n 'linux/compiler_types.h' drivers/kernelsu || true
-
-          echo "===== PATCH compiler_types.h -> compiler.h ====="
-
-          grep -R -l 'linux/compiler_types.h' drivers/kernelsu | while read -r FILE; do
+          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null | \
+          while read -r FILE; do
             echo "Patching $FILE"
             sed -i \
               's|<linux/compiler_types.h>|<linux/compiler.h>|g' \
               "$FILE"
           done
 
-          echo "===== VERIFY HEADER PATCH ====="
-
-          if grep -R -n 'linux/compiler_types.h' drivers/kernelsu; then
+          if grep -R -n 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null; then
             echo "ERROR: compiler_types.h reference remains"
             exit 1
           fi
 
-          echo "Header compatibility patch OK"
+          echo "Old-kernel header patch OK"
 
       - name: Enable KernelSU
         working-directory: kernel
         run: |
-          set -eux
-
           cat >> arch/arm64/configs/lineage_xcover4s_defconfig <<'EOF'
 
           # KernelSU Next
@@ -302,43 +293,49 @@ jobs:
           echo "===== KERNELSU CONFIG ====="
           grep '^CONFIG_KSU=y' out/.config
 
-      - name: Build kernel
+      - name: Build kernel CLEAN
         working-directory: kernel
         run: |
           set +e
           set -o pipefail
 
-          echo "===== STARTING KERNEL BUILD ====="
-          echo "Build output is LIVE and also saved to build.log"
+          echo "=========================================="
+          echo " STARTING CLEAN KERNEL BUILD"
+          echo " OBJDUMP WARNINGS ARE HIDDEN"
+          echo "=========================================="
 
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            2>&1 | tee build.log
+            > build.log 2>&1
 
-          RESULT=${PIPESTATUS[0]}
+          RESULT=$?
 
           echo
-          echo "===== BUILD RESULT: $RESULT ====="
+          echo "=========================================="
+          echo " BUILD FINISHED - RESULT: $RESULT"
+          echo "=========================================="
 
-          if [ "$RESULT" -ne 0 ]; then
-            echo
-            echo "===== POSSIBLE REAL ERRORS ====="
+          echo
+          echo "===== REAL ERRORS ====="
 
-            grep -iE \
-              "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|FAILED|implicit declaration|undeclared" \
-              build.log | tail -200 || true
+          grep -iE \
+            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|Error [0-9]+|implicit declaration|undeclared" \
+            build.log \
+            | grep -v 'objdump:' \
+            | tail -200 || true
 
-            echo
-            echo "===== LAST 100 LINES ====="
-            tail -100 build.log
-          fi
+          echo
+          echo "===== CLEAN BUILD END ====="
+
+          grep -v 'objdump:' build.log \
+            | tail -100 || true
 
           exit "$RESULT"
 
-      - name: Upload build log
+      - name: Upload full build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -355,10 +352,10 @@ jobs:
           grep '^CONFIG_KSU=y' out/.config
           test -f out/arch/arm64/boot/Image
 
-          echo "===== KSU SYMBOLS ====="
+          echo "===== KERNELSU SYMBOLS ====="
           grep "ksu_handle_" out/System.map | head -30
 
-          echo "===== IMAGE ====="
+          echo "===== KERNEL IMAGE READY ====="
           ls -lh out/arch/arm64/boot/Image
           sha256sum out/arch/arm64/boot/Image
 
