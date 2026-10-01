@@ -1,4 +1,4 @@
-name: XCover4s KernelSU Fast Test 3
+name: XCover4s KernelSU Fast Test 4
 
 on:
   workflow_dispatch:
@@ -30,6 +30,7 @@ jobs:
             kernel
 
           cd kernel
+          echo "===== KERNEL ====="
           git rev-parse HEAD
 
       - name: Install KernelSU Next
@@ -42,6 +43,8 @@ jobs:
             | bash -s legacy
 
           if [ -d KernelSU-Next ]; then
+            echo "===== KERNELSU ====="
+            git -C KernelSU-Next rev-parse HEAD || true
             git -C KernelSU-Next describe --tags --always || true
           fi
 
@@ -54,7 +57,10 @@ jobs:
           echo " APPLYING OLD KERNEL FIXES"
           echo "=========================================="
 
-          # Missing headers in this old kernel
+          # --------------------------------------------------------
+          # Missing headers on old kernel
+          # --------------------------------------------------------
+
           grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null \
             | xargs -r sed -i \
             's|<linux/compiler_types.h>|<linux/compiler.h>|g'
@@ -77,9 +83,9 @@ jobs:
 
           root = Path("drivers/kernelsu")
 
-          # --------------------------------------------------------
-          # full_name_hash
-          # --------------------------------------------------------
+          # ========================================================
+          # full_name_hash()
+          # ========================================================
 
           for p in root.rglob("*.c"):
               try:
@@ -87,7 +93,7 @@ jobs:
               except Exception:
                   continue
 
-              old = s
+              original = s
 
               s = re.sub(
                   r'full_name_hash\s*\(\s*NULL\s*,\s*'
@@ -96,13 +102,13 @@ jobs:
                   s
               )
 
-              if s != old:
+              if s != original:
                   p.write_text(s)
                   print("PATCHED full_name_hash:", p)
 
-          # --------------------------------------------------------
-          # in_compat_syscall
-          # --------------------------------------------------------
+          # ========================================================
+          # in_compat_syscall()
+          # ========================================================
 
           for p in root.rglob("*"):
 
@@ -123,28 +129,15 @@ jobs:
               )
 
               if "#include <linux/compat.h>" not in s:
-
-                  lines = s.splitlines()
-                  pos = 0
-
-                  for i, line in enumerate(lines):
-                      if line.startswith("#include"):
-                          pos = i + 1
-
-                  lines.insert(pos, "#include <linux/compat.h>")
-
-                  s = "\n".join(lines) + "\n"
+                  # Put include at TOP, not after code.
+                  s = "#include <linux/compat.h>\n" + s
 
               p.write_text(s)
-
               print("PATCHED compat:", p)
 
-          # --------------------------------------------------------
-          # kvmalloc -> vmalloc
-          # kvfree   -> vfree
-          #
-          # Add linux/vmalloc.h EXPLICITLY to every changed source.
-          # --------------------------------------------------------
+          # ========================================================
+          # kvmalloc / kvfree
+          # ========================================================
 
           for p in root.rglob("*"):
 
@@ -158,8 +151,6 @@ jobs:
 
               original = s
 
-              # KernelSU call form:
-              # kvmalloc(size, GFP_KERNEL)
               s = re.sub(
                   r'\bkvmalloc\s*\(\s*([^,]+?)\s*,\s*'
                   r'GFP_[A-Z0-9_| ()]+\s*\)',
@@ -175,72 +166,54 @@ jobs:
 
               if s != original:
 
+                  # IMPORTANT:
+                  # include must be BEFORE any function using vmalloc.
                   if "#include <linux/vmalloc.h>" not in s:
-
-                      lines = s.splitlines()
-
-                      insert_at = 0
-
-                      for i, line in enumerate(lines):
-                          if line.startswith("#include"):
-                              insert_at = i + 1
-
-                      lines.insert(
-                          insert_at,
-                          "#include <linux/vmalloc.h>"
-                      )
-
-                      s = "\n".join(lines) + "\n"
+                      s = "#include <linux/vmalloc.h>\n" + s
 
                   p.write_text(s)
+                  print("PATCHED allocation:", p)
 
-                  print("PATCHED VMALLOC:", p)
-
-          # --------------------------------------------------------
-          # IMPORTANT:
-          # Force apk_sign.c fix explicitly.
-          # --------------------------------------------------------
+          # ========================================================
+          # FORCE apk_sign.c FIX
+          # ========================================================
 
           apk = root / "manager" / "apk_sign.c"
 
           if not apk.exists():
-              raise SystemExit("apk_sign.c NOT FOUND")
+              raise SystemExit("ERROR: apk_sign.c NOT FOUND")
 
           s = apk.read_text()
 
-          # Catch anything the generic conversion missed.
+          # Remove any misplaced vmalloc include first.
+          s = s.replace(
+              "#include <linux/vmalloc.h>\n",
+              ""
+          )
+
+          # Convert remaining calls.
           s = re.sub(
               r'\bkvmalloc\s*\(\s*([^,]+?)\s*,\s*GFP_KERNEL\s*\)',
               r'vmalloc(\1)',
               s
           )
 
-          s = s.replace("kvfree(", "vfree(")
+          s = s.replace(
+              "kvfree(",
+              "vfree("
+          )
 
-          if "#include <linux/vmalloc.h>" not in s:
-
-              lines = s.splitlines()
-
-              insert_at = 0
-
-              for i, line in enumerate(lines):
-                  if line.startswith("#include"):
-                      insert_at = i + 1
-
-              lines.insert(
-                  insert_at,
-                  "#include <linux/vmalloc.h>"
-              )
-
-              s = "\n".join(lines) + "\n"
+          # Put declaration at line 1.
+          s = "#include <linux/vmalloc.h>\n" + s
 
           apk.write_text(s)
 
-          print("FORCED apk_sign.c vmalloc compatibility")
+          print("FORCED apk_sign.c FIX")
+          print("vmalloc.h is now FIRST LINE")
 
-          # --------------------------------------------------------
+          # ========================================================
           # ALIGN_DOWN
-          # --------------------------------------------------------
+          # ========================================================
 
           adb = root / "feature" / "adb_root.c"
 
@@ -253,33 +226,22 @@ jobs:
                   "#ifndef ALIGN_DOWN" not in s
               ):
 
-                  lines = s.splitlines()
+                  compat = """
+          #ifndef ALIGN_DOWN
+          #define ALIGN_DOWN(x, a) ((x) & ~((typeof(x))(a) - 1))
+          #endif
 
-                  pos = 0
+          """
 
-                  for i, line in enumerate(lines):
-                      if line.startswith("#include"):
-                          pos = i + 1
+                  s = compat + s
 
-                  compat = [
-                      "",
-                      "#ifndef ALIGN_DOWN",
-                      "#define ALIGN_DOWN(x, a) "
-                      "((x) & ~((typeof(x))(a) - 1))",
-                      "#endif",
-                      ""
-                  ]
-
-                  for line in reversed(compat):
-                      lines.insert(pos, line)
-
-                  adb.write_text("\n".join(lines) + "\n")
+                  adb.write_text(s)
 
                   print("PATCHED ALIGN_DOWN")
 
-          # --------------------------------------------------------
-          # sulog time compatibility
-          # --------------------------------------------------------
+          # ========================================================
+          # sulog event time compatibility
+          # ========================================================
 
           event = root / "sulog" / "event.c"
 
@@ -298,23 +260,64 @@ jobs:
               )
 
               if old in s:
-
                   event.write_text(
                       s.replace(old, new)
                   )
-
                   print("PATCHED event.c")
 
           print("ALL COMPATIBILITY FIXES APPLIED")
           PY
 
           echo
-          echo "===== APK_SIGN CHECK ====="
+          echo "=========================================="
+          echo " VERIFY APK_SIGN FIX"
+          echo "=========================================="
 
-          grep -n \
-            -E 'vmalloc|vfree|kvmalloc|kvfree|vmalloc.h' \
+          echo
+          echo "===== FIRST 20 LINES ====="
+          head -20 drivers/kernelsu/manager/apk_sign.c
+
+          echo
+          echo "===== VMALLOC REFERENCES ====="
+          grep -n -E \
+            'vmalloc|vfree|kvmalloc|kvfree' \
             drivers/kernelsu/manager/apk_sign.c \
             || true
+
+          echo
+          echo "===== CHECK INCLUDE BEFORE USE ====="
+
+          INCLUDE_LINE=$(
+            grep -n \
+              '#include <linux/vmalloc.h>' \
+              drivers/kernelsu/manager/apk_sign.c \
+              | head -1 \
+              | cut -d: -f1
+          )
+
+          VMALLOC_LINE=$(
+            grep -n \
+              'vmalloc(' \
+              drivers/kernelsu/manager/apk_sign.c \
+              | grep -v include \
+              | head -1 \
+              | cut -d: -f1
+          )
+
+          echo "vmalloc.h line = $INCLUDE_LINE"
+          echo "first vmalloc = $VMALLOC_LINE"
+
+          if [ -z "$INCLUDE_LINE" ] || [ -z "$VMALLOC_LINE" ]; then
+            echo "ERROR: vmalloc verification failed"
+            exit 1
+          fi
+
+          if [ "$INCLUDE_LINE" -ge "$VMALLOC_LINE" ]; then
+            echo "ERROR: vmalloc.h is still after vmalloc()"
+            exit 1
+          fi
+
+          echo "VMALLOC INCLUDE POSITION = OK"
 
       - name: Enable KernelSU
         working-directory: kernel
@@ -324,11 +327,13 @@ jobs:
           if ! grep -q '^CONFIG_KSU=y' \
             arch/arm64/configs/lineage_xcover4s_defconfig
           then
+
             echo 'CONFIG_KSU=y' \
               >> arch/arm64/configs/lineage_xcover4s_defconfig
+
           fi
 
-      - name: Apply manual KernelSU hooks
+      - name: Apply KernelSU manual hooks
         working-directory: kernel
         run: |
           set -eux
@@ -350,17 +355,21 @@ jobs:
                       "PATCH TARGET NOT FOUND: " + path
                   )
 
-              p.write_text(data.replace(old, new, 1))
+              p.write_text(
+                  data.replace(old, new, 1)
+              )
 
               print("PATCHED:", path)
 
 
           patch(
               "fs/exec.c",
+
               """int do_execve(struct filename *filename,
           	const char __user *const __user *__argv,
           	const char __user *const __user *__envp)
           {""",
+
               """#ifdef CONFIG_KSU
           __attribute__((hot))
           extern int ksu_handle_execveat(int *fd,
@@ -376,29 +385,47 @@ jobs:
 
           patch(
               "fs/exec.c",
+
               """	struct user_arg_ptr envp = { .ptr.native = __envp };
           	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
+
               """	struct user_arg_ptr envp = { .ptr.native = __envp };
           #ifdef CONFIG_KSU
           	{
           		int ksu_fd = AT_FDCWD;
           		int ksu_flags = 0;
-          		ksu_handle_execveat(&ksu_fd, &filename,
-          			&argv, &envp, &ksu_flags);
+          		ksu_handle_execveat(
+          			&ksu_fd,
+          			&filename,
+          			&argv,
+          			&envp,
+          			&ksu_flags
+          		);
           	}
           #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
+          	return do_execveat_common(
+          		AT_FDCWD,
+          		filename,
+          		argv,
+          		envp,
+          		0
+          	);"""
           )
 
           patch(
               "fs/open.c",
+
               """/*
            * access() needs to use the real uid/gid, not the effective uid/gid.""",
+
               """#ifdef CONFIG_KSU
           __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd,
+          extern int ksu_handle_faccessat(
+          	int *dfd,
           	const char __user **filename_user,
-          	int *mode, int *flags);
+          	int *mode,
+          	int *flags
+          );
           #endif
 
           /*
@@ -407,14 +434,20 @@ jobs:
 
           patch(
               "fs/open.c",
+
               """	unsigned int lookup_flags = LOOKUP_FOLLOW;
 
           	if (mode & ~S_IRWXO)""",
+
               """	unsigned int lookup_flags = LOOKUP_FOLLOW;
 
           #ifdef CONFIG_KSU
           	ksu_handle_faccessat(
-          		&dfd, &filename, &mode, NULL);
+          		&dfd,
+          		&filename,
+          		&mode,
+          		NULL
+          	);
           #endif
 
           	if (mode & ~S_IRWXO)"""
@@ -422,14 +455,19 @@ jobs:
 
           patch(
               "fs/read_write.c",
+
               """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
           {""",
+
               """#ifdef CONFIG_KSU
           extern bool ksu_vfs_read_hook __read_mostly;
-          extern __attribute__((cold)) int ksu_handle_sys_read(
+
+          extern __attribute__((cold))
+          int ksu_handle_sys_read(
           	unsigned int fd,
           	char __user **buf_ptr,
-          	size_t *count_ptr);
+          	size_t *count_ptr
+          );
           #endif
 
           SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
@@ -438,9 +476,11 @@ jobs:
 
           patch(
               "fs/read_write.c",
+
               """	ssize_t ret = -EBADF;
 
           	if (f.file) {""",
+
               """	ssize_t ret = -EBADF;
 
           #ifdef CONFIG_KSU
@@ -448,7 +488,8 @@ jobs:
           		ksu_handle_sys_read(
           			fd,
           			(char __user **)&buf,
-          			&count);
+          			&count
+          		);
           #endif
 
           	if (f.file) {"""
@@ -456,13 +497,17 @@ jobs:
 
           patch(
               "fs/stat.c",
+
               """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
           SYSCALL_DEFINE4(newfstatat""",
+
               """#ifdef CONFIG_KSU
           __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd,
+          extern int ksu_handle_stat(
+          	int *dfd,
           	const char __user **filename_user,
-          	int *flags);
+          	int *flags
+          );
           #endif
 
           #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
@@ -471,29 +516,45 @@ jobs:
 
           patch(
               "fs/stat.c",
+
               """	struct kstat stat;
           	int error;
 
           	error = vfs_fstatat(dfd, filename, &stat, flag);""",
+
               """	struct kstat stat;
           	int error;
 
           #ifdef CONFIG_KSU
-          	ksu_handle_stat(&dfd, &filename, &flag);
+          	ksu_handle_stat(
+          		&dfd,
+          		&filename,
+          		&flag
+          	);
           #endif
 
-          	error = vfs_fstatat(dfd, filename, &stat, flag);"""
+          	error = vfs_fstatat(
+          		dfd,
+          		filename,
+          		&stat,
+          		flag
+          	);"""
           )
 
           patch(
               "kernel/reboot.c",
+
               """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
           		void __user *, arg)
           {""",
+
               """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1,
-          	int magic2, unsigned int cmd,
-          	void __user **arg);
+          extern int ksu_handle_sys_reboot(
+          	int magic1,
+          	int magic2,
+          	unsigned int cmd,
+          	void __user **arg
+          );
           #endif
 
           SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
@@ -503,14 +564,20 @@ jobs:
 
           patch(
               "kernel/reboot.c",
+
               """	int ret = 0;
 
           	/* We only trust the superuser with rebooting the system. */""",
+
               """	int ret = 0;
 
           #ifdef CONFIG_KSU
           	ksu_handle_sys_reboot(
-          		magic1, magic2, cmd, &arg);
+          		magic1,
+          		magic2,
+          		cmd,
+          		&arg
+          	);
           #endif
 
           	/* We only trust the superuser with rebooting the system. */"""
@@ -542,6 +609,9 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
+          echo
+          echo "===== CONFIG ====="
+
           grep '^CONFIG_KSU=y' out/.config
 
       - name: Prepare generated headers
@@ -552,7 +622,7 @@ jobs:
           export CCACHE_DIR="$HOME/.ccache"
 
           echo "=========================================="
-          echo " PREPARING GENERATED HEADERS"
+          echo " PREPARING KERNEL HEADERS"
           echo "=========================================="
 
           make \
@@ -564,8 +634,11 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             prepare scripts
 
-          # Building this directory generates the SELinux headers
-          # required by KernelSU on this kernel.
+          echo
+          echo "=========================================="
+          echo " PREPARING SELINUX"
+          echo "=========================================="
+
           make \
             -j"$(nproc)" \
             O=out \
@@ -585,17 +658,21 @@ jobs:
             -name flask.h \
             -print
 
-          if ! find out \
-            -type f \
-            -name flask.h \
-            -print -quit \
-            | grep -q .
-          then
-              echo "ERROR: flask.h missing"
-              tail -100 selinux.log || true
-              exit 1
+          FLASK=$(
+            find out \
+              -type f \
+              -name flask.h \
+              -print \
+              -quit
+          )
+
+          if [ -z "$FLASK" ]; then
+            echo "ERROR: flask.h missing"
+            tail -150 selinux.log || true
+            exit 1
           fi
 
+          echo "FOUND: $FLASK"
           echo "SELINUX HEADERS OK"
 
       - name: Fast KernelSU compile
@@ -604,7 +681,7 @@ jobs:
           set +e
 
           echo "=========================================="
-          echo " FAST KERNELSU COMPILE TEST 3"
+          echo " FAST KERNELSU COMPILE TEST 4"
           echo "=========================================="
 
           export CCACHE_DIR="$HOME/.ccache"
@@ -634,28 +711,37 @@ jobs:
           echo "===== REAL ERRORS ====="
 
           grep -iE \
-            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
+            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named|conflicting types" \
             ksu-build.log \
             | grep -viE \
               'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-            | tail -400 \
+            | tail -500 \
             || true
 
           echo
-          echo "===== LAST 100 CLEAN LINES ====="
+          echo "===== LAST 120 CLEAN LINES ====="
 
           grep -viE \
             'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
             ksu-build.log \
-            | tail -100 \
+            | tail -120 \
             || true
 
           if [ "$RESULT" -eq 0 ]; then
 
             echo
             echo "=========================================="
-            echo " KERNELSU PASSED"
-            echo " NEXT = FULL KERNEL BUILD"
+            echo " KERNELSU RESULT 0"
+            echo " KERNELSU FAST TEST PASSED"
+            echo " NEXT STEP = FULL KERNEL BUILD"
+            echo "=========================================="
+
+          else
+
+            echo
+            echo "=========================================="
+            echo " NEW COMPATIBILITY ERROR FOUND"
+            echo " DO NOT RUN FULL BUILD YET"
             echo "=========================================="
 
           fi
@@ -668,12 +754,14 @@ jobs:
         run: |
           set +e
 
-          REPORT="$GITHUB_WORKSPACE/ksu-fast-report.txt"
+          REPORT="$GITHUB_WORKSPACE/ksu-fast-test-4.txt"
 
           {
-            echo "XCOVER4S KERNELSU FAST TEST 3"
-            echo
+            echo "=========================================="
+            echo " XCOVER4S KERNELSU FAST TEST 4"
+            echo "=========================================="
 
+            echo
             echo "RESULT:"
             cat ksu-result.txt 2>/dev/null \
               || echo "COMPILE DID NOT RUN"
@@ -681,6 +769,14 @@ jobs:
             echo
             echo "CONFIG:"
             grep '^CONFIG_KSU' out/.config 2>/dev/null \
+              || true
+
+            echo
+            echo "APK_SIGN:"
+            grep -n -E \
+              'vmalloc|vfree|kvmalloc|kvfree|vmalloc.h' \
+              drivers/kernelsu/manager/apk_sign.c \
+              2>/dev/null \
               || true
 
             echo
@@ -693,19 +789,11 @@ jobs:
               || true
 
             echo
-            echo "APK_SIGN VMALLOC:"
-            grep -n \
-              -E 'vmalloc|vfree|kvmalloc|kvfree|vmalloc.h' \
-              drivers/kernelsu/manager/apk_sign.c \
-              2>/dev/null \
-              || true
-
-            echo
             echo "ERRORS:"
 
             if [ -f ksu-build.log ]; then
               grep -iE \
-                "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
+                "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named|conflicting types" \
                 ksu-build.log \
                 | grep -viE \
                   'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
@@ -721,9 +809,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-ksu-fast-test-3
+          name: xcover4s-ksu-fast-test-4
           path: |
-            ksu-fast-report.txt
+            ksu-fast-test-4.txt
             kernel/ksu-build.log
             kernel/ksu-result.txt
             kernel/selinux.log
