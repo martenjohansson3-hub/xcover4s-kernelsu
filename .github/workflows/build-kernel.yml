@@ -1,12 +1,12 @@
-name: XCover4s KernelSU Full Build
+name: XCover4s KernelSU Fast Compile
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 20
 
     steps:
 
@@ -16,9 +16,19 @@ jobs:
 
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git curl python3 \
-            clang lld libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu ccache
+            bc \
+            bison \
+            build-essential \
+            flex \
+            git \
+            curl \
+            python3 \
+            clang \
+            lld \
+            libssl-dev \
+            libelf-dev \
+            gcc-aarch64-linux-gnu \
+            ccache
 
       - name: Clone kernel
         run: |
@@ -44,6 +54,7 @@ jobs:
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             | bash -s legacy
 
+          echo
           echo "===== KERNELSU ====="
 
           if [ -d KernelSU-Next ]; then
@@ -51,13 +62,13 @@ jobs:
             git -C KernelSU-Next describe --tags --always || true
           fi
 
-      - name: Apply old-kernel compatibility
+      - name: Apply old kernel compatibility
         working-directory: kernel
         run: |
           set -eux
 
           echo "=========================================="
-          echo " APPLYING COMPATIBILITY PATCHES"
+          echo " APPLYING COMPATIBILITY"
           echo "=========================================="
 
           grep -R -l \
@@ -94,18 +105,14 @@ jobs:
 
           root = Path("drivers/kernelsu")
 
-          # --------------------------------------------------------
-          # full_name_hash
-          # --------------------------------------------------------
-
+          # full_name_hash compatibility
           for p in root.rglob("*.c"):
-
               try:
                   s = p.read_text()
               except Exception:
                   continue
 
-              original = s
+              old = s
 
               s = re.sub(
                   r'full_name_hash\s*\(\s*NULL\s*,\s*'
@@ -114,14 +121,11 @@ jobs:
                   s
               )
 
-              if s != original:
+              if s != old:
                   p.write_text(s)
                   print("PATCHED full_name_hash:", p)
 
-          # --------------------------------------------------------
-          # in_compat_syscall
-          # --------------------------------------------------------
-
+          # in_compat_syscall compatibility
           for p in root.rglob("*"):
 
               if not p.is_file():
@@ -163,10 +167,7 @@ jobs:
 
               print("PATCHED compat:", p)
 
-          # --------------------------------------------------------
-          # kvmalloc / kvfree
-          # --------------------------------------------------------
-
+          # kvmalloc / kvfree compatibility
           for p in root.rglob("*"):
 
               if not p.is_file():
@@ -180,7 +181,7 @@ jobs:
               except Exception:
                   continue
 
-              original = s
+              old = s
 
               s = re.sub(
                   r'\bkvmalloc\s*\(\s*([^,]+?)\s*,\s*'
@@ -195,7 +196,7 @@ jobs:
                   s
               )
 
-              if s != original:
+              if s != old:
 
                   if (
                       "vmalloc(" in s or
@@ -220,12 +221,9 @@ jobs:
 
                   p.write_text(s)
 
-                  print("PATCHED allocation API:", p)
+                  print("PATCHED allocation:", p)
 
-          # --------------------------------------------------------
-          # ALIGN_DOWN
-          # --------------------------------------------------------
-
+          # ALIGN_DOWN compatibility
           p = root / "feature" / "adb_root.c"
 
           if p.exists():
@@ -260,12 +258,9 @@ jobs:
                       "\n".join(lines) + "\n"
                   )
 
-                  print("ADDED ALIGN_DOWN compatibility")
+                  print("ADDED ALIGN_DOWN")
 
-          # --------------------------------------------------------
-          # sulog time API
-          # --------------------------------------------------------
-
+          # sulog event compatibility
           p = root / "sulog" / "event.c"
 
           if p.exists():
@@ -283,13 +278,11 @@ jobs:
               )
 
               if old in s:
-
                   s = s.replace(old, new)
                   p.write_text(s)
+                  print("PATCHED event.c")
 
-                  print("PATCHED event.c time API")
-
-          print("COMPATIBILITY PATCHES COMPLETE")
+          print("COMPATIBILITY COMPLETE")
           PY
 
       - name: Enable KernelSU
@@ -307,7 +300,7 @@ jobs:
 
           fi
 
-      - name: Apply KernelSU manual hooks
+      - name: Apply KernelSU hooks
         working-directory: kernel
         run: |
           set -eux
@@ -548,16 +541,26 @@ jobs:
 
           grep '^CONFIG_KSU=y' out/.config
 
-      - name: KernelSU quick verification
+      - name: Generate required kernel headers
         working-directory: kernel
         run: |
           set -eux
 
           echo "=========================================="
-          echo " VERIFYING KERNELSU BEFORE FULL BUILD"
+          echo " GENERATING REQUIRED HEADERS"
           echo "=========================================="
 
           export CCACHE_DIR="$HOME/.ccache"
+
+          # Prepare general generated headers/scripts.
+          make \
+            -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            prepare
 
           make \
             -j"$(nproc)" \
@@ -566,19 +569,117 @@ jobs:
             CC="ccache clang" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" \
-            drivers/kernelsu/
+            scripts
 
           echo
-          echo "KERNELSU QUICK TEST PASSED"
+          echo "===== GENERATING SELINUX HEADERS ====="
 
-      - name: Full kernel build
+          # Generate SELinux headers used by objsec.h/security.h.
+          make \
+            -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            security/selinux/flask.h \
+            security/selinux/av_permissions.h \
+            2>&1 | tee selinux-generate.log || true
+
+          echo
+          echo "===== SEARCH FOR FLASK.H ====="
+
+          find . out \
+            -type f \
+            -name flask.h \
+            -print \
+            2>/dev/null \
+            || true
+
+          echo
+          echo "===== SEARCH FOR AV_PERMISSIONS.H ====="
+
+          find . out \
+            -type f \
+            -name av_permissions.h \
+            -print \
+            2>/dev/null \
+            || true
+
+          # Some old Android kernels generate these as part of
+          # security/selinux instead of accepting flask.h as a
+          # direct make target. Build that directory if needed.
+          if ! find out \
+            -type f \
+            -name flask.h \
+            -print -quit \
+            | grep -q .
+          then
+
+            echo
+            echo \
+              "Direct flask target not found; preparing SELinux directory"
+
+            make \
+              -j"$(nproc)" \
+              O=out \
+              ARCH=arm64 \
+              CC="ccache clang" \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              security/selinux/ \
+              > selinux-dir.log \
+              2>&1 || true
+          fi
+
+          echo
+          echo "===== FINAL FLASK.H CHECK ====="
+
+          FLASK=$(
+            find out \
+              -type f \
+              -name flask.h \
+              -print \
+              -quit
+          )
+
+          if [ -z "$FLASK" ]; then
+
+            echo \
+              "ERROR: flask.h still was not generated"
+
+            echo
+            echo "===== SELINUX GENERATION LOG ====="
+
+            tail -150 \
+              selinux-generate.log \
+              2>/dev/null \
+              || true
+
+            echo
+            echo "===== SELINUX DIRECTORY LOG ====="
+
+            tail -150 \
+              selinux-dir.log \
+              2>/dev/null \
+              || true
+
+            exit 1
+          fi
+
+          echo "FOUND: $FLASK"
+
+          echo
+          echo "SELINUX HEADERS READY"
+
+      - name: Fast KernelSU compile
         working-directory: kernel
         run: |
           set +e
 
           echo "=========================================="
-          echo " STARTING FULL KERNEL BUILD"
+          echo " FAST KERNELSU COMPILE"
+          echo " NO FULL KERNEL BUILD"
           echo "=========================================="
 
           export CCACHE_DIR="$HOME/.ccache"
@@ -591,115 +692,71 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            > build.log \
-            2>&1 &
+            drivers/kernelsu/ \
+            > ksu-build.log \
+            2>&1
 
-          BUILD_PID=$!
-
-          ELAPSED=0
-
-          while kill -0 "$BUILD_PID" 2>/dev/null
-          do
-            sleep 30
-
-            if kill -0 "$BUILD_PID" 2>/dev/null
-            then
-              ELAPSED=$((ELAPSED + 30))
-
-              echo \
-                "Kernel build running: ${ELAPSED}s"
-
-              # Show recent build progress as well.
-              tail -5 build.log \
-                | grep -viE \
-                  'objdump:|Unrecognized form:|Bogus end-of-siblings' \
-                || true
-            fi
-          done
-
-          wait "$BUILD_PID"
           RESULT=$?
 
-          echo "$RESULT" > build-result.txt
+          echo "$RESULT" > ksu-result.txt
 
           echo
           echo "=========================================="
-          echo " BUILD RESULT: $RESULT"
+          echo " KERNELSU RESULT: $RESULT"
           echo "=========================================="
 
-          if [ "$RESULT" -ne 0 ]
-          then
+          echo
+          echo "===== REAL ERRORS ====="
 
-            echo
-            echo "===== REAL ERRORS ====="
-
-            grep -iE \
-              "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
-              build.log \
-              | grep -viE \
-                'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-              | tail -400 \
-              || true
-
-            echo
-            echo "===== LAST 150 LINES ====="
-
-            grep -viE \
+          grep -iE \
+            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
+            ksu-build.log \
+            | grep -viE \
               'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-              build.log \
-              | tail -150 \
-              || true
+            | tail -400 \
+            || true
 
-          else
+          echo
+          echo "===== LAST OUTPUT ====="
+
+          grep -viE \
+            'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
+            ksu-build.log \
+            | tail -150 \
+            || true
+
+          if [ "$RESULT" -eq 0 ]; then
 
             echo
             echo "=========================================="
-            echo " FULL BUILD PASSED"
+            echo " KERNELSU FAST COMPILE PASSED"
+            echo " READY FOR FULL KERNEL BUILD"
             echo "=========================================="
 
-            find out/arch/arm64/boot \
-              -maxdepth 2 \
-              -type f \
-              -printf '%p %k KB\n' \
-              | sort \
-              || true
           fi
 
           exit "$RESULT"
 
-      # Runs even if the build fails.
-      - name: Create diagnostic report
+      - name: Create report
         if: always()
         working-directory: kernel
         run: |
           set +e
 
-          REPORT="$GITHUB_WORKSPACE/full-build-report.txt"
+          REPORT="$GITHUB_WORKSPACE/ksu-fast-report.txt"
 
           {
             echo "=========================================="
-            echo " XCOVER4S KERNELSU FULL BUILD REPORT"
+            echo " XCOVER4S KERNELSU FAST REPORT"
             echo "=========================================="
 
             echo
-            echo "Kernel commit:"
-            git rev-parse HEAD || true
+            echo "Result:"
 
-            echo
-            echo "KernelSU commit:"
-
-            if [ -d KernelSU-Next ]; then
-              git -C KernelSU-Next rev-parse HEAD || true
-              git -C KernelSU-Next describe --tags --always || true
-            fi
-
-            echo
-            echo "Build result:"
-
-            if [ -f build-result.txt ]; then
-              cat build-result.txt
+            if [ -f ksu-result.txt ]; then
+              cat ksu-result.txt
             else
-              echo "FULL BUILD DID NOT RUN"
+              echo "COMPILE DID NOT RUN"
             fi
 
             echo
@@ -710,24 +767,23 @@ jobs:
             fi
 
             echo
-            echo "Kernel images:"
+            echo "FLASK HEADERS:"
 
-            find out/arch/arm64/boot \
-              -maxdepth 2 \
+            find out \
               -type f \
-              -name 'Image*' \
-              -ls \
+              -name flask.h \
+              -print \
               2>/dev/null \
               || true
 
             echo
-            echo "===== REAL BUILD ERRORS ====="
+            echo "===== ERRORS ====="
 
-            if [ -f build.log ]; then
+            if [ -f ksu-build.log ]; then
 
               grep -iE \
                 "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
-                build.log \
+                ksu-build.log \
                 | grep -viE \
                   'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
                 | tail -500 \
@@ -739,56 +795,16 @@ jobs:
 
           cat "$REPORT"
 
-      # This artifact appears even if full build fails.
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-full-build-diagnostics
+          name: xcover4s-ksu-fast-diagnostics
           path: |
-            full-build-report.txt
-            kernel/build.log
-            kernel/build-result.txt
+            ksu-fast-report.txt
+            kernel/ksu-build.log
+            kernel/ksu-result.txt
+            kernel/selinux-generate.log
+            kernel/selinux-dir.log
             kernel/out/.config
           if-no-files-found: warn
-
-      - name: Verify finished Image
-        if: success()
-        working-directory: kernel
-        run: |
-          set -eux
-
-          IMAGE="out/arch/arm64/boot/Image"
-
-          if [ ! -f "$IMAGE" ]; then
-            echo "ERROR: Image was not created"
-            exit 1
-          fi
-
-          echo "=========================================="
-          echo " KERNEL IMAGE CREATED"
-          echo "=========================================="
-
-          ls -lh "$IMAGE"
-          sha256sum "$IMAGE"
-
-          grep '^CONFIG_KSU=y' out/.config
-
-          echo
-          echo "===== KSU SYMBOL CHECK ====="
-
-          grep 'ksu_handle_' out/System.map \
-            | head -50 \
-            || true
-
-      # Only appears after a successful full build + Image verification.
-      - name: Upload finished kernel
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcover4s-kernelsu-image
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/.config
-            kernel/out/System.map
-          if-no-files-found: error
