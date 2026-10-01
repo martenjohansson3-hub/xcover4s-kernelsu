@@ -1,4 +1,4 @@
-name: XCover4s KSU v0.9.5 SELinux Generate Test
+name: XCover4s KernelSU v0.9.5 Full Kernel Build
 
 on:
   workflow_dispatch:
@@ -6,17 +6,32 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 60
 
     steps:
       - name: Install dependencies
         run: |
           set -euxo pipefail
+
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git clang lld llvm \
-            libssl-dev libelf-dev gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu curl
+            bc \
+            bison \
+            build-essential \
+            flex \
+            git \
+            clang \
+            lld \
+            llvm \
+            libssl-dev \
+            libelf-dev \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            curl \
+            zip
+
+          clang --version
+          aarch64-linux-gnu-gcc --version
 
       - name: Clone known-good kernel
         run: |
@@ -29,25 +44,37 @@ jobs:
             kernel
 
           cd kernel
+
           echo "===== KERNEL COMMIT ====="
           git rev-parse HEAD
+
+          echo "===== SOURCE STATUS ====="
+          git status --short
 
       - name: Integrate KernelSU v0.9.5
         working-directory: kernel
         run: |
           set -euxo pipefail
 
+          echo "=========================================="
+          echo " INTEGRATE KERNELSU v0.9.5"
+          echo "=========================================="
+
           curl -LSs \
             "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" \
             | bash -s v0.9.5
 
+          echo
           echo "===== KERNELSU COMMIT ====="
           git -C KernelSU rev-parse HEAD
 
-          echo "===== INTEGRATION ====="
-          grep -n "kernelsu" drivers/Kconfig drivers/Makefile || true
+          echo
+          echo "===== KBUILD INTEGRATION ====="
+          grep -n "kernelsu" \
+            drivers/Kconfig \
+            drivers/Makefile || true
 
-      - name: Configure kernel
+      - name: Configure XCover4s KernelSU kernel
         working-directory: kernel
         run: |
           set -euxo pipefail
@@ -65,8 +92,13 @@ jobs:
 
           chmod +x scripts/config
 
-          scripts/config --file out/.config -e OVERLAY_FS
-          scripts/config --file out/.config -e KSU
+          scripts/config \
+            --file out/.config \
+            -e OVERLAY_FS
+
+          scripts/config \
+            --file out/.config \
+            -e KSU
 
           make \
             O=out \
@@ -76,64 +108,43 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          echo "===== CONFIG ====="
+          echo
+          echo "===== FINAL CONFIG ====="
 
           grep -E \
-            'CONFIG_(OVERLAY_FS|KSU|SECURITY_SELINUX)' \
+            'CONFIG_(KSU|OVERLAY_FS|SECURITY_SELINUX|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
             out/.config || true
 
-          grep -q '^CONFIG_OVERLAY_FS=y$' out/.config
           grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_OVERLAY_FS=y$' out/.config
+          grep -q '^CONFIG_SECURITY_SELINUX=y$' out/.config
 
-          cp out/.config "$GITHUB_WORKSPACE/kernel-config.txt"
-
-      - name: Inspect SELinux build rules
-        working-directory: kernel
-        run: |
-          set +e
-
-          {
-            echo "===== security/selinux/Makefile ====="
-            cat security/selinux/Makefile 2>/dev/null || true
-
-            echo
-            echo "===== include Makefile ====="
-            cat security/selinux/include/Makefile 2>/dev/null || true
-
-            echo
-            echo "===== flask references ====="
-
-            grep -Rni \
-              'flask.h' \
-              security/selinux \
-              scripts \
-              2>/dev/null || true
-
-            echo
-            echo "===== genheaders / flask targets ====="
-
-            grep -RniE \
-              'genheaders|flask|av_permissions' \
-              security/selinux/Makefile \
-              security/selinux/include \
-              scripts \
-              2>/dev/null || true
-
-          } > "$GITHUB_WORKSPACE/selinux-rules.txt"
-
-          cat "$GITHUB_WORKSPACE/selinux-rules.txt"
+          cp out/.config \
+            "$GITHUB_WORKSPACE/kernel-config.txt"
 
       - name: Generate SELinux headers
         working-directory: kernel
         run: |
           set +e
 
-          LOG="$GITHUB_WORKSPACE/selinux-generate.log"
+          LOG="$GITHUB_WORKSPACE/selinux-build.log"
           : > "$LOG"
 
           echo "=========================================="
           echo " GENERATING SELINUX HEADERS"
           echo "=========================================="
+
+          (
+            SECONDS_RUNNING=0
+
+            while true; do
+              echo "[HEARTBEAT] SELinux build running - ${SECONDS_RUNNING}s - $(date -u '+%H:%M:%S UTC')"
+              sleep 30
+              SECONDS_RUNNING=$((SECONDS_RUNNING + 30))
+            done
+          ) &
+
+          HEARTBEAT_PID=$!
 
           make \
             -j"$(nproc)" \
@@ -148,63 +159,63 @@ jobs:
 
           RESULT=$?
 
-          echo "$RESULT" \
-            > "$GITHUB_WORKSPACE/selinux-generate-result.txt"
+          kill "$HEARTBEAT_PID" 2>/dev/null || true
+          wait "$HEARTBEAT_PID" 2>/dev/null || true
 
-          echo "===== RESULT: $RESULT ====="
+          echo "$RESULT" \
+            > "$GITHUB_WORKSPACE/selinux-result.txt"
+
+          echo
+          echo "===== SELINUX RESULT: $RESULT ====="
+
+          find out/security/selinux \
+            -name flask.h \
+            -printf '%p %s bytes\n' \
+            2>/dev/null || true
 
           grep -vE \
             'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-            "$LOG" | tail -400 || true
+            "$LOG" | tail -200 || true
 
-          exit 0
+          if [ "$RESULT" -ne 0 ]; then
+            exit "$RESULT"
+          fi
 
-      - name: Locate generated SELinux headers
+          if [ ! -s out/security/selinux/flask.h ]; then
+            echo "ERROR: flask.h WAS NOT GENERATED"
+            exit 1
+          fi
+
+          echo "SELinux preparation successful."
+
+      - name: Full KernelSU kernel build
         working-directory: kernel
         run: |
           set +e
 
-          {
-            echo "===== FLASK.H ====="
-
-            find . \
-              -type f \
-              -name flask.h \
-              -printf '%p %s bytes\n' \
-              2>/dev/null || true
-
-            echo
-            echo "===== AV_PERMISSIONS.H ====="
-
-            find . \
-              -type f \
-              -name av_permissions.h \
-              -printf '%p %s bytes\n' \
-              2>/dev/null || true
-
-            echo
-            echo "===== OUT SECURITY FILES ====="
-
-            find out/security \
-              -type f \
-              -printf '%p %s bytes\n' \
-              2>/dev/null | sort || true
-
-          } > "$GITHUB_WORKSPACE/generated-headers.txt"
-
-          cat "$GITHUB_WORKSPACE/generated-headers.txt"
-
-      - name: Compile drivers with KernelSU
-        working-directory: kernel
-        run: |
-          set +e
-
-          RAW="$GITHUB_WORKSPACE/ksu-build.log"
-          : > "$RAW"
+          LOG="$GITHUB_WORKSPACE/full-build.log"
+          : > "$LOG"
 
           echo "=========================================="
-          echo " KERNELSU COMPILE AFTER SELINUX"
+          echo " XCOVER4S FULL KERNELSU KERNEL BUILD"
           echo "=========================================="
+          echo
+          echo "This creates kernel artifacts only."
+          echo "NO BOOT IMAGE."
+          echo "NOT FOR FLASHING YET."
+          echo
+
+          (
+            SECONDS_RUNNING=0
+
+            while true; do
+              echo "[HEARTBEAT] FULL KERNEL BUILD running - ${SECONDS_RUNNING}s - $(date -u '+%H:%M:%S UTC')"
+              sleep 30
+              SECONDS_RUNNING=$((SECONDS_RUNNING + 30))
+            done
+          ) &
+
+          HEARTBEAT_PID=$!
 
           make \
             -j"$(nproc)" \
@@ -214,163 +225,251 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            drivers/ \
-            > "$RAW" 2>&1
+            > "$LOG" 2>&1
 
           RESULT=$?
 
+          kill "$HEARTBEAT_PID" 2>/dev/null || true
+          wait "$HEARTBEAT_PID" 2>/dev/null || true
+
           echo "$RESULT" \
-            > "$GITHUB_WORKSPACE/ksu-build-result.txt"
+            > "$GITHUB_WORKSPACE/full-build-result.txt"
 
           echo
-          echo "===== KSU BUILD RESULT: $RESULT ====="
+          echo "===== FULL BUILD RESULT: $RESULT ====="
+
+          echo
+          echo "===== LAST 500 RELEVANT LINES ====="
 
           grep -vE \
             'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-            "$RAW" | tail -500 || true
+            "$LOG" | tail -500 || true
 
-          exit 0
+          if [ "$RESULT" -ne 0 ]; then
+            echo
+            echo "FULL KERNEL BUILD FAILED"
+            exit "$RESULT"
+          fi
 
-      - name: Inspect KernelSU compilation
+          echo
+          echo "FULL KERNEL BUILD SUCCESSFUL"
+
+      - name: Verify kernel artifacts
         if: always()
         working-directory: kernel
         run: |
           set +e
 
-          {
-            echo "===== KERNELSU OUTPUT ====="
+          LOG="$GITHUB_WORKSPACE/artifact-info.txt"
+          : > "$LOG"
 
-            find out/drivers/kernelsu \
+          {
+            echo "=========================================="
+            echo " KERNEL ARTIFACT VERIFICATION"
+            echo "=========================================="
+            echo
+
+            echo "===== Image ====="
+
+            if [ -f out/arch/arm64/boot/Image ]; then
+              ls -lh out/arch/arm64/boot/Image
+              stat -c '%s bytes' out/arch/arm64/boot/Image
+              sha256sum out/arch/arm64/boot/Image
+              file out/arch/arm64/boot/Image
+            else
+              echo "Image NOT FOUND"
+            fi
+
+            echo
+            echo "===== Image.gz ====="
+
+            if [ -f out/arch/arm64/boot/Image.gz ]; then
+              ls -lh out/arch/arm64/boot/Image.gz
+              stat -c '%s bytes' out/arch/arm64/boot/Image.gz
+              sha256sum out/arch/arm64/boot/Image.gz
+              file out/arch/arm64/boot/Image.gz
+            else
+              echo "Image.gz NOT FOUND"
+            fi
+
+            echo
+            echo "===== DTB / DTBO ====="
+
+            find out/arch/arm64/boot \
               -type f \
+              \( -name '*.dtb' -o -name '*.dtbo' \) \
               -printf '%p %s bytes\n' \
               2>/dev/null | sort || true
 
             echo
-            echo "===== OBJECTS ====="
+            echo "===== KernelSU objects ====="
 
             find out/drivers/kernelsu \
               -type f \
               -name '*.o' \
               -printf '%p %s bytes\n' \
               2>/dev/null | sort || true
+
+            echo
+            echo "===== KernelSU strings in Image ====="
+
+            if [ -f out/arch/arm64/boot/Image ]; then
+              strings out/arch/arm64/boot/Image \
+                | grep -iE 'KernelSU|kernelsu' \
+                | head -50 || true
+            fi
+
+          } >> "$LOG" 2>&1
+
+          cat "$LOG"
+
+      - name: Extract errors and warnings
+        if: always()
+        run: |
+          set +e
+
+          {
+            echo "===== ERRORS ====="
+
+            grep -niE \
+              'error:|fatal error:|undefined reference|No rule to make target|make.*Error' \
+              full-build.log \
+              2>/dev/null || true
 
             echo
             echo "===== KERNELSU BUILD LINES ====="
 
             grep -niE \
               'kernelsu|ksu' \
-              "$GITHUB_WORKSPACE/ksu-build.log" \
-              2>/dev/null || true
-
-          } > "$GITHUB_WORKSPACE/ksu-objects.txt"
-
-          cat "$GITHUB_WORKSPACE/ksu-objects.txt"
-
-      - name: Extract important errors
-        if: always()
-        run: |
-          set +e
-
-          {
-            echo "===== SELINUX ERRORS ====="
-
-            grep -niE \
-              'error:|fatal error:|No rule to make target|make.*Error' \
-              selinux-generate.log \
+              full-build.log \
               2>/dev/null || true
 
             echo
-            echo "===== KERNELSU ERRORS ====="
-
-            grep -niE \
-              'error:|fatal error:|undefined reference|No rule to make target|make.*Error' \
-              ksu-build.log \
-              2>/dev/null || true
-
-            echo
-            echo "===== FLASK.H REFERENCES ====="
+            echo "===== SECTION MISMATCH ====="
 
             grep -ni \
-              'flask.h' \
-              selinux-generate.log \
-              ksu-build.log \
+              'section mismatch' \
+              full-build.log \
               2>/dev/null || true
 
-          } > error-summary.txt
+          } > build-diagnostics.txt
 
-          cat error-summary.txt
+          cat build-diagnostics.txt
 
-      - name: Create summary
+      - name: Copy successful kernel artifacts
+        if: always()
+        run: |
+          set +e
+
+          mkdir -p kernel-artifacts
+
+          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image \
+              kernel-artifacts/Image
+          fi
+
+          if [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+            cp kernel/out/arch/arm64/boot/Image.gz \
+              kernel-artifacts/Image.gz
+          fi
+
+          find kernel/out/arch/arm64/boot \
+            -type f \
+            \( -name '*.dtb' -o -name '*.dtbo' \) \
+            -exec cp {} kernel-artifacts/ \; \
+            2>/dev/null || true
+
+          echo "===== COPIED ARTIFACTS ====="
+          ls -lh kernel-artifacts || true
+
+      - name: Create build summary
         if: always()
         run: |
           set +e
 
           {
-            echo "XCover4s KernelSU v0.9.5 SELinux Generate Test"
-            echo "=============================================="
+            echo "XCover4s KernelSU v0.9.5 Full Kernel Build"
+            echo "==========================================="
             echo
+            echo "IMPORTANT:"
+            echo "KERNEL ARTIFACT ONLY"
             echo "NO BOOT IMAGE"
-            echo "NOT FOR FLASHING"
+            echo "DO NOT FLASH THESE FILES DIRECTLY"
             echo
 
-            echo "KERNEL:"
+            echo "KERNEL COMMIT:"
             git -C kernel rev-parse HEAD 2>/dev/null || true
 
             echo
-            echo "KERNELSU:"
+            echo "KERNELSU COMMIT:"
             git -C kernel/KernelSU rev-parse HEAD 2>/dev/null || true
 
             echo
             echo "CONFIG:"
             grep -E \
-              'CONFIG_(OVERLAY_FS|KSU|SECURITY_SELINUX)' \
+              'CONFIG_(KSU|OVERLAY_FS|SECURITY_SELINUX)' \
               kernel/out/.config \
               2>/dev/null || true
 
             echo
-            echo "SELINUX GENERATE RESULT:"
-            cat selinux-generate-result.txt \
+            echo "SELINUX RESULT:"
+            cat selinux-result.txt \
               2>/dev/null || echo "NO RESULT"
 
             echo
-            echo "KSU BUILD RESULT:"
-            cat ksu-build-result.txt \
+            echo "FULL BUILD RESULT:"
+            cat full-build-result.txt \
               2>/dev/null || echo "NO RESULT"
 
             echo
-            echo "FLASK.H:"
-            find kernel \
-              -type f \
-              -name flask.h \
-              -printf '%p %s bytes\n' \
-              2>/dev/null || true
+            echo "IMAGE:"
+            if [ -f kernel/out/arch/arm64/boot/Image ]; then
+              stat -c '%s bytes' \
+                kernel/out/arch/arm64/boot/Image
+              sha256sum \
+                kernel/out/arch/arm64/boot/Image
+            else
+              echo "NOT CREATED"
+            fi
 
             echo
-            echo "KSU OBJECT COUNT:"
-            find kernel/out/drivers/kernelsu \
-              -type f \
-              -name '*.o' \
-              2>/dev/null | wc -l || true
+            echo "IMAGE.GZ:"
+            if [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+              stat -c '%s bytes' \
+                kernel/out/arch/arm64/boot/Image.gz
+              sha256sum \
+                kernel/out/arch/arm64/boot/Image.gz
+            else
+              echo "NOT CREATED"
+            fi
 
-          } > test-summary.txt
+          } > build-summary.txt
 
-          cat test-summary.txt
+          cat build-summary.txt
+
+      - name: Upload kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-KSU-v095-full-kernel
+          path: |
+            kernel-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-KSU-v095-selinux-generate-test
+          name: xcover4s-KSU-v095-full-diagnostics
           path: |
             kernel-config.txt
-            selinux-rules.txt
-            selinux-generate.log
-            selinux-generate-result.txt
-            generated-headers.txt
-            ksu-build.log
-            ksu-build-result.txt
-            ksu-objects.txt
-            error-summary.txt
-            test-summary.txt
+            selinux-build.log
+            selinux-result.txt
+            full-build.log
+            full-build-result.txt
+            artifact-info.txt
+            build-diagnostics.txt
+            build-summary.txt
           if-no-files-found: warn
           retention-days: 14
