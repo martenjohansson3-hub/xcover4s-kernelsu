@@ -1,4 +1,4 @@
-name: XCover4s CLEAN Clang11 Test
+name: XCover4s KernelSU v0.9.5 Compile Test
 
 on:
   workflow_dispatch:
@@ -12,48 +12,28 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
+
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git curl \
-            python3 libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            zip unzip xz-utils
+            bc \
+            bison \
+            build-essential \
+            flex \
+            git \
+            clang \
+            lld \
+            llvm \
+            libssl-dev \
+            libelf-dev \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            curl \
+            zip
 
-      - name: Install Android Clang 11
-        run: |
-          set -euxo pipefail
+          clang --version
+          aarch64-linux-gnu-gcc --version
 
-          git clone \
-            --depth=1 \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            android-clang
-
-          echo "===== AVAILABLE CLANG VERSIONS ====="
-          find android-clang/clang-r*/bin \
-            -maxdepth 1 -name clang -type f -print || true
-
-          CLANG_BIN="$(
-            find android-clang/clang-r*/bin \
-              -maxdepth 1 -name clang -type f -print |
-            while read f; do
-              if "$f" --version 2>/dev/null | grep -q '11\.0\.2'; then
-                dirname "$f"
-                break
-              fi
-            done
-          )"
-
-          if [ -z "$CLANG_BIN" ]; then
-            echo "ERROR: Android clang 11.0.2 not found"
-            exit 1
-          fi
-
-          echo "$CLANG_BIN" > "$GITHUB_WORKSPACE/clang-path.txt"
-
-          echo "===== SELECTED COMPILER ====="
-          "$CLANG_BIN/clang" --version
-
-      - name: Clone CLEAN kernel
+      - name: Clone known-good kernel source
         run: |
           set -euxo pipefail
 
@@ -68,20 +48,41 @@ jobs:
           echo "===== KERNEL COMMIT ====="
           git rev-parse HEAD
 
-          echo "===== SOURCE STATUS ====="
-          git status --porcelain
-
+          echo "===== VERIFY CLEAN SOURCE ====="
+          git status --short
           test -z "$(git status --porcelain)"
 
-      - name: Configure CLEAN kernel
+      - name: Integrate KernelSU v0.9.5
         working-directory: kernel
         run: |
           set -euxo pipefail
 
-          CLANG_BIN="$(cat "$GITHUB_WORKSPACE/clang-path.txt")"
-          export PATH="$GITHUB_WORKSPACE/$CLANG_BIN:$PATH"
+          echo "=========================================="
+          echo " INTEGRATING KERNELSU v0.9.5"
+          echo " NON-GKI TEST"
+          echo "=========================================="
 
-          clang --version
+          curl -LSs \
+            "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" \
+            | bash -s v0.9.5
+
+          echo
+          echo "===== KERNELSU DIRECTORY ====="
+          test -d KernelSU
+          ls -la KernelSU
+
+          echo
+          echo "===== KERNELSU COMMIT ====="
+          git -C KernelSU rev-parse HEAD
+
+          echo
+          echo "===== SOURCE CHANGES AFTER KSU ====="
+          git status --short
+
+      - name: Configure kernel with KernelSU
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
 
           rm -rf out
           mkdir -p out
@@ -94,6 +95,18 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
+          echo "===== BASE CONFIG CREATED ====="
+
+          if [ ! -x scripts/config ]; then
+            chmod +x scripts/config || true
+          fi
+
+          scripts/config --file out/.config \
+            -e KSU \
+            -e KPROBES \
+            -e HAVE_KPROBES \
+            -e KPROBE_EVENTS
+
           make \
             O=out \
             ARCH=arm64 \
@@ -102,34 +115,35 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          echo "===== ROOT CHECK ====="
+          echo
+          echo "===== KSU CONFIG ====="
+          grep -E \
+            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_HAVE_KPROBES|CONFIG_KPROBE_EVENTS)=' \
+            out/.config || true
 
-          if grep -q '^CONFIG_KSU=y$' out/.config; then
-            echo "ERROR: KernelSU unexpectedly enabled"
+          if ! grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "ERROR: CONFIG_KSU IS NOT ENABLED"
             exit 1
           fi
 
-          echo "NO KERNELSU"
+          echo
+          echo "CONFIG_KSU=y confirmed."
 
           cp out/.config "$GITHUB_WORKSPACE/kernel-config.txt"
 
-      - name: Build CLEAN kernel with heartbeat
+      - name: KernelSU targeted compile test
         working-directory: kernel
         run: |
           set +e
 
-          CLANG_BIN="$(cat "$GITHUB_WORKSPACE/clang-path.txt")"
-          export PATH="$GITHUB_WORKSPACE/$CLANG_BIN:$PATH"
-
-          RAW="$GITHUB_WORKSPACE/full-build.log"
+          RAW="$GITHUB_WORKSPACE/ksu-target-build.log"
           : > "$RAW"
 
           echo "=========================================="
-          echo " XCOVER4S CLEAN CLANG11 BUILD"
-          echo " NO ROOT / NO KERNELSU"
+          echo " KERNELSU TARGETED COMPILE TEST"
+          echo " NO BOOT IMAGE"
+          echo " DO NOT FLASH"
           echo "=========================================="
-
-          START=$(date +%s)
 
           make \
             -j"$(nproc)" \
@@ -139,183 +153,100 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            > "$RAW" 2>&1 &
+            kernel/built-in.o \
+            > "$RAW" 2>&1
 
-          BUILD_PID=$!
-
-          while kill -0 "$BUILD_PID" 2>/dev/null
-          do
-            sleep 30
-
-            if kill -0 "$BUILD_PID" 2>/dev/null; then
-              NOW=$(date +%s)
-              SECONDS_RUNNING=$((NOW-START))
-              LOGSIZE=$(du -h "$RAW" 2>/dev/null | cut -f1)
-
-              echo "[HEARTBEAT] build running: ${SECONDS_RUNNING}s | log: ${LOGSIZE}"
-            fi
-          done
-
-          wait "$BUILD_PID"
           RESULT=$?
 
-          echo "$RESULT" > "$GITHUB_WORKSPACE/full-build-result.txt"
+          echo "$RESULT" > "$GITHUB_WORKSPACE/ksu-target-result.txt"
 
-          echo "=========================================="
-          echo " BUILD RESULT: $RESULT"
-          echo "=========================================="
-
-          echo "===== LAST 300 CLEAN LOG LINES ====="
+          echo
+          echo "===== LAST RELEVANT BUILD OUTPUT ====="
 
           grep -vE \
             'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-            "$RAW" |
-            tail -300 || true
+            "$RAW" | tail -400 || true
+
+          echo
+          echo "===== RESULT ====="
+          echo "TARGET BUILD RESULT: $RESULT"
 
           if [ "$RESULT" -ne 0 ]; then
-            echo "BUILD FAILED"
+            echo "KERNELSU TARGETED BUILD FAILED"
             exit "$RESULT"
           fi
 
-          echo "CLEAN CLANG11 BUILD SUCCESSFUL"
+          echo "KERNELSU TARGETED BUILD SUCCESSFUL"
 
-      - name: Verify output
+      - name: Verify KernelSU objects
         working-directory: kernel
         run: |
           set -euxo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/output"
+          echo "===== SEARCH KERNELSU BUILD OUTPUT ====="
 
-          find out/arch/arm64/boot \
-            -maxdepth 4 \
+          find out \
             -type f \
-            -printf '%p %s bytes\n' \
-            | sort \
-            | tee "$GITHUB_WORKSPACE/output-list.txt"
-
-          FOUND=0
-
-          for FILE in \
-            out/arch/arm64/boot/Image \
-            out/arch/arm64/boot/Image.gz \
-            out/arch/arm64/boot/Image.gz-dtb \
-            out/arch/arm64/boot/Image-dtb
-          do
-            if [ -s "$FILE" ]; then
-              cp "$FILE" "$GITHUB_WORKSPACE/output/"
-              FOUND=1
-            fi
-          done
-
-          test "$FOUND" -eq 1
-
-          find out/arch/arm64/boot \
-            -type f \
-            \( -name '*.dtb' -o -name '*.dtbo' \) \
+            \( -name '*ksu*.o' \
+               -o -path '*/KernelSU/*' \
+               -o -path '*/kernelsu/*' \) \
             -print \
             | sort \
-            | tee "$GITHUB_WORKSPACE/dtb-list.txt" || true
+            | tee "$GITHUB_WORKSPACE/ksu-object-list.txt" \
+            || true
 
-          mkdir -p "$GITHUB_WORKSPACE/output/dtb"
+          echo
+          echo "===== KERNEL BUILT-IN OBJECT ====="
 
-          while IFS= read -r FILE
-          do
-            [ -n "$FILE" ] || continue
+          if [ -s out/kernel/built-in.o ]; then
+            ls -lh out/kernel/built-in.o
+          else
+            echo "ERROR: out/kernel/built-in.o WAS NOT CREATED"
+            exit 1
+          fi
 
-            REL="${FILE#out/arch/arm64/boot/}"
-            DEST="$GITHUB_WORKSPACE/output/dtb/$REL"
-
-            mkdir -p "$(dirname "$DEST")"
-            cp "$FILE" "$DEST"
-
-          done < "$GITHUB_WORKSPACE/dtb-list.txt"
-
-      - name: Kernel diagnostics
-        working-directory: kernel
+      - name: Create test information
+        if: always()
         run: |
-          set -euxo pipefail
-
-          CLANG_BIN="$(cat "$GITHUB_WORKSPACE/clang-path.txt")"
-          export PATH="$GITHUB_WORKSPACE/$CLANG_BIN:$PATH"
+          set +e
 
           {
-            echo "XCOVER4S CLEAN CLANG11 TEST"
-            echo "==========================="
+            echo "XCover4s KernelSU v0.9.5 Compile Test"
+            echo "===================================="
             echo
-            echo "COMPILER:"
-            clang --version
+            echo "NO BOOT IMAGE"
+            echo "NOT FOR FLASHING"
+            echo
+            echo "DATE:"
+            date -u
             echo
             echo "KERNEL COMMIT:"
-            git rev-parse HEAD
+            git -C kernel rev-parse HEAD 2>/dev/null || true
             echo
-            echo "KERNEL RELEASE:"
-            strings out/arch/arm64/boot/Image |
-              grep -m1 'Linux version' || true
+            echo "KERNELSU COMMIT:"
+            git -C kernel/KernelSU rev-parse HEAD 2>/dev/null || true
             echo
-            echo "IMAGE:"
-            ls -l out/arch/arm64/boot/Image
-            sha256sum out/arch/arm64/boot/Image
+            echo "KERNELSU CONFIG:"
+            grep -E \
+              '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_HAVE_KPROBES|CONFIG_KPROBE_EVENTS)=' \
+              kernel/out/.config 2>/dev/null || true
             echo
-            echo "IMAGE.GZ:"
-            ls -l out/arch/arm64/boot/Image.gz || true
-            sha256sum out/arch/arm64/boot/Image.gz || true
-            echo
-            echo "KSU:"
-            grep '^CONFIG_KSU' out/.config ||
-              echo "CONFIG_KSU NOT PRESENT"
+            echo "TARGET RESULT:"
+            cat ksu-target-result.txt 2>/dev/null || echo "NO RESULT"
+          } > ksu-test-info.txt
 
-          } > "$GITHUB_WORKSPACE/build-info.txt"
+          cat ksu-test-info.txt
 
-          cat "$GITHUB_WORKSPACE/build-info.txt"
-
-      - name: Package test build
-        run: |
-          set -euxo pipefail
-
-          cp kernel-config.txt output/
-          cp build-info.txt output/
-          cp output-list.txt output/
-          cp dtb-list.txt output/
-
-          cd output
-
-          find . \
-            -type f \
-            ! -name SHA256SUMS.txt \
-            -print0 |
-            sort -z |
-            xargs -0 sha256sum \
-            > SHA256SUMS.txt
-
-          cat SHA256SUMS.txt
-
-          zip -r \
-            "$GITHUB_WORKSPACE/xcover4s-CLEAN-clang11.zip" \
-            .
-
-      - name: Upload CLEAN Clang11 kernel
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcover4s-CLEAN-clang11
-          path: |
-            xcover4s-CLEAN-clang11.zip
-            build-info.txt
-            full-build-result.txt
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload diagnostics
+      - name: Upload KernelSU diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-CLEAN-clang11-diagnostics
+          name: xcover4s-KSU-v095-target-test
           path: |
-            full-build.log
-            full-build-result.txt
+            ksu-target-build.log
+            ksu-target-result.txt
             kernel-config.txt
-            build-info.txt
-            output-list.txt
-            dtb-list.txt
-            clang-path.txt
+            ksu-object-list.txt
+            ksu-test-info.txt
           if-no-files-found: warn
           retention-days: 14
