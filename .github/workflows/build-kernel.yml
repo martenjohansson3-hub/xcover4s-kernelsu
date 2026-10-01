@@ -1,4 +1,4 @@
-name: XCover4s KernelSU Full Build 3
+name: XCover4s CLEAN Test Kernel
 
 on:
   workflow_dispatch:
@@ -9,25 +9,16 @@ jobs:
     timeout-minutes: 60
 
     steps:
-
-      # ============================================================
-      # 1. DEPENDENCIES
-      # ============================================================
-
       - name: Install dependencies
         run: |
           set -euxo pipefail
-
           sudo apt-get update -qq
-
           sudo apt-get install -y --no-install-recommends \
             bc \
             bison \
             build-essential \
             flex \
             git \
-            curl \
-            python3 \
             clang \
             lld \
             llvm \
@@ -35,23 +26,12 @@ jobs:
             libelf-dev \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            cpio \
-            gzip \
-            xz-utils \
-            zip \
-            unzip
+            zip
 
-          echo
-          echo "===== BUILD TOOLS ====="
           clang --version
           aarch64-linux-gnu-gcc --version
-          make --version
 
-      # ============================================================
-      # 2. KERNEL SOURCE
-      # ============================================================
-
-      - name: Clone kernel
+      - name: Clone CLEAN kernel source
         run: |
           set -euxo pipefail
 
@@ -63,518 +43,14 @@ jobs:
 
           cd kernel
 
-          echo
           echo "===== KERNEL COMMIT ====="
           git rev-parse HEAD
 
-      # ============================================================
-      # 3. KERNELSU NEXT
-      # ============================================================
-
-      - name: Install KernelSU Next
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          curl -LSs \
-            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
-            | bash -s legacy
-
-          test -d drivers/kernelsu
-          test -d KernelSU-Next
-
-          echo
-          echo "===== KERNELSU ====="
-
-          git -C KernelSU-Next describe --tags --always || true
-          git -C KernelSU-Next rev-parse HEAD
-
-      # ============================================================
-      # 4. COMPATIBILITY FIXES
-      # ============================================================
-
-      - name: Apply KernelSU compatibility fixes
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          root = Path("drivers/kernelsu")
-
-          if not root.exists():
-              raise SystemExit("ERROR: drivers/kernelsu missing")
-
-          replacements = {
-              "linux/compiler_types.h": "linux/compiler.h",
-              "linux/sched/signal.h": "linux/sched.h",
-              "linux/sched/task.h": "linux/sched.h",
-              "linux/sched/user.h": "linux/sched.h",
-          }
-
-          for p in root.rglob("*"):
-              if not p.is_file() or p.suffix not in (".c", ".h"):
-                  continue
-
-              try:
-                  s = p.read_text()
-              except Exception:
-                  continue
-
-              old = s
-
-              for a, b in replacements.items():
-                  s = s.replace(f"<{a}>", f"<{b}>")
-
-              if s != old:
-                  p.write_text(s)
-                  print("HEADER PATCH:", p)
-
-          # full_name_hash
-          for p in root.rglob("*.c"):
-              try:
-                  s = p.read_text()
-              except Exception:
-                  continue
-
-              old = s
-
-              s = re.sub(
-                  r'full_name_hash\s*\(\s*NULL\s*,\s*'
-                  r'([^,]+?)\s*,\s*strlen\s*\(\s*\1\s*\)\s*\)',
-                  r'full_name_hash((const unsigned char *)\1, strlen(\1))',
-                  s
-              )
-
-              if s != old:
-                  p.write_text(s)
-                  print("HASH PATCH:", p)
-
-          # in_compat_syscall
-          for p in root.rglob("*"):
-              if not p.is_file() or p.suffix not in (".c", ".h"):
-                  continue
-
-              try:
-                  s = p.read_text()
-              except Exception:
-                  continue
-
-              if "in_compat_syscall()" not in s:
-                  continue
-
-              s = s.replace(
-                  "in_compat_syscall()",
-                  "is_compat_task()"
-              )
-
-              if "#include <linux/compat.h>" not in s:
-                  s = "#include <linux/compat.h>\n" + s
-
-              p.write_text(s)
-              print("COMPAT PATCH:", p)
-
-          # kvmalloc / kvfree
-          for p in root.rglob("*"):
-              if not p.is_file() or p.suffix not in (".c", ".h"):
-                  continue
-
-              try:
-                  s = p.read_text()
-              except Exception:
-                  continue
-
-              old = s
-
-              s = re.sub(
-                  r'\bkvmalloc\s*\(\s*([^,]+?)\s*,\s*'
-                  r'GFP_[A-Z0-9_| ()]+\s*\)',
-                  r'vmalloc(\1)',
-                  s
-              )
-
-              s = s.replace("kvfree(", "vfree(")
-
-              if s != old:
-                  if "#include <linux/vmalloc.h>" not in s:
-                      s = "#include <linux/vmalloc.h>\n" + s
-
-                  p.write_text(s)
-                  print("ALLOCATION PATCH:", p)
-
-          # apk_sign
-          apk = root / "manager" / "apk_sign.c"
-
-          if not apk.exists():
-              raise SystemExit("ERROR: apk_sign.c missing")
-
-          s = apk.read_text()
-
-          s = s.replace(
-              "#include <linux/vmalloc.h>\n",
-              ""
-          )
-
-          s = re.sub(
-              r'\bkvmalloc\s*\(\s*([^,]+?)\s*,\s*GFP_KERNEL\s*\)',
-              r'vmalloc(\1)',
-              s
-          )
-
-          s = s.replace("kvfree(", "vfree(")
-
-          s = "#include <linux/vmalloc.h>\n" + s
-
-          apk.write_text(s)
-
-          # ALIGN_DOWN
-          adb = root / "feature" / "adb_root.c"
-
-          if adb.exists():
-              s = adb.read_text()
-
-              if (
-                  "ALIGN_DOWN(" in s
-                  and "#ifndef ALIGN_DOWN" not in s
-              ):
-                  s = (
-                      "#ifndef ALIGN_DOWN\n"
-                      "#define ALIGN_DOWN(x, a) "
-                      "((x) & ~((typeof(x))(a) - 1))\n"
-                      "#endif\n\n"
-                  ) + s
-
-                  adb.write_text(s)
-                  print("ALIGN_DOWN PATCH")
-
-          # sulog
-          event = root / "sulog" / "event.c"
-
-          if event.exists():
-              s = event.read_text()
-
-              s = s.replace(
-                  "#if KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE",
-                  "#if KERNEL_VERSION(4, 14, 0) <= LINUX_VERSION_CODE"
-              )
-
-              event.write_text(s)
-
-          # selinux_hide
-          hide = root / "feature" / "selinux_hide.c"
-
-          if not hide.exists():
-              raise SystemExit("ERROR: selinux_hide.c missing")
-
-          s = hide.read_text()
-
-          s = s.replace(
-              "#include <asm/set_memory.h>\n",
-              ""
-          )
-
-          s = s.replace(
-              '#include "asm/set_memory.h"\n',
-              ""
-          )
-
-          if "__nocfi" in s and "#ifndef __nocfi" not in s:
-              s = (
-                  "#ifndef __nocfi\n"
-                  "#define __nocfi\n"
-                  "#endif\n\n"
-              ) + s
-
-          hide.write_text(s)
-
-          print()
-          print("ALL COMPATIBILITY PATCHES APPLIED")
-          PY
-
-      # ============================================================
-      # 5. VERIFY FIXES
-      # ============================================================
-
-      - name: Verify compatibility fixes
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          if grep -R \
-            'linux/compiler_types.h' \
-            drivers/kernelsu \
-            --include='*.c' \
-            --include='*.h'
-          then
-              echo "ERROR: compiler_types.h remains"
-              exit 1
-          fi
-
-          if grep -R \
-            'linux/sched/signal.h' \
-            drivers/kernelsu \
-            --include='*.c' \
-            --include='*.h'
-          then
-              echo "ERROR: sched/signal.h remains"
-              exit 1
-          fi
-
-          if grep -q \
-            'asm/set_memory.h' \
-            drivers/kernelsu/feature/selinux_hide.c
-          then
-              echo "ERROR: asm/set_memory.h remains"
-              exit 1
-          fi
-
-          echo "COMPATIBILITY CHECK PASSED"
-
-      # ============================================================
-      # 6. ENABLE KSU
-      # ============================================================
-
-      - name: Enable KernelSU
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          DEFCONFIG="arch/arm64/configs/lineage_xcover4s_defconfig"
-
-          test -f "$DEFCONFIG"
-
-          if ! grep -q '^CONFIG_KSU=y$' "$DEFCONFIG"; then
-              echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
-          fi
-
-          grep '^CONFIG_KSU=y$' "$DEFCONFIG"
-
-      # ============================================================
-      # 7. MANUAL KSU HOOKS
-      # ============================================================
-
-      - name: Apply KernelSU manual hooks
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          def patch(path, old, new):
-              p = Path(path)
-
-              if not p.exists():
-                  raise SystemExit("FILE NOT FOUND: " + path)
-
-              data = p.read_text()
-
-              if new in data:
-                  print("ALREADY PATCHED:", path)
-                  return
-
-              if old not in data:
-                  raise SystemExit("PATCH TARGET NOT FOUND: " + path)
-
-              p.write_text(data.replace(old, new, 1))
-              print("PATCHED:", path)
-
-
-          # EXEC
-          patch(
-              "fs/exec.c",
-              """int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd,
-          	struct filename **filename_ptr,
-          	void *argv, void *envp, int *flags);
-          #endif
-
-          int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {"""
-          )
-
-          patch(
-              "fs/exec.c",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          #ifdef CONFIG_KSU
-          	{
-          		int ksu_fd = AT_FDCWD;
-          		int ksu_flags = 0;
-          		ksu_handle_execveat(&ksu_fd, &filename,
-          			&argv, &envp, &ksu_flags);
-          	}
-          #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
-          )
-
-          # FACCESSAT
-          patch(
-              "fs/open.c",
-              """/*
-           * access() needs to use the real uid/gid, not the effective uid/gid.""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd,
-          	const char __user **filename_user,
-          	int *mode, int *flags);
-          #endif
-
-          /*
-           * access() needs to use the real uid/gid, not the effective uid/gid."""
-          )
-
-          patch(
-              "fs/open.c",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          	if (mode & ~S_IRWXO)""",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_faccessat(
-          		&dfd, &filename, &mode, NULL);
-          #endif
-
-          	if (mode & ~S_IRWXO)"""
-          )
-
-          # READ
-          patch(
-              "fs/read_write.c",
-              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern __attribute__((cold)) int ksu_handle_sys_read(
-          	unsigned int fd,
-          	char __user **buf_ptr,
-          	size_t *count_ptr);
-          #endif
-
-          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {"""
-          )
-
-          patch(
-              "fs/read_write.c",
-              """	ssize_t ret = -EBADF;
-
-          	if (f.file) {""",
-              """	ssize_t ret = -EBADF;
-
-          #ifdef CONFIG_KSU
-          	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(
-          			fd,
-          			(char __user **)&buf,
-          			&count);
-          #endif
-
-          	if (f.file) {"""
-          )
-
-          # STAT
-          patch(
-              "fs/stat.c",
-              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd,
-          	const char __user **filename_user,
-          	int *flags);
-          #endif
-
-          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat"""
-          )
-
-          patch(
-              "fs/stat.c",
-              """	struct kstat stat;
-          	int error;
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);""",
-              """	struct kstat stat;
-          	int error;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_stat(&dfd, &filename, &flag);
-          #endif
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);"""
-          )
-
-          # REBOOT
-          patch(
-              "kernel/reboot.c",
-              """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1,
-          	int magic2, unsigned int cmd,
-          	void __user **arg);
-          #endif
-
-          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {"""
-          )
-
-          patch(
-              "kernel/reboot.c",
-              """	int ret = 0;
-
-          	/* We only trust the superuser with rebooting the system. */""",
-              """	int ret = 0;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_sys_reboot(
-          		magic1, magic2, cmd, &arg);
-          #endif
-
-          	/* We only trust the superuser with rebooting the system. */"""
-          )
-
-          print()
-          print("ALL MANUAL KERNELSU HOOKS APPLIED")
-          PY
-
-      # ============================================================
-      # 8. VERIFY HOOKS
-      # ============================================================
-
-      - name: Verify KernelSU hooks
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          grep -n 'ksu_handle_execveat' fs/exec.c
-          grep -n 'ksu_handle_faccessat' fs/open.c
-          grep -n 'ksu_handle_sys_read' fs/read_write.c
-          grep -n 'ksu_handle_stat' fs/stat.c
-          grep -n 'ksu_handle_sys_reboot' kernel/reboot.c
-
-          echo
-          echo "ALL HOOKS PRESENT"
-
-      # ============================================================
-      # 9. CONFIGURE
-      # ============================================================
-
-      - name: Configure kernel
+          echo "===== VERIFY SOURCE IS CLEAN ====="
+          git status --short
+          test -z "$(git status --porcelain)"
+
+      - name: Configure CLEAN kernel
         working-directory: kernel
         run: |
           set -euxo pipefail
@@ -598,131 +74,29 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          echo
-          echo "===== CONFIG ====="
+          echo "===== VERIFY NO KERNELSU ====="
 
-          grep '^CONFIG_KSU=y$' out/.config
-
-          cp out/.config \
-            "$GITHUB_WORKSPACE/kernel-config.txt"
-
-      # ============================================================
-      # 10. PREPARE
-      # ============================================================
-
-      - name: Prepare kernel
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          make \
-            -j"$(nproc)" \
-            O=out \
-            ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            prepare scripts
-
-          echo
-          echo "===== GENERATING SELINUX HEADERS ====="
-
-          make \
-            -j"$(nproc)" \
-            O=out \
-            ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            security/selinux/ \
-            > "$GITHUB_WORKSPACE/selinux-build.log" \
-            2>&1
-
-          FLASK="$(
-            find out \
-              -type f \
-              -name flask.h \
-              -print \
-              -quit
-          )"
-
-          if [ -z "$FLASK" ]; then
-              echo "ERROR: flask.h missing"
-              cat "$GITHUB_WORKSPACE/selinux-build.log"
-              exit 1
+          if grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "ERROR: CONFIG_KSU IS ENABLED"
+            exit 1
           fi
 
-          echo "FOUND:"
-          echo "$FLASK"
+          echo "KernelSU is NOT enabled."
 
-      # ============================================================
-      # 11. VERIFY KSU
-      # ============================================================
+          cp out/.config "$GITHUB_WORKSPACE/kernel-config.txt"
 
-      - name: Verify KernelSU compilation
-        working-directory: kernel
-        run: |
-          set +e
-
-          echo "=========================================="
-          echo " VERIFYING KERNELSU"
-          echo "=========================================="
-
-          make \
-            -j"$(nproc)" \
-            O=out \
-            ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" \
-            drivers/kernelsu/ \
-            > "$GITHUB_WORKSPACE/kernelsu-verify.log" \
-            2>&1
-
-          RESULT=$?
-
-          grep -vE \
-            'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-            "$GITHUB_WORKSPACE/kernelsu-verify.log" \
-            || true
-
-          if [ "$RESULT" -ne 0 ]; then
-              echo
-              echo "KERNELSU FAILED: $RESULT"
-              exit "$RESULT"
-          fi
-
-          test -s out/drivers/kernelsu/built-in.o
-
-          echo
-          echo "=========================================="
-          echo " KERNELSU PASSED"
-          echo "=========================================="
-
-      # ============================================================
-      # 12. FULL BUILD
-      #
-      # RAW LOG IS SAVED.
-      # 0x22 / 0x23 OBJDUMP SPAM HIDDEN FROM SCREEN.
-      # ============================================================
-
-      - name: Full kernel build
+      - name: Build CLEAN kernel
         working-directory: kernel
         run: |
           set +e
 
           RAW="$GITHUB_WORKSPACE/full-build.log"
-
           : > "$RAW"
 
           echo "=========================================="
-          echo " STARTING FULL KERNEL BUILD"
-          echo " HEARTBEAT EVERY 30 SECONDS"
-          echo " OBJDUMP 0x22/0x23 SPAM HIDDEN"
+          echo " XCOVER4S CLEAN KERNEL BUILD"
+          echo " NO ROOT / NO KERNELSU"
           echo "=========================================="
-
-          START=$(date +%s)
 
           make \
             -j"$(nproc)" \
@@ -732,99 +106,31 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            > "$RAW" \
-            2>&1 &
+            > "$RAW" 2>&1
 
-          BUILD_PID=$!
-
-          tail -n +1 -F "$RAW" \
-            | grep --line-buffered -vE \
-              'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' &
-
-          FILTER_PID=$!
-
-          (
-            while kill -0 "$BUILD_PID" 2>/dev/null
-            do
-              sleep 30
-
-              if kill -0 "$BUILD_PID" 2>/dev/null
-              then
-                NOW=$(date +%s)
-
-                echo
-                echo "Kernel build still running... $((NOW-START))s"
-              fi
-            done
-          ) &
-
-          HEARTBEAT_PID=$!
-
-          wait "$BUILD_PID"
           RESULT=$?
 
-          sleep 2
+          echo "$RESULT" > "$GITHUB_WORKSPACE/full-build-result.txt"
 
-          kill "$FILTER_PID" 2>/dev/null || true
-          kill "$HEARTBEAT_PID" 2>/dev/null || true
-
-          wait "$FILTER_PID" 2>/dev/null || true
-          wait "$HEARTBEAT_PID" 2>/dev/null || true
-
-          END=$(date +%s)
-
-          echo "$RESULT" \
-            > "$GITHUB_WORKSPACE/full-build-result.txt"
-
-          echo
-          echo "=========================================="
-          echo " FULL BUILD RESULT: $RESULT"
-          echo " TIME: $((END-START)) SECONDS"
-          echo "=========================================="
+          grep -vE \
+            'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
+            "$RAW" | tail -300 || true
 
           if [ "$RESULT" -ne 0 ]; then
-
-            echo
-            echo "========== ERRORS =========="
-
-            grep -n -iE \
-              'fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|unknown type name|no member named|conflicting types|too many arguments|incompatible pointer|expected' \
-              "$RAW" \
-              | grep -viE \
-                'aarch64-linux-gnu-objdump: Warning: Unrecognized form:|Bogus end-of-siblings|DIE at offset' \
-              | tail -500 \
-              || true
-
-            echo
-            echo "========== LAST CLEAN OUTPUT =========="
-
-            grep -viE \
-              'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-              "$RAW" \
-              | tail -200 \
-              || true
-
+            echo "CLEAN BUILD FAILED: $RESULT"
             exit "$RESULT"
           fi
 
-          echo
-          echo "=========================================="
-          echo " FULL KERNEL BUILD SUCCESSFUL"
-          echo "=========================================="
+          echo "CLEAN BUILD SUCCESSFUL"
 
-      # ============================================================
-      # 13. VERIFY OUTPUT
-      # ============================================================
-
-      - name: Verify kernel output
-        if: success()
+      - name: Verify CLEAN output
         working-directory: kernel
         run: |
           set -euxo pipefail
 
           mkdir -p "$GITHUB_WORKSPACE/output"
 
-          echo "===== BOOT OUTPUT ====="
+          echo "===== KERNEL OUTPUTS ====="
 
           find out/arch/arm64/boot \
             -maxdepth 4 \
@@ -842,31 +148,25 @@ jobs:
             out/arch/arm64/boot/Image-dtb
           do
             if [ -s "$FILE" ]; then
-
-              echo "FOUND KERNEL: $FILE"
-
-              cp "$FILE" \
-                "$GITHUB_WORKSPACE/output/"
-
+              echo "FOUND: $FILE"
+              cp "$FILE" "$GITHUB_WORKSPACE/output/"
               FOUND=1
             fi
           done
 
           if [ "$FOUND" -ne 1 ]; then
-            echo "ERROR: NO KERNEL IMAGE FOUND"
+            echo "ERROR: NO KERNEL IMAGE"
             exit 1
           fi
 
-          echo
-          echo "===== DTB ====="
+          echo "===== DTB OUTPUTS ====="
 
           find out/arch/arm64/boot \
             -type f \
             \( -name '*.dtb' -o -name '*.dtbo' \) \
             -print \
             | sort \
-            | tee "$GITHUB_WORKSPACE/dtb-list.txt" \
-            || true
+            | tee "$GITHUB_WORKSPACE/dtb-list.txt" || true
 
           mkdir -p "$GITHUB_WORKSPACE/output/dtb"
 
@@ -878,96 +178,39 @@ jobs:
             DEST="$GITHUB_WORKSPACE/output/dtb/$REL"
 
             mkdir -p "$(dirname "$DEST")"
-
             cp "$FILE" "$DEST"
 
           done < "$GITHUB_WORKSPACE/dtb-list.txt"
 
-      # ============================================================
-      # 14. FINAL KSU CHECK
-      # ============================================================
-
-      - name: Verify KernelSU in final build
-        if: success()
-        working-directory: kernel
+      - name: Create build information
         run: |
           set -euxo pipefail
 
-          grep '^CONFIG_KSU=y$' out/.config
-
-          test -s \
-            out/drivers/kernelsu/built-in.o
-
-          ls -lh \
-            out/drivers/kernelsu/built-in.o
-
-          echo
-          echo "KERNELSU PRESENT"
-
-      # ============================================================
-      # 15. BUILD INFO
-      # ============================================================
-
-      - name: Create build information
-        if: always()
-        run: |
-          set +e
-
           {
-            echo "XCover4s KernelSU Full Build 3"
-            echo "================================"
+            echo "XCover4s CLEAN Test Kernel"
+            echo "=========================="
             echo
-
+            echo "NO ROOT"
+            echo "NO KERNELSU"
+            echo "NO SOURCE PATCHES"
+            echo
             echo "DATE:"
             date -u
-
             echo
             echo "KERNEL COMMIT:"
-            git -C kernel rev-parse HEAD 2>/dev/null || true
-
+            git -C kernel rev-parse HEAD
             echo
-            echo "KERNELSU VERSION:"
-            git -C kernel/KernelSU-Next \
-              describe --tags --always \
-              2>/dev/null || true
-
-            echo
-            echo "KERNELSU COMMIT:"
-            git -C kernel/KernelSU-Next \
-              rev-parse HEAD \
-              2>/dev/null || true
-
-            echo
-            echo "CONFIG:"
-            grep '^CONFIG_KSU' \
-              kernel/out/.config \
-              2>/dev/null || true
-
-            echo
-            echo "BUILD RESULT:"
-            cat full-build-result.txt \
-              2>/dev/null \
-              || echo "NO RESULT"
-
+            echo "CONFIG KSU CHECK:"
+            grep '^CONFIG_KSU' kernel/out/.config || echo "CONFIG_KSU NOT PRESENT"
             echo
             echo "OUTPUTS:"
-            find output \
-              -type f \
-              -printf '%p %s bytes\n' \
-              2>/dev/null \
-              | sort \
-              || true
+            find output -type f -printf '%p %s bytes\n' | sort
 
           } > build-info.txt
 
           cat build-info.txt
 
-      # ============================================================
-      # 16. PACKAGE
-      # ============================================================
-
-      - name: Package successful build
-        if: success()
+      - name: Package CLEAN test kernel
         run: |
           set -euxo pipefail
 
@@ -975,7 +218,6 @@ jobs:
           cp build-info.txt output/
           cp output-list.txt output/
           cp dtb-list.txt output/
-          cp kernelsu-verify.log output/
 
           cd output
 
@@ -987,117 +229,34 @@ jobs:
             | xargs -0 sha256sum \
             > SHA256SUMS.txt
 
-          echo
-          echo "===== CHECKSUMS ====="
+          echo "===== SHA256 ====="
           cat SHA256SUMS.txt
 
           zip -r \
-            "$GITHUB_WORKSPACE/xcover4s-kernelsu-build.zip" \
+            "$GITHUB_WORKSPACE/xcover4s-CLEAN-test-kernel.zip" \
             .
 
-          cd "$GITHUB_WORKSPACE"
-
-          sha256sum \
-            xcover4s-kernelsu-build.zip \
-            > xcover4s-kernelsu-build.zip.sha256
-
-          echo
-          echo "===== FINAL PACKAGE ====="
-
-          ls -lh \
-            xcover4s-kernelsu-build.zip \
-            xcover4s-kernelsu-build.zip.sha256
-
-          cat xcover4s-kernelsu-build.zip.sha256
-
-      # ============================================================
-      # 17. FAILURE REPORT
-      # ============================================================
-
-      - name: Create failure report
-        if: failure()
-        run: |
-          set +e
-
-          {
-            echo "XCOVER4S FULL BUILD 3 FAILURE"
-            echo "================================"
-            echo
-
-            echo "RESULT:"
-            cat full-build-result.txt \
-              2>/dev/null \
-              || echo "NO FULL BUILD RESULT"
-
-            echo
-            echo "CONFIG:"
-            grep '^CONFIG_KSU' \
-              kernel/out/.config \
-              2>/dev/null || true
-
-            echo
-            echo "ERRORS:"
-
-            if [ -f full-build.log ]; then
-
-              grep -n -iE \
-                'fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|unknown type name|no member named|conflicting types|too many arguments|incompatible pointer|expected' \
-                full-build.log \
-                | grep -viE \
-                  'aarch64-linux-gnu-objdump: Warning: Unrecognized form:|Bogus end-of-siblings|DIE at offset' \
-                | tail -600 \
-                || true
-
-            fi
-
-            echo
-            echo "LAST CLEAN OUTPUT:"
-
-            grep -viE \
-              'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-              full-build.log \
-              2>/dev/null \
-              | tail -300 \
-              || true
-
-          } > failure-report.txt
-
-          cat failure-report.txt
-
-      # ============================================================
-      # 18. SUCCESS ARTIFACT
-      # ============================================================
-
-      - name: Upload kernel artifact
-        if: success()
+      - name: Upload CLEAN kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernelsu-full-build
+          name: xcover4s-CLEAN-test-kernel
           path: |
-            xcover4s-kernelsu-build.zip
-            xcover4s-kernelsu-build.zip.sha256
+            xcover4s-CLEAN-test-kernel.zip
             build-info.txt
             full-build-result.txt
           if-no-files-found: error
           retention-days: 14
 
-      # ============================================================
-      # 19. DIAGNOSTICS
-      # ============================================================
-
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-full-build-diagnostics
+          name: xcover4s-CLEAN-test-diagnostics
           path: |
             full-build.log
             full-build-result.txt
-            kernelsu-verify.log
-            selinux-build.log
             kernel-config.txt
             build-info.txt
-            failure-report.txt
             output-list.txt
             dtb-list.txt
           if-no-files-found: warn
