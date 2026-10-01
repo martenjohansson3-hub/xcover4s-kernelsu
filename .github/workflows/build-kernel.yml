@@ -1,23 +1,42 @@
-name: XCover4s KernelSU Fast Test 5
+name: XCover4s KernelSU Ultra Fast Test 6
 
 on:
   workflow_dispatch:
 
 jobs:
-  ksu-test:
+  test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
-      - name: Install dependencies
+      # ============================================================
+      # 1. INSTALL
+      # ============================================================
+
+      - name: Install build tools
         run: |
           set -eux
 
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git curl python3 \
-            clang lld libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu ccache
+            bc \
+            bison \
+            build-essential \
+            flex \
+            git \
+            curl \
+            python3 \
+            clang \
+            lld \
+            libssl-dev \
+            libelf-dev \
+            gcc-aarch64-linux-gnu \
+            ccache
+
+      # ============================================================
+      # 2. KERNEL
+      # ============================================================
 
       - name: Clone kernel
         run: |
@@ -29,8 +48,9 @@ jobs:
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
-          cd kernel
-          git rev-parse HEAD
+      # ============================================================
+      # 3. KERNELSU
+      # ============================================================
 
       - name: Install KernelSU Next
         working-directory: kernel
@@ -41,11 +61,15 @@ jobs:
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             | bash -s legacy
 
-          echo "===== KERNELSU VERSION ====="
+          echo "===== KSU VERSION ====="
 
-          if [ -d KernelSU-Next ]; then
-            git -C KernelSU-Next describe --tags --always || true
-          fi
+          git -C KernelSU-Next \
+            describe --tags --always \
+            || true
+
+      # ============================================================
+      # 4. APPLY ALL KNOWN COMPAT FIXES
+      # ============================================================
 
       - name: Apply compatibility fixes
         working-directory: kernel
@@ -53,22 +77,34 @@ jobs:
           set -eux
 
           echo "=========================================="
-          echo " APPLYING COMPATIBILITY FIXES"
+          echo " APPLYING KNOWN FIXES"
           echo "=========================================="
 
-          grep -R -l 'linux/compiler_types.h' drivers/kernelsu 2>/dev/null \
+          grep -R -l \
+            'linux/compiler_types.h' \
+            drivers/kernelsu \
+            2>/dev/null \
             | xargs -r sed -i \
             's|<linux/compiler_types.h>|<linux/compiler.h>|g'
 
-          grep -R -l 'linux/sched/signal.h' drivers/kernelsu 2>/dev/null \
+          grep -R -l \
+            'linux/sched/signal.h' \
+            drivers/kernelsu \
+            2>/dev/null \
             | xargs -r sed -i \
             's|<linux/sched/signal.h>|<linux/sched.h>|g'
 
-          grep -R -l 'linux/sched/task.h' drivers/kernelsu 2>/dev/null \
+          grep -R -l \
+            'linux/sched/task.h' \
+            drivers/kernelsu \
+            2>/dev/null \
             | xargs -r sed -i \
             's|<linux/sched/task.h>|<linux/sched.h>|g'
 
-          grep -R -l 'linux/sched/user.h' drivers/kernelsu 2>/dev/null \
+          grep -R -l \
+            'linux/sched/user.h' \
+            drivers/kernelsu \
+            2>/dev/null \
             | xargs -r sed -i \
             's|<linux/sched/user.h>|<linux/sched.h>|g'
 
@@ -78,11 +114,12 @@ jobs:
 
           root = Path("drivers/kernelsu")
 
-          # ========================================================
-          # full_name_hash compatibility
-          # ========================================================
+          # --------------------------------------------------------
+          # full_name_hash
+          # --------------------------------------------------------
 
           for p in root.rglob("*.c"):
+
               try:
                   s = p.read_text()
               except Exception:
@@ -99,14 +136,18 @@ jobs:
 
               if s != old:
                   p.write_text(s)
-                  print("PATCHED full_name_hash:", p)
+                  print("PATCHED HASH:", p)
 
-          # ========================================================
-          # in_compat_syscall compatibility
-          # ========================================================
+          # --------------------------------------------------------
+          # compat syscall
+          # --------------------------------------------------------
 
           for p in root.rglob("*"):
-              if not p.is_file() or p.suffix not in (".c", ".h"):
+
+              if not p.is_file():
+                  continue
+
+              if p.suffix not in (".c", ".h"):
                   continue
 
               try:
@@ -126,14 +167,19 @@ jobs:
                   s = "#include <linux/compat.h>\n" + s
 
               p.write_text(s)
-              print("PATCHED compat:", p)
 
-          # ========================================================
-          # kvmalloc / kvfree compatibility
-          # ========================================================
+              print("PATCHED COMPAT:", p)
+
+          # --------------------------------------------------------
+          # kvmalloc / kvfree
+          # --------------------------------------------------------
 
           for p in root.rglob("*"):
-              if not p.is_file() or p.suffix not in (".c", ".h"):
+
+              if not p.is_file():
+                  continue
+
+              if p.suffix not in (".c", ".h"):
                   continue
 
               try:
@@ -150,29 +196,30 @@ jobs:
                   s
               )
 
-              s = re.sub(
-                  r'\bkvfree\s*\(',
-                  'vfree(',
-                  s
+              s = s.replace(
+                  "kvfree(",
+                  "vfree("
               )
 
               if s != old:
+
                   if "#include <linux/vmalloc.h>" not in s:
                       s = "#include <linux/vmalloc.h>\n" + s
 
                   p.write_text(s)
-                  print("PATCHED allocation:", p)
 
-          # ========================================================
-          # FORCE apk_sign.c
-          # ========================================================
+                  print("PATCHED ALLOCATION:", p)
+
+          # --------------------------------------------------------
+          # Force apk_sign compatibility
+          # --------------------------------------------------------
 
           apk = root / "manager" / "apk_sign.c"
 
           if apk.exists():
+
               s = apk.read_text()
 
-              # Remove misplaced includes
               s = s.replace(
                   "#include <linux/vmalloc.h>\n",
                   ""
@@ -189,26 +236,27 @@ jobs:
                   "vfree("
               )
 
-              # MUST be before functions
               s = "#include <linux/vmalloc.h>\n" + s
 
               apk.write_text(s)
 
-              print("PATCHED apk_sign.c")
+              print("PATCHED APK_SIGN")
 
-          # ========================================================
-          # ALIGN_DOWN compatibility
-          # ========================================================
+          # --------------------------------------------------------
+          # ALIGN_DOWN
+          # --------------------------------------------------------
 
           adb = root / "feature" / "adb_root.c"
 
           if adb.exists():
+
               s = adb.read_text()
 
               if (
                   "ALIGN_DOWN(" in s and
                   "#ifndef ALIGN_DOWN" not in s
               ):
+
                   s = (
                       "#ifndef ALIGN_DOWN\n"
                       "#define ALIGN_DOWN(x, a) "
@@ -217,104 +265,102 @@ jobs:
                   ) + s
 
                   adb.write_text(s)
+
                   print("PATCHED ALIGN_DOWN")
 
-          # ========================================================
+          # --------------------------------------------------------
           # sulog compatibility
-          # ========================================================
+          # --------------------------------------------------------
 
           event = root / "sulog" / "event.c"
 
           if event.exists():
+
               s = event.read_text()
 
-              old = (
-                  "#if KERNEL_VERSION(4, 19, 0) "
-                  "<= LINUX_VERSION_CODE"
+              s = s.replace(
+                  "#if KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE",
+                  "#if KERNEL_VERSION(4, 14, 0) <= LINUX_VERSION_CODE"
               )
 
-              new = (
-                  "#if KERNEL_VERSION(4, 14, 0) "
-                  "<= LINUX_VERSION_CODE"
-              )
+              event.write_text(s)
 
-              if old in s:
-                  event.write_text(
-                      s.replace(old, new)
-                  )
-                  print("PATCHED event.c")
-
-          # ========================================================
-          # NEW TEST 5 FIX:
-          # asm/set_memory.h does not exist on this old ARM64 kernel
-          # ========================================================
+          # --------------------------------------------------------
+          # selinux_hide:
+          # remove unavailable ARM64 set_memory header
+          # --------------------------------------------------------
 
           hide = root / "feature" / "selinux_hide.c"
 
           if not hide.exists():
               raise SystemExit(
-                  "ERROR: selinux_hide.c NOT FOUND"
+                  "ERROR: selinux_hide.c missing"
               )
 
           s = hide.read_text()
 
-          print("===== ORIGINAL SET_MEMORY REFERENCES =====")
-
-          for i, line in enumerate(s.splitlines(), 1):
-              if "set_memory" in line:
-                  print(i, line)
-
-          # Remove unavailable header.
           s = s.replace(
               "#include <asm/set_memory.h>\n",
               ""
           )
 
           s = s.replace(
-              "#include \"asm/set_memory.h\"\n",
+              '#include "asm/set_memory.h"\n',
               ""
           )
 
+          # --------------------------------------------------------
+          # NEW FIX:
+          # __nocfi does not exist on this old kernel/toolchain.
+          #
+          # Do NOT replace every use. Define the missing annotation
+          # as empty for this compatibility test.
+          # --------------------------------------------------------
+
+          if "__nocfi" in s:
+
+              if "#ifndef __nocfi" not in s:
+
+                  compat = (
+                      "\n"
+                      "#ifndef __nocfi\n"
+                      "#define __nocfi\n"
+                      "#endif\n"
+                      "\n"
+                  )
+
+                  # Put definition before the source body.
+                  s = compat + s
+
+                  print("ADDED __nocfi COMPATIBILITY")
+
           hide.write_text(s)
 
-          print("REMOVED asm/set_memory.h INCLUDE")
-
-          print("ALL COMPATIBILITY FIXES APPLIED")
+          print("PATCHED SELINUX_HIDE")
+          print("ALL KNOWN FIXES COMPLETE")
           PY
 
           echo
           echo "=========================================="
-          echo " TEST 5 PRECHECK"
+          echo " SELINUX_HIDE DIAGNOSTIC"
           echo "=========================================="
 
-          echo
-          echo "===== SET_MEMORY REFERENCES ====="
-
-          grep -n -E \
-            'set_memory|asm/set_memory' \
+          grep -n \
+            -E '__nocfi|set_memory|asm/set_memory' \
             drivers/kernelsu/feature/selinux_hide.c \
             || true
 
           echo
-          echo "===== APK_SIGN ====="
+          echo "===== FIRST 30 LINES ====="
 
-          grep -n -E \
-            'vmalloc|vfree|kvmalloc|kvfree|vmalloc.h' \
-            drivers/kernelsu/manager/apk_sign.c \
-            || true
-
-          if grep -q \
-            'asm/set_memory.h' \
+          head -30 \
             drivers/kernelsu/feature/selinux_hide.c
-          then
-            echo "ERROR: asm/set_memory.h still present"
-            exit 1
-          fi
 
-          echo
-          echo "PRECHECK PASSED"
+      # ============================================================
+      # 5. CONFIG
+      # ============================================================
 
-      - name: Enable KernelSU
+      - name: Configure
         working-directory: kernel
         run: |
           set -eux
@@ -322,245 +368,9 @@ jobs:
           if ! grep -q '^CONFIG_KSU=y' \
             arch/arm64/configs/lineage_xcover4s_defconfig
           then
-            echo 'CONFIG_KSU=y' \
-              >> arch/arm64/configs/lineage_xcover4s_defconfig
+              echo 'CONFIG_KSU=y' \
+                >> arch/arm64/configs/lineage_xcover4s_defconfig
           fi
-
-      - name: Apply KernelSU manual hooks
-        working-directory: kernel
-        run: |
-          set -eux
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          def patch(path, old, new):
-              p = Path(path)
-              data = p.read_text()
-
-              if new in data:
-                  print("ALREADY PATCHED:", path)
-                  return
-
-              if old not in data:
-                  raise SystemExit(
-                      "PATCH TARGET NOT FOUND: " + path
-                  )
-
-              p.write_text(
-                  data.replace(old, new, 1)
-              )
-
-              print("PATCHED:", path)
-
-
-          patch(
-              "fs/exec.c",
-              """int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd,
-          	struct filename **filename_ptr,
-          	void *argv, void *envp, int *flags);
-          #endif
-
-          int do_execve(struct filename *filename,
-          	const char __user *const __user *__argv,
-          	const char __user *const __user *__envp)
-          {"""
-          )
-
-          patch(
-              "fs/exec.c",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
-              """	struct user_arg_ptr envp = { .ptr.native = __envp };
-          #ifdef CONFIG_KSU
-          	{
-          		int ksu_fd = AT_FDCWD;
-          		int ksu_flags = 0;
-          		ksu_handle_execveat(
-          			&ksu_fd,
-          			&filename,
-          			&argv,
-          			&envp,
-          			&ksu_flags
-          		);
-          	}
-          #endif
-          	return do_execveat_common(
-          		AT_FDCWD,
-          		filename,
-          		argv,
-          		envp,
-          		0
-          	);"""
-          )
-
-          patch(
-              "fs/open.c",
-              """/*
-           * access() needs to use the real uid/gid, not the effective uid/gid.""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(
-          	int *dfd,
-          	const char __user **filename_user,
-          	int *mode,
-          	int *flags
-          );
-          #endif
-
-          /*
-           * access() needs to use the real uid/gid, not the effective uid/gid."""
-          )
-
-          patch(
-              "fs/open.c",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          	if (mode & ~S_IRWXO)""",
-              """	unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_faccessat(
-          		&dfd,
-          		&filename,
-          		&mode,
-          		NULL
-          	);
-          #endif
-
-          	if (mode & ~S_IRWXO)"""
-          )
-
-          patch(
-              "fs/read_write.c",
-              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern __attribute__((cold))
-          int ksu_handle_sys_read(
-          	unsigned int fd,
-          	char __user **buf_ptr,
-          	size_t *count_ptr
-          );
-          #endif
-
-          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {"""
-          )
-
-          patch(
-              "fs/read_write.c",
-              """	ssize_t ret = -EBADF;
-
-          	if (f.file) {""",
-              """	ssize_t ret = -EBADF;
-
-          #ifdef CONFIG_KSU
-          	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(
-          			fd,
-          			(char __user **)&buf,
-          			&count
-          		);
-          #endif
-
-          	if (f.file) {"""
-          )
-
-          patch(
-              "fs/stat.c",
-              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat""",
-              """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_stat(
-          	int *dfd,
-          	const char __user **filename_user,
-          	int *flags
-          );
-          #endif
-
-          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
-          SYSCALL_DEFINE4(newfstatat"""
-          )
-
-          patch(
-              "fs/stat.c",
-              """	struct kstat stat;
-          	int error;
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);""",
-              """	struct kstat stat;
-          	int error;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_stat(
-          		&dfd,
-          		&filename,
-          		&flag
-          	);
-          #endif
-
-          	error = vfs_fstatat(
-          		dfd,
-          		filename,
-          		&stat,
-          		flag
-          	);"""
-          )
-
-          patch(
-              "kernel/reboot.c",
-              """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {""",
-              """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(
-          	int magic1,
-          	int magic2,
-          	unsigned int cmd,
-          	void __user **arg
-          );
-          #endif
-
-          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          		void __user *, arg)
-          {"""
-          )
-
-          patch(
-              "kernel/reboot.c",
-              """	int ret = 0;
-
-          	/* We only trust the superuser with rebooting the system. */""",
-              """	int ret = 0;
-
-          #ifdef CONFIG_KSU
-          	ksu_handle_sys_reboot(
-          		magic1,
-          		magic2,
-          		cmd,
-          		&arg
-          	);
-          #endif
-
-          	/* We only trust the superuser with rebooting the system. */"""
-          )
-
-          print("ALL KERNELSU HOOKS APPLIED")
-          PY
-
-      - name: Configure kernel
-        working-directory: kernel
-        run: |
-          set -eux
 
           export CCACHE_DIR="$HOME/.ccache"
 
@@ -580,16 +390,26 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
-          echo
-          echo "===== CONFIG ====="
-          grep '^CONFIG_KSU=y' out/.config
+          grep '^CONFIG_KSU=y' \
+            out/.config
 
-      - name: Prepare generated headers
+      # ============================================================
+      # 6. MINIMUM PREPARE
+      #
+      # We still need generated kernel headers. This cannot safely
+      # be skipped when starting with a fresh GitHub runner.
+      # ============================================================
+
+      - name: Minimal kernel prepare
         working-directory: kernel
         run: |
           set -eux
 
           export CCACHE_DIR="$HOME/.ccache"
+
+          echo "=========================================="
+          echo " MINIMAL PREPARE"
+          echo "=========================================="
 
           make \
             -j"$(nproc)" \
@@ -598,10 +418,12 @@ jobs:
             CC="ccache clang" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            prepare scripts
+            prepare \
+            scripts
 
+          echo
           echo "=========================================="
-          echo " GENERATING SELINUX HEADERS"
+          echo " GENERATE SELINUX HEADERS"
           echo "=========================================="
 
           make \
@@ -612,7 +434,7 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             security/selinux/ \
-            > selinux.log \
+            > selinux-prep.log \
             2>&1
 
           FLASK=$(
@@ -624,24 +446,38 @@ jobs:
           )
 
           if [ -z "$FLASK" ]; then
-            echo "ERROR: flask.h missing"
-            tail -150 selinux.log || true
-            exit 1
+
+              echo "ERROR: flask.h missing"
+
+              tail -100 \
+                selinux-prep.log \
+                || true
+
+              exit 1
+
           fi
 
-          echo "FLASK.H = $FLASK"
-          echo "HEADERS READY"
+          echo "FLASK = $FLASK"
 
-      - name: Fast KernelSU compile
+      # ============================================================
+      # 7. ULTRA-FAST TARGETED COMPILE
+      #
+      # ONLY compile the object that failed in Test 5.
+      # ============================================================
+
+      - name: Compile only selinux_hide
         working-directory: kernel
         run: |
           set +e
 
           echo "=========================================="
-          echo " FAST KERNELSU COMPILE TEST 5"
+          echo " ULTRA FAST TARGET TEST"
+          echo " TARGET: selinux_hide.o"
           echo "=========================================="
 
           export CCACHE_DIR="$HOME/.ccache"
+
+          START=$(date +%s)
 
           make \
             -j"$(nproc)" \
@@ -651,134 +487,128 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            drivers/kernelsu/ \
-            > ksu-build.log \
+            drivers/kernelsu/feature/selinux_hide.o \
+            > target-build.log \
             2>&1
 
           RESULT=$?
 
-          echo "$RESULT" > ksu-result.txt
+          END=$(date +%s)
+          SECONDS_USED=$((END - START))
 
-          TOTAL_LINES=$(
-            wc -l < ksu-build.log
-          )
+          echo "$RESULT" \
+            > target-result.txt
 
           echo
           echo "=========================================="
-          echo " KERNELSU RESULT: $RESULT"
-          echo " LOG LINES: $TOTAL_LINES"
+          echo " TARGET RESULT: $RESULT"
+          echo " COMPILE TIME: ${SECONDS_USED}s"
           echo "=========================================="
 
           echo
           echo "===== REAL ERRORS ====="
 
           grep -n -iE \
-            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named|conflicting types" \
-            ksu-build.log \
+            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named|conflicting types|expected" \
+            target-build.log \
             | grep -viE \
               'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-            | tail -500 \
+            | tail -300 \
             || true
 
           echo
-          echo "===== LAST 150 CLEAN LINES ====="
+          echo "===== CLEAN OUTPUT ====="
 
           grep -viE \
             'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-            ksu-build.log \
-            | tail -150 \
+            target-build.log \
+            | tail -120 \
             || true
 
           if [ "$RESULT" -eq 0 ]; then
 
-            echo
-            echo "=========================================="
-            echo " KERNELSU RESULT 0"
-            echo " KERNELSU FAST TEST PASSED"
-            echo " READY FOR FULL BUILD"
-            echo "=========================================="
+              echo
+              echo "=========================================="
+              echo " SELINUX_HIDE.O PASSED"
+              echo "=========================================="
 
           else
 
-            echo
-            echo "=========================================="
-            echo " NEXT COMPATIBILITY ERROR FOUND"
-            echo "=========================================="
+              echo
+              echo "=========================================="
+              echo " SELINUX_HIDE.O STILL HAS AN ERROR"
+              echo "=========================================="
 
           fi
 
           exit "$RESULT"
 
-      - name: Create diagnostic report
+      # ============================================================
+      # 8. REPORT
+      # ============================================================
+
+      - name: Create diagnostics
         if: always()
         working-directory: kernel
         run: |
           set +e
 
-          REPORT="$GITHUB_WORKSPACE/ksu-fast-test-5.txt"
+          REPORT="$GITHUB_WORKSPACE/test6-report.txt"
 
           {
-            echo "=========================================="
-            echo " XCOVER4S KERNELSU FAST TEST 5"
-            echo "=========================================="
+              echo "=========================================="
+              echo " XCOVER4S KSU TEST 6"
+              echo " TARGETED SELINUX_HIDE TEST"
+              echo "=========================================="
 
-            echo
-            echo "RESULT:"
-            cat ksu-result.txt 2>/dev/null \
-              || echo "COMPILE DID NOT RUN"
+              echo
+              echo "RESULT:"
 
-            echo
-            echo "LOG LINE COUNT:"
-            wc -l ksu-build.log 2>/dev/null \
-              || true
+              cat target-result.txt \
+                2>/dev/null \
+                || echo "TARGET DID NOT RUN"
 
-            echo
-            echo "CONFIG:"
-            grep '^CONFIG_KSU' out/.config 2>/dev/null \
-              || true
+              echo
+              echo "SELINUX_HIDE REFERENCES:"
 
-            echo
-            echo "SET_MEMORY:"
-            grep -n -E \
-              'set_memory|asm/set_memory' \
-              drivers/kernelsu/feature/selinux_hide.c \
-              2>/dev/null \
-              || true
-
-            echo
-            echo "APK_SIGN:"
-            grep -n -E \
-              'vmalloc|vfree|kvmalloc|kvfree|vmalloc.h' \
-              drivers/kernelsu/manager/apk_sign.c \
-              2>/dev/null \
-              || true
-
-            echo
-            echo "ERRORS:"
-
-            if [ -f ksu-build.log ]; then
-              grep -n -iE \
-                "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named|conflicting types" \
-                ksu-build.log \
-                | grep -viE \
-                  'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-                | tail -500 \
+              grep -n \
+                -E '__nocfi|set_memory|asm/set_memory' \
+                drivers/kernelsu/feature/selinux_hide.c \
+                2>/dev/null \
                 || true
-            fi
+
+              echo
+              echo "ERRORS:"
+
+              if [ -f target-build.log ]; then
+
+                  grep -n -iE \
+                    "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named|conflicting types|expected" \
+                    target-build.log \
+                    | grep -viE \
+                      'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
+                    | tail -400 \
+                    || true
+
+              fi
 
           } > "$REPORT"
 
           cat "$REPORT"
 
+      # ============================================================
+      # 9. ARTIFACT
+      # ============================================================
+
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-ksu-fast-test-5
+          name: xcover4s-test6-ultrafast
           path: |
-            ksu-fast-test-5.txt
-            kernel/ksu-build.log
-            kernel/ksu-result.txt
-            kernel/selinux.log
+            test6-report.txt
+            kernel/target-build.log
+            kernel/target-result.txt
+            kernel/selinux-prep.log
             kernel/out/.config
           if-no-files-found: warn
