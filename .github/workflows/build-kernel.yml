@@ -1,12 +1,12 @@
-name: XCover4s KernelSU v0.9.5 Kconfig Diagnostic
+name: XCover4s KernelSU v0.9.5 Overlay Compile Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  diagnostic:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Install dependencies
@@ -29,7 +29,10 @@ jobs:
             binutils-aarch64-linux-gnu \
             curl
 
-      - name: Clone known-good XCover4s kernel
+          clang --version
+          aarch64-linux-gnu-gcc --version
+
+      - name: Clone known-good kernel
         run: |
           set -euxo pipefail
 
@@ -44,13 +47,16 @@ jobs:
           echo "===== KERNEL COMMIT ====="
           git rev-parse HEAD
 
+          echo "===== CLEAN SOURCE ====="
+          git status --short
+
       - name: Integrate KernelSU v0.9.5
         working-directory: kernel
         run: |
           set -euxo pipefail
 
           echo "=========================================="
-          echo " INSTALL KERNELSU v0.9.5"
+          echo " KERNELSU v0.9.5 INTEGRATION"
           echo "=========================================="
 
           curl -LSs \
@@ -59,74 +65,13 @@ jobs:
 
           echo
           echo "===== KERNELSU COMMIT ====="
-
           git -C KernelSU rev-parse HEAD
 
           echo
-          echo "===== GIT STATUS ====="
+          echo "===== KERNELSU INTEGRATION ====="
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile || true
 
-          git status --short
-
-      - name: Inspect KernelSU integration
-        working-directory: kernel
-        run: |
-          set +e
-
-          LOG="$GITHUB_WORKSPACE/ksu-integration.txt"
-          : > "$LOG"
-
-          {
-            echo "=========================================="
-            echo " KERNELSU INTEGRATION DIAGNOSTIC"
-            echo "=========================================="
-            echo
-
-            echo "===== KernelSU directory ====="
-            find KernelSU -maxdepth 3 -type f | sort
-            echo
-
-            echo "===== KernelSU Kconfig ====="
-            if [ -f KernelSU/kernel/Kconfig ]; then
-              cat KernelSU/kernel/Kconfig
-            else
-              echo "KernelSU/kernel/Kconfig NOT FOUND"
-            fi
-            echo
-
-            echo "===== KernelSU Makefiles ====="
-            find KernelSU \
-              -maxdepth 3 \
-              \( -name Makefile -o -name Kconfig \) \
-              -print \
-              -exec sh -c '
-                echo "----- $1 -----"
-                cat "$1"
-                echo
-              ' _ {} \;
-            echo
-
-            echo "===== References to KernelSU / KSU ====="
-
-            grep -RniE \
-              'KernelSU|CONFIG_KSU|source.*KernelSU|obj-\$\(CONFIG_KSU\)' \
-              . \
-              --exclude-dir=.git \
-              --exclude-dir=out \
-              2>/dev/null | head -500 || true
-
-            echo
-            echo "===== kernel/Kconfig tail ====="
-            tail -100 kernel/Kconfig 2>/dev/null || true
-
-            echo
-            echo "===== kernel/Makefile tail ====="
-            tail -100 kernel/Makefile 2>/dev/null || true
-
-          } >> "$LOG" 2>&1
-
-          cat "$LOG"
-
-      - name: Generate normal XCover4s config
+      - name: Configure XCover4s kernel
         working-directory: kernel
         run: |
           set -euxo pipefail
@@ -142,180 +87,206 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
 
-          cp out/.config \
-            "$GITHUB_WORKSPACE/config-before-ksu.txt"
+          echo
+          echo "===== ORIGINAL CONFIG ====="
 
-      - name: Test CONFIG_KSU
+          grep -E \
+            'CONFIG_(OVERLAY_FS|KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
+            out/.config || true
+
+          cp out/.config \
+            "$GITHUB_WORKSPACE/config-original.txt"
+
+      - name: Enable OverlayFS and KernelSU
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          chmod +x scripts/config
+
+          echo "===== ENABLE OVERLAY_FS ====="
+
+          scripts/config \
+            --file out/.config \
+            -e OVERLAY_FS
+
+          echo "===== ENABLE KSU ====="
+
+          scripts/config \
+            --file out/.config \
+            -e KSU
+
+          echo
+          echo "===== CONFIG BEFORE OLDDEFCONFIG ====="
+
+          grep -E \
+            'CONFIG_(OVERLAY_FS|KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
+            out/.config || true
+
+          cp out/.config \
+            "$GITHUB_WORKSPACE/config-before-olddefconfig.txt"
+
+          echo
+          echo "===== RUN OLDDEFCONFIG ====="
+
+          make \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          echo
+          echo "===== FINAL CONFIG ====="
+
+          grep -E \
+            'CONFIG_(OVERLAY_FS|KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
+            out/.config || true
+
+          cp out/.config \
+            "$GITHUB_WORKSPACE/config-final.txt"
+
+          echo
+          echo "===== VERIFY OVERLAY_FS ====="
+
+          if ! grep -q '^CONFIG_OVERLAY_FS=y$' out/.config; then
+            echo "ERROR: CONFIG_OVERLAY_FS DID NOT SURVIVE OLDDEFCONFIG"
+            exit 1
+          fi
+
+          echo "CONFIG_OVERLAY_FS=y confirmed."
+
+          echo
+          echo "===== VERIFY KERNELSU ====="
+
+          if ! grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "ERROR: CONFIG_KSU DID NOT SURVIVE OLDDEFCONFIG"
+            exit 1
+          fi
+
+          echo "CONFIG_KSU=y confirmed."
+
+      - name: Targeted KernelSU compile test
         working-directory: kernel
         run: |
           set +e
 
-          LOG="$GITHUB_WORKSPACE/ksu-config-test.txt"
-          : > "$LOG"
+          RAW="$GITHUB_WORKSPACE/ksu-compile.log"
+          : > "$RAW"
 
-          {
-            echo "=========================================="
-            echo " CONFIG_KSU TEST"
-            echo "=========================================="
-            echo
+          echo "=========================================="
+          echo " KERNELSU TARGETED COMPILE"
+          echo " OVERLAY_FS=y"
+          echo " KSU=y"
+          echo " NO BOOT IMAGE"
+          echo "=========================================="
 
-            echo "===== BEFORE ====="
+          make \
+            -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error" \
+            drivers/kernelsu/built-in.o \
+            > "$RAW" 2>&1
 
-            grep -E \
-              'CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
-              out/.config || true
+          RESULT=$?
 
-            echo
-            echo "===== scripts/config exists? ====="
+          echo "$RESULT" \
+            > "$GITHUB_WORKSPACE/ksu-compile-result.txt"
 
-            ls -l scripts/config || true
+          echo
+          echo "===== COMPILE OUTPUT ====="
 
-            echo
-            echo "===== Enable CONFIG_KSU ====="
+          grep -vE \
+            'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
+            "$RAW" | tail -500 || true
 
-            chmod +x scripts/config 2>/dev/null || true
+          echo
+          echo "===== RESULT ====="
+          echo "KernelSU compile result: $RESULT"
 
-            scripts/config \
-              --file out/.config \
-              -e KSU
+          if [ "$RESULT" -ne 0 ]; then
+            echo "KERNELSU TARGETED COMPILE FAILED"
+            exit "$RESULT"
+          fi
 
-            echo
-            echo "===== Immediately after scripts/config ====="
+          echo
+          echo "KERNELSU TARGETED COMPILE SUCCESSFUL"
 
-            grep -E \
-              'CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
-              out/.config || true
-
-            cp out/.config \
-              "$GITHUB_WORKSPACE/config-after-scripts-config.txt"
-
-            echo
-            echo "===== Run olddefconfig ====="
-
-            make \
-              O=out \
-              ARCH=arm64 \
-              CC=clang \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              olddefconfig
-
-            OLDRESULT=$?
-
-            echo
-            echo "olddefconfig result: $OLDRESULT"
-
-            echo
-            echo "===== AFTER olddefconfig ====="
-
-            grep -E \
-              'CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
-              out/.config || true
-
-            echo
-            echo "===== Search KSU in final config ====="
-
-            grep -n 'KSU' out/.config || true
-
-            echo
-            echo "===== Relevant KPROBE settings ====="
-
-            grep -nE \
-              'KPROBE|KALLSYMS|TRACEPOINT|FTRACE' \
-              out/.config || true
-
-          } >> "$LOG" 2>&1
-
-          cp out/.config \
-            "$GITHUB_WORKSPACE/config-after-olddefconfig.txt"
-
-          cat "$LOG"
-
-          # IMPORTANT:
-          # Do not fail here even if CONFIG_KSU disappeared.
-          # We want the diagnostic artifact.
-
-          exit 0
-
-      - name: Check integration files
+      - name: Verify KernelSU objects
+        if: always()
         working-directory: kernel
         run: |
           set +e
 
-          LOG="$GITHUB_WORKSPACE/integration-files.txt"
-          : > "$LOG"
-
           {
-            echo "===== kernel/Kconfig ====="
+            echo "===== KernelSU build files ====="
 
-            grep -n -B5 -A10 \
-              'KernelSU' \
-              kernel/Kconfig || true
-
-            echo
-            echo "===== kernel/Makefile ====="
-
-            grep -n -B5 -A10 \
-              'KernelSU' \
-              kernel/Makefile || true
+            find out/drivers/kernelsu \
+              -type f \
+              -printf '%p %s bytes\n' \
+              2>/dev/null | sort || true
 
             echo
-            echo "===== CONFIG_KSU definition ====="
+            echo "===== built-in.o ====="
 
-            grep -Rni \
-              '^config KSU' \
-              KernelSU . \
-              --exclude-dir=.git \
-              --exclude-dir=out \
+            ls -lh \
+              out/drivers/kernelsu/built-in.o \
               2>/dev/null || true
 
-          } >> "$LOG" 2>&1
+          } | tee "$GITHUB_WORKSPACE/ksu-object-info.txt"
 
-          cat "$LOG"
-
-      - name: Create summary
+      - name: Create diagnostic summary
         if: always()
         run: |
           set +e
 
           {
-            echo "XCover4s KernelSU v0.9.5 Kconfig Diagnostic"
-            echo "==========================================="
+            echo "XCover4s KernelSU v0.9.5 Overlay Compile Test"
+            echo "============================================="
             echo
-            echo "NO KERNEL BUILD"
             echo "NO BOOT IMAGE"
             echo "NOT FOR FLASHING"
             echo
 
-            echo "KERNEL:"
+            echo "KERNEL COMMIT:"
             git -C kernel rev-parse HEAD 2>/dev/null || true
 
             echo
-            echo "KERNELSU:"
+            echo "KERNELSU COMMIT:"
             git -C kernel/KernelSU rev-parse HEAD 2>/dev/null || true
 
             echo
             echo "FINAL CONFIG:"
             grep -E \
-              'CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
+              'CONFIG_(OVERLAY_FS|KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS)' \
               kernel/out/.config 2>/dev/null || true
 
-          } > diagnostic-summary.txt
+            echo
+            echo "COMPILE RESULT:"
+            cat ksu-compile-result.txt \
+              2>/dev/null || echo "NO COMPILE RESULT"
 
-          cat diagnostic-summary.txt
+          } > ksu-test-summary.txt
+
+          cat ksu-test-summary.txt
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-KSU-v095-Kconfig-diagnostic
+          name: xcover4s-KSU-v095-overlay-compile-test
           path: |
-            ksu-integration.txt
-            ksu-config-test.txt
-            integration-files.txt
-            config-before-ksu.txt
-            config-after-scripts-config.txt
-            config-after-olddefconfig.txt
-            diagnostic-summary.txt
+            config-original.txt
+            config-before-olddefconfig.txt
+            config-final.txt
+            ksu-compile.log
+            ksu-compile-result.txt
+            ksu-object-info.txt
+            ksu-test-summary.txt
           if-no-files-found: warn
           retention-days: 14
