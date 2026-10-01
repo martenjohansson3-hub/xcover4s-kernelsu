@@ -1,42 +1,24 @@
-name: XCover4s KernelSU Fast Test
+name: XCover4s KernelSU Full Build
 
 on:
   workflow_dispatch:
 
 jobs:
-  fast-test:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
-      # ============================================================
-      # 1. DEPENDENCIES
-      # ============================================================
 
       - name: Install dependencies
         run: |
           set -eux
 
           sudo apt-get update
-
           sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            flex \
-            git \
-            curl \
-            python3 \
-            clang \
-            lld \
-            libssl-dev \
-            libelf-dev \
-            gcc-aarch64-linux-gnu \
-            ccache
-
-      # ============================================================
-      # 2. KERNEL SOURCE
-      # ============================================================
+            bc bison build-essential flex git curl python3 \
+            clang lld libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu ccache
 
       - name: Clone kernel
         run: |
@@ -53,14 +35,6 @@ jobs:
           echo "===== KERNEL ====="
           git rev-parse HEAD
 
-          grep '^VERSION =' Makefile
-          grep '^PATCHLEVEL =' Makefile
-          grep '^SUBLEVEL =' Makefile
-
-      # ============================================================
-      # 3. KERNELSU
-      # ============================================================
-
       - name: Install KernelSU Next
         working-directory: kernel
         run: |
@@ -70,7 +44,6 @@ jobs:
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             | bash -s legacy
 
-          echo
           echo "===== KERNELSU ====="
 
           if [ -d KernelSU-Next ]; then
@@ -78,22 +51,14 @@ jobs:
             git -C KernelSU-Next describe --tags --always || true
           fi
 
-      # ============================================================
-      # 4. OLD KERNEL COMPATIBILITY
-      # ============================================================
-
-      - name: Apply compatibility patches
+      - name: Apply old-kernel compatibility
         working-directory: kernel
         run: |
           set -eux
 
           echo "=========================================="
-          echo " APPLYING OLD KERNEL COMPATIBILITY"
+          echo " APPLYING COMPATIBILITY PATCHES"
           echo "=========================================="
-
-          # --------------------------------------------------------
-          # Missing modern headers
-          # --------------------------------------------------------
 
           grep -R -l \
             'linux/compiler_types.h' \
@@ -123,28 +88,18 @@ jobs:
             | xargs -r sed -i \
               's|<linux/sched/user.h>|<linux/sched.h>|g'
 
-          # --------------------------------------------------------
-          # Patch source APIs
-          # --------------------------------------------------------
-
           python3 <<'PY'
           from pathlib import Path
           import re
 
           root = Path("drivers/kernelsu")
 
-          # ========================================================
-          # full_name_hash()
-          # Old kernel:
-          #
-          # full_name_hash(const unsigned char *, unsigned int)
-          #
-          # New KernelSU code may use:
-          #
-          # full_name_hash(NULL, name, len)
-          # ========================================================
+          # --------------------------------------------------------
+          # full_name_hash
+          # --------------------------------------------------------
 
           for p in root.rglob("*.c"):
+
               try:
                   s = p.read_text()
               except Exception:
@@ -163,11 +118,12 @@ jobs:
                   p.write_text(s)
                   print("PATCHED full_name_hash:", p)
 
-          # ========================================================
-          # in_compat_syscall()
-          # ========================================================
+          # --------------------------------------------------------
+          # in_compat_syscall
+          # --------------------------------------------------------
 
           for p in root.rglob("*"):
+
               if not p.is_file():
                   continue
 
@@ -188,8 +144,8 @@ jobs:
               )
 
               if "#include <linux/compat.h>" not in s:
-                  lines = s.splitlines()
 
+                  lines = s.splitlines()
                   pos = 0
 
                   for i, line in enumerate(lines):
@@ -207,17 +163,12 @@ jobs:
 
               print("PATCHED compat:", p)
 
-          # ========================================================
+          # --------------------------------------------------------
           # kvmalloc / kvfree
-          #
-          # Previous version attempted to redefine kvmalloc globally.
-          # Don't do that.
-          #
-          # Replace KernelSU allocations directly with vmalloc/vfree
-          # for this old kernel.
-          # ========================================================
+          # --------------------------------------------------------
 
           for p in root.rglob("*"):
+
               if not p.is_file():
                   continue
 
@@ -250,12 +201,10 @@ jobs:
                       "vmalloc(" in s or
                       "vfree(" in s
                   ):
-                      if (
-                          "#include <linux/vmalloc.h>"
-                          not in s
-                      ):
-                          lines = s.splitlines()
 
+                      if "#include <linux/vmalloc.h>" not in s:
+
+                          lines = s.splitlines()
                           pos = 0
 
                           for i, line in enumerate(lines):
@@ -271,14 +220,11 @@ jobs:
 
                   p.write_text(s)
 
-                  print(
-                      "PATCHED allocation API:",
-                      p
-                  )
+                  print("PATCHED allocation API:", p)
 
-          # ========================================================
+          # --------------------------------------------------------
           # ALIGN_DOWN
-          # ========================================================
+          # --------------------------------------------------------
 
           p = root / "feature" / "adb_root.c"
 
@@ -286,41 +232,39 @@ jobs:
 
               s = p.read_text()
 
-              if "ALIGN_DOWN(" in s:
+              if (
+                  "ALIGN_DOWN(" in s and
+                  "#ifndef ALIGN_DOWN" not in s
+              ):
 
-                  if "#ifndef ALIGN_DOWN" not in s:
+                  lines = s.splitlines()
+                  pos = 0
 
-                      lines = s.splitlines()
+                  for i, line in enumerate(lines):
+                      if line.startswith("#include"):
+                          pos = i + 1
 
-                      pos = 0
+                  compat = [
+                      "",
+                      "#ifndef ALIGN_DOWN",
+                      "#define ALIGN_DOWN(x, a) "
+                      "((x) & ~((typeof(x))(a) - 1))",
+                      "#endif",
+                      ""
+                  ]
 
-                      for i, line in enumerate(lines):
-                          if line.startswith("#include"):
-                              pos = i + 1
+                  for line in reversed(compat):
+                      lines.insert(pos, line)
 
-                      compat = [
-                          "",
-                          "#ifndef ALIGN_DOWN",
-                          "#define ALIGN_DOWN(x, a) "
-                          "((x) & ~((typeof(x))(a) - 1))",
-                          "#endif",
-                          ""
-                      ]
+                  p.write_text(
+                      "\n".join(lines) + "\n"
+                  )
 
-                      for line in reversed(compat):
-                          lines.insert(pos, line)
+                  print("ADDED ALIGN_DOWN compatibility")
 
-                      s = "\n".join(lines) + "\n"
-
-                      p.write_text(s)
-
-                      print(
-                          "ADDED ALIGN_DOWN compatibility"
-                      )
-
-          # ========================================================
-          # event.c kernel version compatibility
-          # ========================================================
+          # --------------------------------------------------------
+          # sulog time API
+          # --------------------------------------------------------
 
           p = root / "sulog" / "event.c"
 
@@ -339,141 +283,14 @@ jobs:
               )
 
               if old in s:
-                  s = s.replace(
-                      old,
-                      new
-                  )
 
+                  s = s.replace(old, new)
                   p.write_text(s)
 
-                  print(
-                      "PATCHED event.c time API"
-                  )
+                  print("PATCHED event.c time API")
 
-          print(
-              "COMPATIBILITY PATCHING COMPLETE"
-          )
+          print("COMPATIBILITY PATCHES COMPLETE")
           PY
-
-      # ============================================================
-      # 5. CHECK PATCH RESULTS
-      # ============================================================
-
-      - name: Compatibility precheck
-        working-directory: kernel
-        run: |
-          set +e
-
-          echo "=========================================="
-          echo " COMPATIBILITY PRECHECK"
-          echo "=========================================="
-
-          BAD=0
-
-          echo
-          echo "===== BAD HEADERS ====="
-
-          for H in \
-            linux/compiler_types.h \
-            linux/sched/signal.h \
-            linux/sched/task.h \
-            linux/sched/user.h
-          do
-
-            if grep -R -n \
-              "$H" \
-              drivers/kernelsu \
-              2>/dev/null
-            then
-              echo "BAD HEADER: $H"
-              BAD=1
-            fi
-
-          done
-
-          echo
-          echo "===== IN_COMPAT_SYSCALL ====="
-
-          if grep -R -n \
-            'in_compat_syscall()' \
-            drivers/kernelsu \
-            2>/dev/null
-          then
-              BAD=1
-          else
-              echo "OK"
-          fi
-
-          echo
-          echo "===== KVMALLOC ====="
-
-          if grep -R -n \
-            'kvmalloc(' \
-            drivers/kernelsu \
-            2>/dev/null
-          then
-              echo \
-                "WARNING: kvmalloc remains"
-          else
-              echo "OK - none remain"
-          fi
-
-          echo
-          echo "===== KVFREE ====="
-
-          grep -R -n \
-            'kvfree(' \
-            drivers/kernelsu \
-            2>/dev/null \
-            || echo "OK - none remain"
-
-          echo
-          echo "===== VMALLOC ====="
-
-          grep -R -n \
-            'vmalloc(' \
-            drivers/kernelsu \
-            2>/dev/null \
-            | head -50 \
-            || true
-
-          echo
-          echo "===== FULL_NAME_HASH ====="
-
-          grep -R -n \
-            'full_name_hash' \
-            drivers/kernelsu \
-            2>/dev/null \
-            || true
-
-          echo
-          echo "===== ALIGN_DOWN ====="
-
-          grep -R -n \
-            'ALIGN_DOWN' \
-            drivers/kernelsu \
-            2>/dev/null \
-            || true
-
-          if [ "$BAD" -ne 0 ]; then
-
-              echo
-              echo "=========================================="
-              echo " PRECHECK FAILED"
-              echo "=========================================="
-
-              exit 1
-
-          fi
-
-          echo
-          echo "=========================================="
-          echo " PRECHECK PASSED"
-          echo "=========================================="
-
-      # ============================================================
-      # 6. ENABLE KSU
-      # ============================================================
 
       - name: Enable KernelSU
         working-directory: kernel
@@ -485,17 +302,12 @@ jobs:
             arch/arm64/configs/lineage_xcover4s_defconfig
           then
 
-            echo \
-              'CONFIG_KSU=y' \
+            echo 'CONFIG_KSU=y' \
               >> arch/arm64/configs/lineage_xcover4s_defconfig
 
           fi
 
-      # ============================================================
-      # 7. MANUAL HOOKS
-      # ============================================================
-
-      - name: Apply KernelSU hooks
+      - name: Apply KernelSU manual hooks
         working-directory: kernel
         run: |
           set -eux
@@ -509,38 +321,29 @@ jobs:
               data = p.read_text()
 
               if new in data:
-                  print(
-                      "ALREADY PATCHED:",
-                      path
-                  )
+                  print("ALREADY PATCHED:", path)
                   return
 
               if old not in data:
                   raise SystemExit(
-                      "PATCH TARGET NOT FOUND: "
-                      + path
+                      "PATCH TARGET NOT FOUND: " + path
                   )
 
               p.write_text(
-                  data.replace(
-                      old,
-                      new,
-                      1
-                  )
+                  data.replace(old, new, 1)
               )
 
-              print(
-                  "PATCHED:",
-                  path
-              )
+              print("PATCHED:", path)
 
 
           patch(
               "fs/exec.c",
+
               """int do_execve(struct filename *filename,
           	const char __user *const __user *__argv,
           	const char __user *const __user *__envp)
           {""",
+
               """#ifdef CONFIG_KSU
           __attribute__((hot))
           extern int ksu_handle_execveat(int *fd,
@@ -556,8 +359,10 @@ jobs:
 
           patch(
               "fs/exec.c",
+
               """	struct user_arg_ptr envp = { .ptr.native = __envp };
           	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
+
               """	struct user_arg_ptr envp = { .ptr.native = __envp };
           #ifdef CONFIG_KSU
           	{
@@ -572,8 +377,10 @@ jobs:
 
           patch(
               "fs/open.c",
+
               """/*
            * access() needs to use the real uid/gid, not the effective uid/gid.""",
+
               """#ifdef CONFIG_KSU
           __attribute__((hot))
           extern int ksu_handle_faccessat(int *dfd,
@@ -587,9 +394,11 @@ jobs:
 
           patch(
               "fs/open.c",
+
               """	unsigned int lookup_flags = LOOKUP_FOLLOW;
 
           	if (mode & ~S_IRWXO)""",
+
               """	unsigned int lookup_flags = LOOKUP_FOLLOW;
 
           #ifdef CONFIG_KSU
@@ -602,8 +411,10 @@ jobs:
 
           patch(
               "fs/read_write.c",
+
               """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
           {""",
+
               """#ifdef CONFIG_KSU
           extern bool ksu_vfs_read_hook __read_mostly;
           extern __attribute__((cold)) int ksu_handle_sys_read(
@@ -618,9 +429,11 @@ jobs:
 
           patch(
               "fs/read_write.c",
+
               """	ssize_t ret = -EBADF;
 
           	if (f.file) {""",
+
               """	ssize_t ret = -EBADF;
 
           #ifdef CONFIG_KSU
@@ -636,8 +449,10 @@ jobs:
 
           patch(
               "fs/stat.c",
+
               """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
           SYSCALL_DEFINE4(newfstatat""",
+
               """#ifdef CONFIG_KSU
           __attribute__((hot))
           extern int ksu_handle_stat(int *dfd,
@@ -651,10 +466,12 @@ jobs:
 
           patch(
               "fs/stat.c",
+
               """	struct kstat stat;
           	int error;
 
           	error = vfs_fstatat(dfd, filename, &stat, flag);""",
+
               """	struct kstat stat;
           	int error;
 
@@ -667,9 +484,11 @@ jobs:
 
           patch(
               "kernel/reboot.c",
+
               """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
           		void __user *, arg)
           {""",
+
               """#ifdef CONFIG_KSU
           extern int ksu_handle_sys_reboot(int magic1,
           	int magic2, unsigned int cmd,
@@ -683,9 +502,11 @@ jobs:
 
           patch(
               "kernel/reboot.c",
+
               """	int ret = 0;
 
           	/* We only trust the superuser with rebooting the system. */""",
+
               """	int ret = 0;
 
           #ifdef CONFIG_KSU
@@ -696,22 +517,15 @@ jobs:
           	/* We only trust the superuser with rebooting the system. */"""
           )
 
-          print(
-              "ALL HOOKS APPLIED"
-          )
+          print("ALL KERNELSU HOOKS APPLIED")
           PY
-
-      # ============================================================
-      # 8. CONFIG
-      # ============================================================
 
       - name: Configure kernel
         working-directory: kernel
         run: |
           set -eux
 
-          export \
-            CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_DIR="$HOME/.ccache"
 
           make \
             O=out \
@@ -732,26 +546,18 @@ jobs:
           echo
           echo "===== CONFIG ====="
 
-          grep \
-            '^CONFIG_KSU=y' \
-            out/.config
+          grep '^CONFIG_KSU=y' out/.config
 
-      # ============================================================
-      # 9. FAST KERNELSU BUILD ONLY
-      # ============================================================
-
-      - name: Fast KernelSU compile test
+      - name: KernelSU quick verification
         working-directory: kernel
         run: |
-          set +e
+          set -eux
 
           echo "=========================================="
-          echo " FAST KERNELSU COMPILE TEST"
-          echo " FULL KERNEL IS NOT BEING BUILT"
+          echo " VERIFYING KERNELSU BEFORE FULL BUILD"
           echo "=========================================="
 
-          export \
-            CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_DIR="$HOME/.ccache"
 
           make \
             -j"$(nproc)" \
@@ -761,82 +567,126 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error" \
-            drivers/kernelsu/ \
-            > ksu-build.log \
-            2>&1
+            drivers/kernelsu/
 
+          echo
+          echo "KERNELSU QUICK TEST PASSED"
+
+      - name: Full kernel build
+        working-directory: kernel
+        run: |
+          set +e
+
+          echo "=========================================="
+          echo " STARTING FULL KERNEL BUILD"
+          echo "=========================================="
+
+          export CCACHE_DIR="$HOME/.ccache"
+
+          make \
+            -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error" \
+            > build.log \
+            2>&1 &
+
+          BUILD_PID=$!
+
+          ELAPSED=0
+
+          while kill -0 "$BUILD_PID" 2>/dev/null
+          do
+            sleep 30
+
+            if kill -0 "$BUILD_PID" 2>/dev/null
+            then
+              ELAPSED=$((ELAPSED + 30))
+
+              echo \
+                "Kernel build running: ${ELAPSED}s"
+
+              # Show recent build progress as well.
+              tail -5 build.log \
+                | grep -viE \
+                  'objdump:|Unrecognized form:|Bogus end-of-siblings' \
+                || true
+            fi
+          done
+
+          wait "$BUILD_PID"
           RESULT=$?
 
-          echo "$RESULT" \
-            > ksu-result.txt
+          echo "$RESULT" > build-result.txt
 
           echo
           echo "=========================================="
-          echo " KERNELSU RESULT: $RESULT"
+          echo " BUILD RESULT: $RESULT"
           echo "=========================================="
 
-          echo
-          echo "===== REAL ERRORS ====="
+          if [ "$RESULT" -ne 0 ]
+          then
 
-          grep -iE \
-            "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
-            ksu-build.log \
-            | grep -viE \
+            echo
+            echo "===== REAL ERRORS ====="
+
+            grep -iE \
+              "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
+              build.log \
+              | grep -viE \
+                'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
+              | tail -400 \
+              || true
+
+            echo
+            echo "===== LAST 150 LINES ====="
+
+            grep -viE \
               'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-            | tail -300 \
-            || true
-
-          echo
-          echo "===== LAST CLEAN OUTPUT ====="
-
-          grep -viE \
-            'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
-            ksu-build.log \
-            | tail -150 \
-            || true
-
-          if [ "$RESULT" -eq 0 ]; then
-
-              echo
-              echo "=========================================="
-              echo " KERNELSU FAST TEST PASSED"
-              echo " NEXT STEP WILL BE FULL KERNEL BUILD"
-              echo "=========================================="
+              build.log \
+              | tail -150 \
+              || true
 
           else
 
-              echo
-              echo "=========================================="
-              echo " KERNELSU STILL HAS COMPATIBILITY ERRORS"
-              echo "=========================================="
+            echo
+            echo "=========================================="
+            echo " FULL BUILD PASSED"
+            echo "=========================================="
 
+            find out/arch/arm64/boot \
+              -maxdepth 2 \
+              -type f \
+              -printf '%p %k KB\n' \
+              | sort \
+              || true
           fi
 
           exit "$RESULT"
 
-      # ============================================================
-      # 10. REPORT
-      # ============================================================
-
+      # Runs even if the build fails.
       - name: Create diagnostic report
         if: always()
         working-directory: kernel
         run: |
           set +e
 
-          REPORT="$GITHUB_WORKSPACE/ksu-fast-report.txt"
+          REPORT="$GITHUB_WORKSPACE/full-build-report.txt"
 
           {
             echo "=========================================="
-            echo " XCOVER4S KERNELSU FAST TEST REPORT"
+            echo " XCOVER4S KERNELSU FULL BUILD REPORT"
             echo "=========================================="
 
             echo
-            echo "Kernel:"
+            echo "Kernel commit:"
             git rev-parse HEAD || true
 
             echo
-            echo "KernelSU:"
+            echo "KernelSU commit:"
 
             if [ -d KernelSU-Next ]; then
               git -C KernelSU-Next rev-parse HEAD || true
@@ -844,12 +694,12 @@ jobs:
             fi
 
             echo
-            echo "Result:"
+            echo "Build result:"
 
-            if [ -f ksu-result.txt ]; then
-              cat ksu-result.txt
+            if [ -f build-result.txt ]; then
+              cat build-result.txt
             else
-              echo "TEST DID NOT RUN"
+              echo "FULL BUILD DID NOT RUN"
             fi
 
             echo
@@ -860,40 +710,24 @@ jobs:
             fi
 
             echo
-            echo "===== REMAINING KVMALLOC ====="
+            echo "Kernel images:"
 
-            grep -R -n \
-              'kvmalloc(' \
-              drivers/kernelsu \
+            find out/arch/arm64/boot \
+              -maxdepth 2 \
+              -type f \
+              -name 'Image*' \
+              -ls \
               2>/dev/null \
               || true
 
             echo
-            echo "===== REMAINING KVFREE ====="
+            echo "===== REAL BUILD ERRORS ====="
 
-            grep -R -n \
-              'kvfree(' \
-              drivers/kernelsu \
-              2>/dev/null \
-              || true
-
-            echo
-            echo "===== REMAINING COMPAT CALLS ====="
-
-            grep -R -n \
-              'in_compat_syscall()' \
-              drivers/kernelsu \
-              2>/dev/null \
-              || true
-
-            echo
-            echo "===== BUILD ERRORS ====="
-
-            if [ -f ksu-build.log ]; then
+            if [ -f build.log ]; then
 
               grep -iE \
                 "fatal error:|error:|undefined reference|multiple definition|No rule to make target|implicit declaration|undeclared|too many arguments|incompatible pointer|unknown type name|no member named" \
-                ksu-build.log \
+                build.log \
                 | grep -viE \
                   'objdump:|Unrecognized form:|DIE at offset|Bogus end-of-siblings' \
                 | tail -500 \
@@ -905,18 +739,56 @@ jobs:
 
           cat "$REPORT"
 
-      # ============================================================
-      # 11. ARTIFACT
-      # ============================================================
-
-      - name: Upload fast-test diagnostics
+      # This artifact appears even if full build fails.
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-kernelsu-fast-test
+          name: xcover4s-full-build-diagnostics
           path: |
-            ksu-fast-report.txt
-            kernel/ksu-build.log
-            kernel/ksu-result.txt
+            full-build-report.txt
+            kernel/build.log
+            kernel/build-result.txt
             kernel/out/.config
-          if-no-files-found: ignore
+          if-no-files-found: warn
+
+      - name: Verify finished Image
+        if: success()
+        working-directory: kernel
+        run: |
+          set -eux
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          if [ ! -f "$IMAGE" ]; then
+            echo "ERROR: Image was not created"
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo " KERNEL IMAGE CREATED"
+          echo "=========================================="
+
+          ls -lh "$IMAGE"
+          sha256sum "$IMAGE"
+
+          grep '^CONFIG_KSU=y' out/.config
+
+          echo
+          echo "===== KSU SYMBOL CHECK ====="
+
+          grep 'ksu_handle_' out/System.map \
+            | head -50 \
+            || true
+
+      # Only appears after a successful full build + Image verification.
+      - name: Upload finished kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-kernelsu-image
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            kernel/out/System.map
+          if-no-files-found: error
