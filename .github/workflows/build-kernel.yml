@@ -1,275 +1,72 @@
-
-name: XCOVER4S V33.1 ABD FIX AND BUILD
+name: XCOVER4S V34 CP POWER INVESTIGATION
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  investigate:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
+    timeout-minutes: 25
     steps:
-      - name: Install tools
+      - name: Install analysis tools
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev libelf-dev cpio
+          sudo apt-get install -y git python3
 
-      - name: Clone kernel
+      - name: Fetch exact V33.1 kernel source
         run: |
           set -euo pipefail
-          mkdir -p diagnostics artifact
-          git clone --depth 1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git clone --depth 1 --branch lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          mkdir -p diagnostics
           git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply V33.1 patches
+      - name: Trace CP power supply and shutdown paths
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
           import re
-
-          def replace_once(path, old, new):
-              p = Path(path)
-              s = p.read_text()
-              if s.count(old) != 1:
-                  raise SystemExit(f"Patch mismatch: {path}")
-              p.write_text(s.replace(old, new))
-
-          cp = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
-          s = cp.read_text()
-
-          for pattern, body in [
-              (
-                  r'(void cal_cp_init\(void\)\s*\{\s*)'
-                  r'pmucal_cp_init\(\);',
-                  'pr_warn("V33.1 CP init blocked");\n'
-                  '\tpmucal_cp_reset_assert();'
-              ),
-              (
-                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
-                  r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V33.1 CP release blocked");\n'
-                  '\tpmucal_cp_reset_assert();'
-              )
-          ]:
-              s, n = re.subn(
-                  pattern,
-                  lambda m, b=body: m.group(1) + b,
-                  s
-              )
-              if n != 1:
-                  raise SystemExit(f"CP patch mismatch: {n}")
-
-          cp.write_text(s)
-
-          base = "kernel/drivers/video/fbdev/exynos/dpu_7885/"
-
-          replace_once(
-              base + "decon_reg.c",
-              "const double decon_clocks_table[][CLK_ID_MAX]",
-              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-          )
-
-          replace_once(
-              base + "decon.h",
-              "#define decon_create_debugfs(...) do { } while(0)",
-              "#define decon_create_debugfs(...) (0)"
-          )
-
-          replace_once(
-              base + "decon.h",
-              "#define decon_destroy_debugfs(..) do { } while(0)",
-              "#define decon_destroy_debugfs(...) do { } while(0)"
-          )
-
-          helper = Path(base + "helper.c")
-          hs = helper.read_text()
-
-          if not re.search(r'\bACQUIRE_FENCE_LEN\b', hs):
-              raise SystemExit("Fence symbol missing")
-
-          if not re.search(
-              r'^\s*#\s*define\s+ACQUIRE_FENCE_LEN\b',
-              hs, re.M
-          ):
-              helper.write_text(
-                  "#ifndef ACQUIRE_FENCE_LEN\n"
-                  "#define ACQUIRE_FENCE_LEN 1024\n"
-                  "#endif\n\n" + hs
-              )
-
-          abd = Path(base + "decon_abd.c")
-          src = abd.read_text()
-
-          pos = src.find("event_log_idx")
-          if pos < 0:
-              raise SystemExit("ABD event_log_idx not found")
-
-          candidates = list(re.finditer(
-              r'(?m)^[\w\s\*]+\b([A-Za-z_]\w*)'
-              r'\s*\([^;{}]*\)\s*\{',
-              src[:pos]
-          ))
-
-          if not candidates:
-              raise SystemExit(
-                  "Cannot locate ABD function boundary"
-              )
-
-          match = candidates[-1]
-          start = match.start()
-          opening = src.find("{", match.start(), match.end())
-
-          depth = 0
-          end = None
-
-          for i in range(opening, len(src)):
-              if src[i] == "{":
-                  depth += 1
-              elif src[i] == "}":
-                  depth -= 1
-                  if depth == 0:
-                      end = i + 1
-                      break
-
-          if end is None or not (opening < pos < end):
-              raise SystemExit(
-                  "ABD function boundary validation failed"
-              )
-
-          original = src[start:end]
-
-          if "event_log_idx" not in original:
-              raise SystemExit("Wrong ABD function selected")
-
-          Path("diagnostics/abd-original.txt").write_text(
-              original
-          )
-
-          signature = src[start:opening]
-
-          if not re.search(r'\bvoid\s+\w+\s*\(', signature):
-              raise SystemExit(
-                  "ABD reader is not void; refusing unsafe patch"
-              )
-
-          replacement = (
-              signature + "{\n"
-              "\t/* V33.1: event-log reader disabled. */\n"
-              "}\n"
-          )
-
-          abd.write_text(
-              src[:start] + replacement + src[end:]
-          )
-
-          print("V33.1 ABD reader patched")
+          root = Path('kernel')
+          patterns = {
+            'cp_api': re.compile(r'\b(?:cal_cp_|pmucal_cp_|exynos_cp_|cp_power_|cp_on|cp_off|cp_reset|modem_power)\w*\b', re.I),
+            'pmu_sequences': re.compile(r'\b(?:CP_PWR|CP_POWER|CP_CTRL|CP_STATUS|CP_RESET|CP_START|CP_ACTIVE|CP2AP|AP2CP|PMU_CP|PMUCAL_CP)\w*\b', re.I),
+            'regulators': re.compile(r'\b(?:regulator_(?:get|enable|disable|is_enabled)|vdd_cp|vdd_modem|vdd_mif|vdd_mdm|ldo_cp)\w*\b', re.I),
+          }
+          exts = {'.c', '.h', '.dts', '.dtsi'}
+          results = {key: [] for key in patterns}
+          for path in root.rglob('*'):
+            if not path.is_file() or path.suffix not in exts:
+              continue
+            if any(part in {'.git', 'out'} for part in path.parts):
+              continue
+            try:
+              lines = path.read_text(errors='replace').splitlines()
+            except OSError:
+              continue
+            for i, line in enumerate(lines, 1):
+              for key, regex in patterns.items():
+                if regex.search(line):
+                  results[key].append(f'{path.relative_to(root)}:{i}: {line[:350]}')
+          for key, matches in results.items():
+            Path(f'diagnostics/{key}.txt').write_text('\n'.join(matches) + '\n')
+            print(key, len(matches), 'matches')
+          targets = [
+            'drivers/soc/samsung/cal-if/cal-if.c',
+            'drivers/soc/samsung/cal-if/pmucal',
+          ]
+          for target in targets:
+            path = root / target
+            if path.is_file():
+              Path('diagnostics/' + path.name + '.source.txt').write_text(path.read_text(errors='replace'))
+          report = '''V34 DIAGNOSTIC ONLY.\nV33.1 was the last successful kernel baseline.\nThis workflow does NOT patch CP power, build a kernel, or make an Odin TAR.\nReset asserted is NOT equivalent to CP power removed.\nReview pmucal sequences, modem control, and regulator/device tree evidence before attempting a power-off patch.\nEven a software power-off call is not proof of zero voltage: hardware measurement is required.\n'''
+          Path('diagnostics/README.txt').write_text(report)
           PY
 
-          git -C kernel diff > diagnostics/v33-1.patch
-
-      - name: Configure kernel
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make O=out lineage_xcover4s_defconfig
-
-          scripts/config --file out/.config \
-            -d DEBUG_INFO \
-            -d DEBUG_INFO_DWARF4 \
-            -d DEBUG_INFO_DWARF5 \
-            -d DEBUG_INFO_BTF \
-            -d DEBUG_INFO_BTF_MODULES \
-            -d KALLSYMS_ALL \
-            -e SECURITY_SELINUX \
-            -e SECURITY_SELINUX_DEVELOP \
-            -e SECURITY_SELINUX_BOOTPARAM \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
-
-          make O=out olddefconfig
-
-          cp out/.config ../diagnostics/final.config
-
-      - name: Fast targeted compilation
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 \
-            drivers/soc/samsung/cal-if/cal-if.o \
-            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
-            drivers/video/fbdev/exynos/dpu_7885/decon_core.o \
-            drivers/video/fbdev/exynos/dpu_7885/helper.o \
-            drivers/video/fbdev/exynos/dpu_7885/decon_abd.o \
-            2>&1 | tee ../diagnostics/targeted-build.log
-
-      - name: Full kernel build
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 Image \
-            2>&1 | tee ../diagnostics/full-build.log
-
-      - name: Package results
-        run: |
-          set -euo pipefail
-
-          IMAGE=kernel/out/arch/arm64/boot/Image
-          test -s "$IMAGE"
-
-          cp "$IMAGE" artifact/Image
-          cp diagnostics/v33-1.patch artifact/v33-1.patch
-          cp diagnostics/final.config artifact/final.config
-
-          sha256sum artifact/Image > artifact/SHA256SUMS
-          stat -c '%s bytes' "$IMAGE" \
-            > artifact/kernel-size.txt
-
-          cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V33.1
-
-          Kernel compilation completed.
-
-          ABD event-log reader disabled.
-          CP reset-assert patch included.
-
-          Physical modem power-off NOT verified.
-          SELinux runtime mode NOT verified.
-
-          NOT ODIN FLASHABLE.
-          Original boot image repacking required.
-          EOF
-
-      - name: Upload kernel
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCOVER4S-V33-1-KERNEL
-          path: artifact/
-
-      - name: Upload diagnostics
+      - name: Upload complete CP investigation
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V33-1-DIAGNOSTICS
+          name: XCOVER4S-V34-CP-POWER-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
