@@ -1,16 +1,26 @@
 
-name: XCOVER4S V22 FINAL PREFLIGHT
+name: XCOVER4S V22 FULL KERNEL
 
 on:
   workflow_dispatch:
 
 jobs:
-  preflight:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 90
 
     steps:
-      - name: Download kernel
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            clang-14 lld-14 \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            bc bison flex \
+            libssl-dev libelf-dev cpio
+
+      - name: Download source
         run: |
           set -euo pipefail
           git clone --depth 1 \
@@ -19,98 +29,124 @@ jobs:
             kernel
           mkdir -p diagnostics
           git -C kernel rev-parse HEAD \
-            > diagnostics/commit.txt
+            > diagnostics/source-commit.txt
 
-      - name: Audit every CP power path
+      - name: Apply V22 CP experiment
         run: |
           set -euo pipefail
 
-          {
-            echo "=== CP POWER CALLS ==="
-            grep -RnE \
-              'cal_cp_|pmucal_cp_|exynos_cp_|exynos_set_cp_power_onoff' \
-              kernel/drivers/misc/modem_if \
-              kernel/drivers/misc/modem_v1 \
-              kernel/drivers/soc/samsung \
-              || true
+          python3 - <<'PY'
+          from pathlib import Path
 
-            echo "=== CP PMUCAL IMPLEMENTATION ==="
-            grep -RnE \
-              'pmucal_cp_(init|reset_assert|reset_release)|cp_reset_assert|CP_PWRON' \
-              kernel/drivers/soc/samsung/cal-if \
-              || true
+          p = Path(
+              "kernel/drivers/soc/samsung/cal-if/cal-if.c"
+          )
+          s = p.read_text()
 
-          } > diagnostics/cp-power-paths.txt
+          changes = [
+              (
+                  "void cal_cp_init(void)\n"
+                  "{\n\tpmucal_cp_init();\n}",
+                  "void cal_cp_init(void)\n"
+                  "{\n"
+                  '\tpr_warn("V22 CP init blocked\\n");\n'
+                  "\tpmucal_cp_reset_assert();\n}"
+              ),
+              (
+                  "void cal_cp_reset_release(void)\n"
+                  "{\n\tpmucal_cp_reset_release();\n}",
+                  "void cal_cp_reset_release(void)\n"
+                  "{\n"
+                  '\tpr_warn("V22 CP release blocked\\n");\n'
+                  "\tpmucal_cp_reset_assert();\n}"
+              )
+          ]
 
-      - name: Audit GNSS dependencies
+          for old, new in changes:
+              if s.count(old) != 1:
+                  raise SystemExit(
+                      "Unexpected CP source. Stopping."
+                  )
+              s = s.replace(old, new)
+
+          p.write_text(s)
+          PY
+
+          git -C kernel diff \
+            > diagnostics/v22.patch
+
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          cd kernel
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make O=out lineage_xcover4s_defconfig
+
+          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
+
+          scripts/config --file out/.config \
+            -e SECURITY_SELINUX_DEVELOP \
+            -d SECURITY_SELINUX_BOOTPARAM_VALUE \
+            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+
+          make O=out olddefconfig
+
+          cp out/.config ../diagnostics/final.config
+
+      - name: Compile kernel
+        run: |
+          set -o pipefail
+          cd kernel
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
+
+          make O=out -j2 Image \
+            2>&1 | tee ../diagnostics/build.log
+
+      - name: Collect kernel
         run: |
           set -euo pipefail
 
-          {
-            echo "=== GNSS PMU REFERENCES ==="
-            grep -RnE \
-              'pmu|power|reset|clock|regulator|CP_|cp_' \
-              kernel/drivers/misc/gnss_if \
-              || true
+          mkdir -p artifact
 
-            echo "=== GNSS CONFIG ==="
-            grep -E \
-              'CONFIG_.*(GNSS|GPS|CP_PMUCAL)' \
-              kernel/arch/arm64/configs/lineage_xcover4s_defconfig \
-              || true
+          cp kernel/out/arch/arm64/boot/Image \
+            artifact/Image
 
-          } > diagnostics/gnss-check.txt
+          test -s artifact/Image
 
-      - name: Audit SELinux permissive options
-        run: |
-          set -euo pipefail
+          sha256sum artifact/Image \
+            > artifact/SHA256SUMS
 
-          {
-            echo "=== SELINUX CONFIG ==="
-            grep -E \
-              '^CONFIG_SECURITY_SELINUX|^CONFIG_LSM' \
-              kernel/arch/arm64/configs/lineage_xcover4s_defconfig \
-              || true
+          cp diagnostics/v22.patch artifact/
 
-            echo "=== SELINUX ENFORCING DEFAULT ==="
-            grep -Rn \
-              'CONFIG_SECURITY_SELINUX_DEVELOP' \
-              kernel/security/selinux \
-              kernel/arch/arm64/configs \
-              || true
+          echo "Kernel compilation passed" \
+            > artifact/STATUS.txt
 
-            echo "=== SELINUX BOOT PARAMETERS ==="
-            grep -RnE \
-              'enforcing=|selinux=|selinux_enforcing' \
-              kernel/security/selinux \
-              | head -100 || true
+          echo "CP hardware power-off unverified" \
+            >> artifact/STATUS.txt
 
-          } > diagnostics/selinux-check.txt
+          echo "SELinux runtime state unverified" \
+            >> artifact/STATUS.txt
 
-      - name: Record V22 build requirements
-        run: |
-          cat > diagnostics/next-build.txt <<'EOF'
-          TARGET:
-          Samsung XCover 4s /e/OS
+          echo "NOT FLASHABLE" \
+            >> artifact/STATUS.txt
 
-          REQUIRED:
-          1. CP shutdown sequence must complete.
-          2. CP must not restart.
-          3. GNSS startup must remain functional.
-          4. Wi-Fi must remain functional.
-          5. SELinux permissive in the same final build.
-          6. Original boot image must remain untouched.
-
-          STATUS:
-          Source audit only.
-          No flashable boot image produced.
-          Hardware power-off not yet verified.
-          EOF
+      - name: Upload kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V22-KERNEL
+          path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-FINAL-PREFLIGHT
+          name: XCOVER4S-V22-BUILD-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
