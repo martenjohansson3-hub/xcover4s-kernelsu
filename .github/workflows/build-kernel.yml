@@ -1,5 +1,5 @@
 
-name: XCOVER4S V31 TARGETED BUILD
+name: XCOVER4S V32 KERNEL BUILD
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Install tools
@@ -22,12 +22,12 @@ jobs:
       - name: Clone kernel
         run: |
           set -euo pipefail
-          mkdir -p diagnostics
+          mkdir -p diagnostics artifact
           git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply source fixes
+      - name: Apply V32 patches
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -48,13 +48,13 @@ jobs:
               (
                   r'(void cal_cp_init\(void\)\s*\{\s*)'
                   r'pmucal_cp_init\(\);',
-                  'pr_warn("V31 CP init blocked");\n'
+                  'pr_warn("V32 CP init blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               ),
               (
                   r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
                   r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V31 CP release blocked");\n'
+                  'pr_warn("V32 CP release blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               )
           ]
@@ -94,7 +94,7 @@ jobs:
           hs = helper.read_text()
 
           if not re.search(r'\bACQUIRE_FENCE_LEN\b', hs):
-              raise SystemExit("ACQUIRE_FENCE_LEN reference missing")
+              raise SystemExit("Fence reference missing")
 
           if not re.search(
               r'^\s*#\s*define\s+ACQUIRE_FENCE_LEN\b',
@@ -106,10 +106,48 @@ jobs:
                   "#endif\n\n" + hs
               )
 
-          print("V31 patches applied")
+          # V32: Avoid compiling ABD event-log reader
+          # when its required definitions are unavailable.
+          abd = Path(base + "decon_abd.c")
+          s = abd.read_text()
+
+          lines = s.splitlines(keepends=True)
+          start = None
+
+          for i, line in enumerate(lines):
+              if re.search(
+                  r'^\s*(?:static\s+)?(?:int|void)\s+'
+                  r'\w*event\w*\s*\(',
+                  line
+              ):
+                  if i + 25 < len(lines):
+                      block = "".join(lines[i:i+45])
+                      if "event_log_idx" in block:
+                          start = i
+                          break
+
+          if start is None:
+              raise SystemExit(
+                  "Could not identify ABD event-log function safely"
+              )
+
+          print(
+              "Found ABD event-log function near line",
+              start + 1
+          )
+
+          # Do not automatically alter unknown function
+          # boundaries. Record source for diagnostics.
+          Path("diagnostics-abd-location.txt").write_text(
+              "".join(lines[max(0,start-10):start+100])
+          )
+
+          abd.write_text(s)
           PY
 
-          git -C kernel diff > diagnostics/v31.patch
+          git -C kernel diff > diagnostics/v32.patch
+          cp kernel/diagnostics-abd-location.txt \
+            diagnostics/abd-location.txt
 
       - name: Configure kernel
         run: |
@@ -137,13 +175,7 @@ jobs:
 
           cp out/.config ../diagnostics/final.config
 
-          if grep -q '^CONFIG_DECON_EVENT_LOG=y$' out/.config; then
-            echo "DECON_EVENT_LOG enabled"
-          else
-            echo "DECON_EVENT_LOG not enabled"
-          fi
-
-      - name: Targeted compilation
+      - name: Fast targeted test
         run: |
           set -euo pipefail
           cd kernel
@@ -152,33 +184,71 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KCFLAGS=-Wno-error
 
-          set +e
           make O=out -j2 \
             drivers/soc/samsung/cal-if/cal-if.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_core.o \
             drivers/video/fbdev/exynos/dpu_7885/helper.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_abd.o \
-            > ../diagnostics/targeted-build.log 2>&1
+            2>&1 | tee ../diagnostics/targeted-build.log
 
-          RESULT=$?
-          set -e
+      - name: Full kernel build
+        run: |
+          set -euo pipefail
+          cd kernel
 
-          tail -n 100 ../diagnostics/targeted-build.log
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
 
-          if [ "$RESULT" -eq 0 ]; then
-            echo "PASS" > ../diagnostics/STATUS.txt
-          else
-            echo "FAIL - exit code $RESULT" \
-              > ../diagnostics/STATUS.txt
-          fi
+          make O=out -j2 Image \
+            2>&1 | tee ../diagnostics/full-build.log
 
-          exit "$RESULT"
+      - name: Package kernel
+        run: |
+          set -euo pipefail
+
+          IMAGE=kernel/out/arch/arm64/boot/Image
+          test -s "$IMAGE"
+
+          cp "$IMAGE" artifact/Image
+          cp diagnostics/v32.patch artifact/v32.patch
+          cp diagnostics/final.config artifact/final.config
+
+          sha256sum artifact/Image \
+            > artifact/SHA256SUMS
+
+          stat -c '%s bytes' "$IMAGE" \
+            > artifact/kernel-size.txt
+
+          cat > artifact/STATUS.txt <<'EOF'
+          XCOVER4S V32
+
+          Kernel compilation completed.
+
+          CP reset-assert patch included.
+          Physical modem power-off NOT verified.
+
+          SELinux boot settings requested.
+          Runtime SELinux state NOT verified.
+
+          NOT AN ODIN FLASHABLE IMAGE.
+
+          Requires original boot.img repacking,
+          partition size validation and testing.
+          EOF
+
+      - name: Upload kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V32-KERNEL
+          path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V31-DIAGNOSTICS
+          name: XCOVER4S-V32-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
