@@ -1,5 +1,5 @@
 
-name: XCOVER4S V39 BUILD AND ODIN CANDIDATE
+name: XCOVER4S V40 FULL BUILD AND BOOT AUDIT
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
       KCFLAGS: -Wno-error
 
     steps:
-      - name: Checkout private repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -30,28 +30,54 @@ jobs:
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
             libssl-dev libelf-dev python3 \
-            python3-pip lz4
+            ripgrep
 
-      - name: Verify private boot backup
+      - name: Prepare output
+        run: mkdir -p dist
+
+      - name: Check optional boot backup
         run: |
           set -euo pipefail
 
-          test -s private/boot-backup.img
-
           python3 - <<'PY'
           from pathlib import Path
+          import hashlib
 
           p = Path("private/boot-backup.img")
-          header = p.open("rb").read(8)
 
-          if header != b"ANDROID!":
-              raise SystemExit(
-                  "Unsupported boot image magic. "
-                  "Refusing to repack."
+          if not p.is_file():
+              print(
+                  "No private boot backup. "
+                  "Kernel build will continue."
+              )
+          elif p.stat().st_size == 0:
+              print(
+                  "Empty boot backup. "
+                  "Kernel build will continue."
+              )
+          else:
+              with p.open("rb") as f:
+                  magic = f.read(8)
+
+              print("Boot size:", p.stat().st_size)
+              print("Boot magic:", repr(magic))
+              print(
+                  "Boot SHA256:",
+                  hashlib.sha256(
+                      p.read_bytes()
+                  ).hexdigest()
               )
 
-          print("Android boot image magic OK")
-          print("Boot backup size:", p.stat().st_size)
+              if magic != b"ANDROID!":
+                  print(
+                      "Boot image format not validated. "
+                      "No repacking will occur."
+                  )
+              else:
+                  print(
+                      "Android boot magic detected. "
+                      "Full layout still unverified."
+                  )
           PY
 
       - name: Clone exact kernel source
@@ -66,11 +92,25 @@ jobs:
           git -C kernel checkout \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply guarded V39 CPLOCK
+          git -C kernel rev-parse HEAD \
+            > dist/source-commit.txt
+
+      - name: Audit original modem paths
         run: |
           set -euo pipefail
 
-          cat > /tmp/patch.py <<'PY'
+          cd kernel
+
+          rg -n \
+            'pmucal_cp_init|pmucal_cp_reset_release|pmucal_cp_reset_assert|cal_cp_init|cal_cp_reset_release|IOCTL_MODEM_ON|IOCTL_MODEM_RESET|IOCTL_MODEM_BOOT_ON|IOCTL_MODEM_DL_START|CP_PWRON|CP_POWER_ON|CP_POWER_OFF|ss310ap_on' \
+            drivers \
+            > ../dist/cp-callers-before.txt || true
+
+      - name: Apply V40 guarded CPLOCK
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/v40_patch.py <<'PY'
           from pathlib import Path
           import re
 
@@ -79,6 +119,9 @@ jobs:
           )
 
           source = path.read_text()
+
+          if "CPLOCK_V40" in source:
+              raise SystemExit("Already patched")
 
           for name in (
               "pmucal_cp_init",
@@ -98,21 +141,23 @@ jobs:
                       f"Unexpected source layout: {name}"
                   )
 
-              insertion = (
-                  matches[0].group(1)
-                  + "\n"
-                  + "\t/* CPLOCK_V39 */\n"
-                  + "\tpr_warn_ratelimited("
-                  + f"\"CPLOCK: denied {name}\\n\""
-                  + ");\n"
-                  + "\treturn -EPERM;\n"
+              match = matches[0]
+
+              lock = (
+                  "\n\t/* CPLOCK_V40 */\n"
+                  "\tpr_warn_ratelimited("
+                  f"\"CPLOCK: denied {name}\\n\""
+                  ");\n"
+                  "\treturn -EPERM;\n"
               )
 
               source = (
-                  source[:matches[0].start()]
-                  + insertion
-                  + source[matches[0].end():]
+                  source[:match.end()]
+                  + lock
+                  + source[match.end():]
               )
+
+              print("Patched:", name)
 
           if "#include <linux/errno.h>" not in source:
               source = (
@@ -126,19 +171,23 @@ jobs:
                   + source
               )
 
-          path.write_text(source)
+          if source.count("/* CPLOCK_V40 */") != 2:
+              raise SystemExit("Patch verification failed")
 
-          if source.count("/* CPLOCK_V39 */") != 2:
-              raise SystemExit("CPLOCK patch verification failed")
+          path.write_text(source)
           PY
 
-          python3 /tmp/patch.py
+          python3 /tmp/v40_patch.py
 
           git -C kernel diff --check
+          git -C kernel diff > dist/v40.patch
+
+          test -s dist/v40.patch
 
       - name: Configure kernel
         run: |
           set -euo pipefail
+
           cd kernel
 
           make O=out lineage_xcover4s_defconfig
@@ -148,69 +197,86 @@ jobs:
           grep -qx 'CONFIG_SEC_MODEM_SS310AP=y' out/.config
           grep -qx 'CONFIG_UMTS_MODEM_SS310AP=y' out/.config
 
+          cp out/.config ../dist/kernel.config
+
       - name: Full kernel build
         run: |
           set -euo pipefail
+
           cd kernel
 
           make O=out -j2 Image \
-            2>&1 | tee ../v39-build.log
+            2>&1 | tee ../dist/build.log
 
           test -s out/arch/arm64/boot/Image
 
-      - name: Install Android boot image tools
+      - name: Validate ARM64 kernel
         run: |
           set -euo pipefail
 
-          git clone \
-            --depth 1 \
-            https://github.com/osm0sis/mkbootimg.git \
-            boottools
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          import hashlib
 
-          test -f boottools/unpackbootimg
-          test -f boottools/mkbootimg
+          p = Path(
+              "kernel/out/arch/arm64/boot/Image"
+          )
 
-      - name: Prepare Odin candidate
-        run: |
-          set -euo pipefail
+          data = p.read_bytes()
 
-          mkdir -p dist unpacked
+          if len(data) < 1000000:
+              raise SystemExit(
+                  "Kernel Image too small"
+              )
 
-          cp private/boot-backup.img \
-            dist/known-good-boot.img
+          magic = struct.unpack_from(
+              "<I", data, 0x38
+          )[0]
 
-          cp kernel/out/arch/arm64/boot/Image \
+          if magic != 0x644d5241:
+              raise SystemExit(
+                  "Invalid ARM64 Image magic"
+              )
+
+          print("ARM64 Image header OK")
+          print("Image size:", len(data))
+          print(
+              "SHA256:",
+              hashlib.sha256(data).hexdigest()
+          )
+          PY
+
+          cp \
+            kernel/out/arch/arm64/boot/Image \
             dist/Image
 
-          # A boot image cannot be safely repacked
-          # until all original boot parameters,
-          # ramdisk, DTB and header layout have
-          # been verified.
-          #
-          # Deliberately fail closed rather than
-          # producing an unvalidated Odin tar.
+          sha256sum dist/Image \
+            > dist/Image.sha256
 
-          echo \
-            "Boot repack requires verified original layout." \
-            > dist/REPACK-NOT-VALIDATED.txt
-
-          echo \
-            "No flashable Odin package generated." \
-            >> dist/REPACK-NOT-VALIDATED.txt
-
-      - name: Collect diagnostics
+      - name: Audit remaining CP paths
         if: always()
         run: |
           mkdir -p dist
 
-          if [ -f v39-build.log ]; then
-            cp v39-build.log dist/build.log
+          if [ -d kernel/drivers ]; then
+            (
+              cd kernel
+
+              rg -n \
+                'pmucal_cp_init|pmucal_cp_reset_release|pmucal_cp_reset_assert|cal_cp_init|cal_cp_reset_release|IOCTL_MODEM_ON|IOCTL_MODEM_RESET|IOCTL_MODEM_BOOT_ON|IOCTL_MODEM_DL_START|CP_PWRON|CP_POWER_ON|CP_POWER_OFF|ss310ap_on' \
+                drivers \
+                || true
+            ) > dist/cp-callers-after.txt
           fi
 
+      - name: Collect failure diagnostics
+        if: always()
+        run: |
+          mkdir -p dist
+
           if [ -d kernel/.git ]; then
-            git -C kernel diff > dist/v39.patch
-            git -C kernel rev-parse HEAD \
-              > dist/source-commit.txt
+            git -C kernel diff > dist/v40.patch
           fi
 
           if [ -f kernel/out/.config ]; then
@@ -218,26 +284,30 @@ jobs:
           fi
 
           cat > dist/README.txt <<'EOF'
-          XCOVER4S V39
+          XCOVER4S V40 EXPERIMENTAL
 
-          Experimental CPLOCK kernel build.
+          Full kernel build independent of boot backup.
 
-          This build blocks two PMUCAL CP-start
-          entry points but does not implement
-          a complete verified CP power-off lock.
+          CPLOCK gates:
+          - pmucal_cp_init
+          - pmucal_cp_reset_release
 
-          The kernel has not been boot-tested.
+          NOT VERIFIED:
+          - Safe CP power-down
+          - All modem restart paths
+          - Boot compatibility
+          - Physical CP power state
+          - Odin repacking
 
-          No Odin flash package is generated.
-
-          DO NOT FLASH THE OUTPUT.
+          No Odin flash package generated.
+          DO NOT FLASH THIS IMAGE DIRECTLY.
           EOF
 
-      - name: Upload V39 results
+      - name: Upload V40
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V39-BUILD-AND-REPACK-AUDIT
+          name: XCOVER4S-V40-FULL-BUILD
           path: dist/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
