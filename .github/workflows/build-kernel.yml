@@ -1,4 +1,4 @@
-name: XCover4s - Find CP Power Function
+name: XCover4s - CP HARD OFF + SELinux Permissive v2
 
 on:
   workflow_dispatch:
@@ -6,43 +6,510 @@ on:
 permissions:
   contents: read
 
+env:
+  KERNEL_DIR: kernel
+  KERNEL_REPO: https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git
+  KERNEL_BRANCH: lineage-18.1
+  KERNEL_DEFCONFIG: lineage_xcover4s_defconfig
+
+  ARCH: arm64
+  CC: clang
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  CROSS_COMPILE: aarch64-linux-gnu-
+
 jobs:
-  find:
+  build:
     runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: |
+          set -eux
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            device-tree-compiler \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            clang \
+            lld \
+            llvm \
+            make \
+            cpio \
+            rsync \
+            python3 \
+            git
+
       - name: Clone kernel
         run: |
           set -eux
 
+          rm -rf "$KERNEL_DIR"
+
           git clone \
             --depth 1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
+            --branch "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" \
+            "$KERNEL_DIR"
 
-      - name: Find CP power implementation
-        working-directory: kernel
+          test -f "$KERNEL_DIR/Makefile"
+          test -f "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
+
+          echo "========================================"
+          echo "SOURCE COMMIT"
+          echo "========================================"
+
+          git -C "$KERNEL_DIR" rev-parse HEAD
+
+      # ============================================================
+      # SELINUX -> PERMISSIVE
+      # ============================================================
+
+      - name: Patch SELinux permissive
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
         run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          changed = []
+
+          for p in Path("security/selinux").rglob("*.c"):
+              text = p.read_text(errors="ignore")
+              old = text
+
+              text = re.sub(
+                  r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
+                  r'\g<1>0\g<2>',
+                  text
+              )
+
+              if text != old:
+                  p.write_text(text)
+                  changed.append(str(p))
+
+          print("SELinux files changed:")
+          for p in changed:
+              print("  " + p)
+
+          if not changed:
+              raise SystemExit(
+                  "ERROR: Could not locate SELinux enforcing defaults"
+              )
+          PY
+
+      # ============================================================
+      # CELLULAR CP HARD LOCKOUT
+      #
+      # IMPORTANT:
+      # Do NOT modify modem_ctrl_ss310ap.c.
+      #
+      # Block CP_POWER_ON centrally in Samsung PMU CP code.
+      # CP_POWER_OFF remains functional.
+      # ============================================================
+
+      - name: Patch cellular CP power lockout
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          FILE="drivers/soc/samsung/pmu-cp.c"
+
+          test -f "$FILE"
+
+          cp "$FILE" pmu-cp.original.c
+
           echo "========================================"
-          echo "exynos_set_cp_power_onoff"
+          echo "ORIGINAL FUNCTION"
           echo "========================================"
 
-          grep -RIn \
-            --exclude-dir=.git \
-            "exynos_set_cp_power_onoff" \
-            . || true
+          grep -n -A90 -B10 \
+            "int exynos_set_cp_power_onoff" \
+            "$FILE" || true
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("drivers/soc/samsung/pmu-cp.c")
+          text = p.read_text()
+          original = text
+
+          pattern = (
+              r'(int\s+exynos_set_cp_power_onoff\s*'
+              r'\(\s*enum\s+cp_mode\s+mode\s*\)\s*\{)'
+          )
+
+          matches = re.findall(pattern, text)
+
+          print(
+              "exynos_set_cp_power_onoff definitions found:",
+              len(matches)
+          )
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "ERROR: Expected exactly one "
+                  "exynos_set_cp_power_onoff definition"
+              )
+
+          replacement = r'''\1
+
+          /*
+           * XCOVER4S CELLULAR CP LOCKOUT
+           *
+           * Never permit the cellular communication processor
+           * to transition into CP_POWER_ON.
+           *
+           * Power-off operations are left untouched.
+           */
+          if (mode == CP_POWER_ON) {
+              pr_info("XCOVER4S: blocked cellular CP_POWER_ON\n");
+              return 0;
+          }
+          '''
+
+          text = re.sub(
+              pattern,
+              replacement,
+              text,
+              count=1
+          )
+
+          if text == original:
+              raise SystemExit(
+                  "ERROR: pmu-cp.c was not changed"
+              )
+
+          p.write_text(text)
+
+          print(
+              "Central CP_POWER_ON lockout installed."
+          )
+          PY
 
           echo
           echo "========================================"
-          echo "CP_POWER_ON / CP_POWER_OFF"
+          echo "PATCHED FUNCTION"
+          echo "========================================"
+
+          grep -n -A105 -B10 \
+            "int exynos_set_cp_power_onoff" \
+            "$FILE"
+
+          echo
+          echo "========================================"
+          echo "DIFF"
+          echo "========================================"
+
+          git diff -- "$FILE"
+
+      # ============================================================
+      # CONFIG
+      # ============================================================
+
+      - name: Prepare kernel configuration
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          rm -rf out
+
+          make \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            "$KERNEL_DEFCONFIG"
+
+          CONFIG="out/.config"
+
+          test -f "$CONFIG"
+
+          if grep -q \
+            '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' \
+            "$CONFIG"
+          then
+            sed -i \
+              's/^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=.*/CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0/' \
+              "$CONFIG"
+          else
+            echo \
+              'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' \
+              >> "$CONFIG"
+          fi
+
+          make \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            olddefconfig
+
+          echo "========================================"
+          echo "SELINUX CONFIG"
+          echo "========================================"
+
+          grep -E \
+            "^CONFIG_SECURITY_SELINUX=|^CONFIG_SECURITY_SELINUX_BOOTPARAM=|^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=|^CONFIG_SECURITY_SELINUX_DEVELOP=" \
+            "$CONFIG" || true
+
+          VALUE="$(
+            grep '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' \
+              "$CONFIG" \
+              | cut -d= -f2
+          )"
+
+          if [ "$VALUE" != "0" ]; then
+            echo "ERROR: SELinux bootparam value != 0"
+            exit 1
+          fi
+
+      # ============================================================
+      # VERIFY PATCHES BEFORE BUILD
+      # ============================================================
+
+      - name: Verify final source
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          FILE="drivers/soc/samsung/pmu-cp.c"
+
+          echo "========================================"
+          echo "VERIFY CP LOCKOUT"
+          echo "========================================"
+
+          COUNT="$(
+            grep -c \
+              'XCOVER4S: blocked cellular CP_POWER_ON' \
+              "$FILE"
+          )"
+
+          if [ "$COUNT" != "1" ]; then
+            echo "ERROR: CP lockout marker count = $COUNT"
+            exit 1
+          fi
+
+          grep -n -A8 -B8 \
+            'XCOVER4S: blocked cellular CP_POWER_ON' \
+            "$FILE"
+
+          echo
+          echo "========================================"
+          echo "VERIFY MODEM DRIVER WAS NOT MODIFIED"
+          echo "========================================"
+
+          if ! git diff --quiet -- \
+            drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+          then
+            echo "ERROR: SS310AP modem driver was unexpectedly modified"
+            git diff -- \
+              drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+            exit 1
+          fi
+
+          echo "OK: modem driver untouched"
+
+          echo
+          echo "========================================"
+          echo "VERIFY SELINUX"
           echo "========================================"
 
           grep -RInE \
-            --exclude-dir=.git \
-            "CP_POWER_(ON|OFF)" \
-            drivers arch include \
-            | head -300 || true
+            "selinux_enforcing[[:space:]]*=" \
+            security/selinux \
+            || true
+
+          echo
+          echo "SOURCE CHECK PASSED"
+
+      # ============================================================
+      # BUILD
+      # ============================================================
+
+      - name: Build kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        env:
+          KCFLAGS: -Wno-error
+        run: |
+          set -o pipefail
+
+          echo "========================================"
+          echo "BUILDING XCOVER4S"
+          echo "SELINUX PERMISSIVE"
+          echo "CELLULAR CP HARD OFF"
+          echo "========================================"
+
+          make -j"$(nproc)" \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            CC="$CC" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KCFLAGS="$KCFLAGS" \
+            Image dtbs \
+            2>&1 \
+          | awk '
+              /aarch64-linux-gnu-objdump: Warning:/ { next }
+              /Unrecognized form: 0x[0-9a-fA-F]+/ { next }
+              /Corrupt attribute/ { next }
+              /Bogus end-of-siblings marker/ { next }
+              /Further warnings about bogus end-of-sibling markers suppressed/ { next }
+
+              /^[[:space:]]+CC[[:space:]]+/ { next }
+              /^[[:space:]]+LD[[:space:]]+/ { next }
+              /^[[:space:]]+AS[[:space:]]+/ { next }
+              /^[[:space:]]+AR[[:space:]]+/ { next }
+              /^[[:space:]]+HOSTCC[[:space:]]+/ { next }
+              /^[[:space:]]+HOSTLD[[:space:]]+/ { next }
+
+              {
+                  print
+                  fflush()
+              }
+            ' \
+          | tee build.log
+
+          STATUS=${PIPESTATUS[0]}
+
+          echo
+          echo "========================================"
+          echo "MAKE EXIT CODE: $STATUS"
+          echo "========================================"
+
+          exit "$STATUS"
+
+      # ============================================================
+      # VERIFY RESULT
+      # ============================================================
+
+      - name: Verify kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          test -f "$IMAGE"
+
+          echo "========================================"
+          echo "KERNEL BUILT"
+          echo "========================================"
+
+          ls -lh "$IMAGE"
+
+          echo
+          echo "SHA256:"
+          sha256sum "$IMAGE"
+
+          echo
+          echo "SELINUX:"
+          grep \
+            "^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=" \
+            out/.config
+
+          echo
+          echo "CP LOCKOUT:"
+          grep -n \
+            "XCOVER4S: blocked cellular CP_POWER_ON" \
+            drivers/soc/samsung/pmu-cp.c
+
+      # ============================================================
+      # IMPORTANT BUILD MESSAGES
+      # ============================================================
+
+      - name: Show important messages
+        if: always()
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "IMPORTANT BUILD MESSAGES"
+          echo "========================================"
+
+          if [ -f build.log ]; then
+            grep -iE \
+              "error:|fatal error:|undefined reference|warning:|FAILED|Error [0-9]+|section mismatch" \
+              build.log \
+              | tail -300 || true
+          fi
+
+      # ============================================================
+      # PACKAGE
+      # ============================================================
+
+      - name: Package results
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts
+
+          IMAGE="${KERNEL_DIR}/out/arch/arm64/boot/Image"
+
+          if [ -f "$IMAGE" ]; then
+            cp \
+              "$IMAGE" \
+              artifacts/Image-CP-HARD-OFF-SELINUX-PERMISSIVE-v2
+          fi
+
+          if [ -f "${KERNEL_DIR}/out/.config" ]; then
+            cp \
+              "${KERNEL_DIR}/out/.config" \
+              artifacts/kernel-config
+          fi
+
+          if [ -f "${KERNEL_DIR}/build.log" ]; then
+            cp \
+              "${KERNEL_DIR}/build.log" \
+              artifacts/build.log
+          fi
+
+          if [ -f "${KERNEL_DIR}/pmu-cp.original.c" ]; then
+            cp \
+              "${KERNEL_DIR}/pmu-cp.original.c" \
+              artifacts/
+          fi
+
+          if [ -f "${KERNEL_DIR}/drivers/soc/samsung/pmu-cp.c" ]; then
+            cp \
+              "${KERNEL_DIR}/drivers/soc/samsung/pmu-cp.c" \
+              artifacts/pmu-cp.PATCHED.c
+          fi
+
+          cd "${KERNEL_DIR}"
+
+          git diff \
+            -- security/selinux \
+               drivers/soc/samsung/pmu-cp.c \
+            > ../artifacts/final-kernel.patch || true
+
+          cd ..
+
+          echo "========================================"
+          echo "ARTIFACTS"
+          echo "========================================"
+
+          ls -lh artifacts/
+
+      - name: Upload kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcover4s-CP-HARD-OFF-SELINUX-PERMISSIVE-v2
+          path: artifacts/
+          if-no-files-found: error
