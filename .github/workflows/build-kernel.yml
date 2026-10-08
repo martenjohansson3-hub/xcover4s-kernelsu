@@ -1,4 +1,4 @@
-name: XCover4s - Permissive + SS310AP Analysis
+name: XCover4s - FINAL CP OFF + SELinux Permissive
 
 on:
   workflow_dispatch:
@@ -66,14 +66,17 @@ jobs:
           test -f "$KERNEL_DIR/Makefile"
           test -f "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
 
-          echo
           echo "========================================"
-          echo "KERNEL SOURCE"
+          echo "SOURCE COMMIT"
           echo "========================================"
 
           git -C "$KERNEL_DIR" rev-parse HEAD
 
-      - name: Patch SELinux default permissive
+      # ============================================================
+      # SELINUX -> DEFAULT PERMISSIVE
+      # ============================================================
+
+      - name: Patch SELinux permissive
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         run: |
@@ -86,8 +89,9 @@ jobs:
           changed = []
 
           for p in Path("security/selinux").rglob("*.c"):
+
               text = p.read_text(errors="ignore")
-              original = text
+              old = text
 
               text = re.sub(
                   r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
@@ -95,169 +99,132 @@ jobs:
                   text
               )
 
-              if text != original:
+              if text != old:
                   p.write_text(text)
                   changed.append(str(p))
 
-          print("Changed SELinux source files:")
+          print("SELinux files changed:")
 
           for p in changed:
               print("  " + p)
 
           if not changed:
               raise SystemExit(
-                  "ERROR: No selinux_enforcing assignment was changed"
+                  "ERROR: Could not locate SELinux enforcing defaults"
               )
           PY
-
-          echo
-          echo "========================================"
-          echo "SELINUX SOURCE AFTER PATCH"
-          echo "========================================"
 
           grep -RInE \
             "selinux_enforcing[[:space:]]*=" \
             security/selinux \
-            2>/dev/null || true
+            || true
 
-          echo
-          echo "========================================"
-          echo "SELINUX SOURCE DIFF"
-          echo "========================================"
+      # ============================================================
+      # SS310AP / S327AP CP POWER LOCKOUT
+      # ============================================================
 
-          git diff -- security/selinux
-
-      - name: Targeted SS310AP modem analysis
+      - name: Patch SS310AP CP permanently OFF
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         run: |
-          set +e
+          set -eux
 
-          OUT="modem-analysis.log"
+          FILE="drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
 
-          : > "$OUT"
+          test -f "$FILE"
 
-          {
-            echo "========================================"
-            echo "XCOVER4S SS310AP MODEM ANALYSIS"
-            echo "========================================"
-            echo
+          echo "========================================"
+          echo "ORIGINAL SS310AP POWER CALLS"
+          echo "========================================"
 
-            echo "===== SS310AP FILES ====="
+          grep -n \
+            "exynos_set_cp_power_onoff" \
+            "$FILE" || true
 
-            find . -type f \
-              \( \
-                -iname '*ss310*' \
-                -o -iname '*s327*' \
-                -o -iname '*modem*' \
-                -o -iname '*cpif*' \
-              \) \
-              | sort
+          cp "$FILE" modem_ctrl_ss310ap.original.c
 
-            echo
-            echo "===== SS310AP / S327AP REFERENCES ====="
+          python3 <<'PY'
+          from pathlib import Path
+          import re
 
-            grep -RInE \
-              "SS310AP|ss310ap|S327AP|s327ap" \
-              drivers \
-              arch/arm64 \
-              include \
-              2>/dev/null
+          p = Path("drivers/misc/modem_v1/modem_ctrl_ss310ap.c")
 
-            echo
-            echo "===== XCOVER4S DTS REFERENCES ====="
+          text = p.read_text()
+          original = text
 
-            grep -RInE \
-              "xcover4s|s327ap|ss310ap|modem|cpif" \
-              arch/arm64/boot/dts \
-              2>/dev/null
+          # --------------------------------------------------------
+          # 1. Disable every direct CP_POWER_ON request in this
+          #    SS310AP-specific driver.
+          #
+          #    We deliberately do NOT touch GNSS, Wi-Fi or Bluetooth.
+          # --------------------------------------------------------
 
-            echo
-            echo "===== MODEM POWER FUNCTIONS ====="
+          on_calls = len(re.findall(
+              r'exynos_set_cp_power_onoff\s*\(\s*CP_POWER_ON\s*\)\s*;',
+              text
+          ))
 
-            grep -RInE \
-              "modem.*power|power.*modem|cp.*power|power.*cp|modem_on|modem_off|modem_reset|cp_on|cp_off|cp_reset|power_on|power_off" \
-              drivers \
-              arch/arm64 \
-              include \
-              2>/dev/null
+          print("CP_POWER_ON calls found:", on_calls)
 
-            echo
-            echo "===== GPIO / RESET / ACTIVE CONTROL ====="
+          if on_calls == 0:
+              raise SystemExit(
+                  "ERROR: No CP_POWER_ON call found in SS310AP driver"
+              )
 
-            grep -RInE \
-              "gpio.*cp|cp.*gpio|gpio.*modem|modem.*gpio|cp_reset|cp_on|cp_active|phone_active|pda_active|reset_req|cp_wakeup|ap_wakeup" \
-              drivers \
-              arch/arm64/boot/dts \
-              include \
-              2>/dev/null
+          text = re.sub(
+              r'exynos_set_cp_power_onoff\s*\(\s*CP_POWER_ON\s*\)\s*;',
+              'exynos_set_cp_power_onoff(CP_POWER_OFF); '
+              '/* XCOVER4S: cellular CP locked OFF */',
+              text
+          )
 
-            echo
-            echo "===== REGULATORS NEAR MODEM / CP ====="
+          if text == original:
+              raise SystemExit(
+                  "ERROR: SS310AP source was not changed"
+              )
 
-            grep -RInE \
-              "vdd.*(cp|modem)|vcc.*(cp|modem)|(cp|modem).*vdd|(cp|modem).*vcc|regulator.*(cp|modem)|(cp|modem).*regulator" \
-              drivers \
-              arch/arm64/boot/dts \
-              include \
-              2>/dev/null
+          p.write_text(text)
 
-            echo
-            echo "===== REGULATOR ENABLE / DISABLE ====="
-
-            grep -RInE \
-              "regulator_(get|enable|disable|force_disable)|devm_regulator_get" \
-              drivers \
-              2>/dev/null \
-              | grep -Ei \
-                "modem|cp|ss310|s327|mif|link" || true
-
-            echo
-            echo "===== MODEM CONTROL STRUCTURES ====="
-
-            grep -RInE \
-              "modem_ctl|modem_data|modem_ops|modemctl|modem_ctrl|cp_ctrl|cpif" \
-              drivers \
-              include \
-              2>/dev/null
-
-            echo
-            echo "===== MODEM CONFIG ====="
-
-            grep -RInE \
-              "CONFIG_.*(SS310|MODEM|CPIF|SIPC)" \
-              arch/arm64/configs \
-              2>/dev/null
-
-            echo
-            echo "===== WIFI / WLAN REFERENCES FOR SEPARATION ====="
-
-            grep -RInE \
-              "wlan|wifi|bcmdhd|dhd" \
-              arch/arm64/boot/dts \
-              2>/dev/null \
-              | head -200
-
-            echo
-            echo "===== GPS / GNSS REFERENCES FOR SEPARATION ====="
-
-            grep -RInE \
-              "gps|gnss" \
-              arch/arm64/boot/dts \
-              drivers \
-              2>/dev/null \
-              | head -200
-
-          } >> "$OUT"
+          print(
+              "All direct SS310AP CP_POWER_ON requests "
+              "replaced with CP_POWER_OFF."
+          )
+          PY
 
           echo
           echo "========================================"
-          echo "MODEM ANALYSIS CREATED"
+          echo "VERIFY CP_POWER_ON IS GONE FROM SS310AP"
           echo "========================================"
 
-          wc -l "$OUT"
+          if grep -nE \
+            "exynos_set_cp_power_onoff[[:space:]]*\([[:space:]]*CP_POWER_ON" \
+            "$FILE"
+          then
+            echo "ERROR: CP_POWER_ON still exists in SS310AP driver"
+            exit 1
+          fi
 
-          true
+          echo "OK: no direct CP_POWER_ON remains."
+
+          echo
+          echo "========================================"
+          echo "CP POWER CALLS AFTER PATCH"
+          echo "========================================"
+
+          grep -n \
+            "exynos_set_cp_power_onoff" \
+            "$FILE" || true
+
+          echo
+          echo "========================================"
+          echo "SS310AP DIFF"
+          echo "========================================"
+
+          git diff -- "$FILE"
+
+      # ============================================================
+      # CONFIG
+      # ============================================================
 
       - name: Prepare kernel configuration
         working-directory: ${{ env.KERNEL_DIR }}
@@ -276,7 +243,10 @@ jobs:
 
           test -f "$CONFIG"
 
-          if grep -q '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' "$CONFIG"; then
+          if grep -q \
+            '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' \
+            "$CONFIG"
+          then
 
             sed -i \
               's/^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=.*/CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0/' \
@@ -287,7 +257,6 @@ jobs:
             echo \
               'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' \
               >> "$CONFIG"
-
           fi
 
           make \
@@ -304,17 +273,58 @@ jobs:
             "^CONFIG_SECURITY_SELINUX=|^CONFIG_SECURITY_SELINUX_BOOTPARAM=|^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=|^CONFIG_SECURITY_SELINUX_DEVELOP=" \
             "$CONFIG" || true
 
-          VALUE="$(grep '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' "$CONFIG" | cut -d= -f2)"
+          VALUE="$(
+            grep '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' \
+              "$CONFIG" \
+              | cut -d= -f2
+          )"
 
           if [ "$VALUE" != "0" ]; then
-            echo "ERROR: SELinux bootparam value is NOT 0"
+            echo "ERROR: SELinux bootparam value != 0"
             exit 1
           fi
 
-          echo
-          echo "SELinux bootparam default = PERMISSIVE"
+      # ============================================================
+      # FINAL SAFETY VERIFICATION BEFORE COMPILATION
+      # ============================================================
 
-      - name: Build kernel
+      - name: Verify final source patches
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          FILE="drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
+
+          echo "========================================"
+          echo "FINAL SOURCE CHECK"
+          echo "========================================"
+
+          if grep -qE \
+            "exynos_set_cp_power_onoff[[:space:]]*\([[:space:]]*CP_POWER_ON" \
+            "$FILE"
+          then
+            echo "ERROR: SS310AP can still request CP_POWER_ON"
+            exit 1
+          fi
+
+          grep -n \
+            "XCOVER4S: cellular CP locked OFF" \
+            "$FILE"
+
+          grep -RInE \
+            "selinux_enforcing[[:space:]]*=" \
+            security/selinux \
+            || true
+
+          echo
+          echo "SOURCE CHECK PASSED"
+
+      # ============================================================
+      # BUILD
+      # ============================================================
+
+      - name: Build final kernel
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         env:
@@ -322,11 +332,11 @@ jobs:
         run: |
           set -o pipefail
 
-          echo
           echo "========================================"
-          echo "BUILDING XCOVER4S KERNEL"
+          echo "BUILDING FINAL XCOVER4S KERNEL"
+          echo "SELINUX PERMISSIVE"
+          echo "SS310AP CP POWER LOCKOUT"
           echo "========================================"
-          echo
 
           make -j"$(nproc)" \
             O="$PWD/out" \
@@ -345,7 +355,6 @@ jobs:
               /Further warnings about bogus end-of-sibling markers suppressed/ { next }
 
               /^[[:space:]]+CC[[:space:]]+/ { next }
-              /^[[:space:]]+CC[[:space:]]+\[M\]/ { next }
               /^[[:space:]]+LD[[:space:]]+/ { next }
               /^[[:space:]]+AS[[:space:]]+/ { next }
               /^[[:space:]]+AR[[:space:]]+/ { next }
@@ -368,7 +377,11 @@ jobs:
 
           exit "$STATUS"
 
-      - name: Verify new kernel
+      # ============================================================
+      # VERIFY RESULT
+      # ============================================================
+
+      - name: Verify final kernel
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         run: |
@@ -380,7 +393,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "NEW KERNEL SUCCESSFULLY BUILT"
+          echo "FINAL KERNEL BUILT"
           echo "========================================"
 
           ls -lh "$IMAGE"
@@ -390,30 +403,26 @@ jobs:
           sha256sum "$IMAGE"
 
           echo
-          echo "========================================"
-          echo "FINAL SELINUX CONFIG"
-          echo "========================================"
-
+          echo "SELINUX:"
           grep -E \
-            "^CONFIG_SECURITY_SELINUX=|^CONFIG_SECURITY_SELINUX_BOOTPARAM=|^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=|^CONFIG_SECURITY_SELINUX_DEVELOP=" \
-            out/.config || true
+            "^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=" \
+            out/.config
 
           echo
-          echo "========================================"
-          echo "FINAL SELINUX SOURCE"
-          echo "========================================"
+          echo "SS310AP:"
+          grep -n \
+            "XCOVER4S: cellular CP locked OFF" \
+            drivers/misc/modem_v1/modem_ctrl_ss310ap.c
 
-          grep -RInE \
-            "selinux_enforcing[[:space:]]*=" \
-            security/selinux \
-            2>/dev/null || true
+      # ============================================================
+      # IMPORTANT WARNINGS ONLY
+      # ============================================================
 
-      - name: Show important build messages
+      - name: Show important messages
         if: always()
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         run: |
-          echo
           echo "========================================"
           echo "IMPORTANT BUILD MESSAGES"
           echo "========================================"
@@ -427,7 +436,11 @@ jobs:
 
           fi
 
-      - name: Package results
+      # ============================================================
+      # PACKAGE
+      # ============================================================
+
+      - name: Package final results
         if: always()
         shell: bash
         run: |
@@ -438,7 +451,7 @@ jobs:
           if [ -f "$IMAGE" ]; then
             cp \
               "$IMAGE" \
-              artifacts/Image-selinux-permissive
+              artifacts/Image-FINAL-CP-OFF-SELINUX-PERMISSIVE
           fi
 
           if [ -f "${KERNEL_DIR}/out/.config" ]; then
@@ -453,23 +466,38 @@ jobs:
               artifacts/build.log
           fi
 
-          if [ -f "${KERNEL_DIR}/modem-analysis.log" ]; then
+          if [ -f "${KERNEL_DIR}/modem_ctrl_ss310ap.original.c" ]; then
             cp \
-              "${KERNEL_DIR}/modem-analysis.log" \
-              artifacts/modem-analysis.log
+              "${KERNEL_DIR}/modem_ctrl_ss310ap.original.c" \
+              artifacts/
           fi
+
+          if [ -f "${KERNEL_DIR}/drivers/misc/modem_v1/modem_ctrl_ss310ap.c" ]; then
+            cp \
+              "${KERNEL_DIR}/drivers/misc/modem_v1/modem_ctrl_ss310ap.c" \
+              artifacts/modem_ctrl_ss310ap.PATCHED.c
+          fi
+
+          cd "${KERNEL_DIR}"
+
+          git diff \
+            -- security/selinux \
+               drivers/misc/modem_v1/modem_ctrl_ss310ap.c \
+            > ../artifacts/final-kernel.patch || true
+
+          cd ..
 
           echo
           echo "========================================"
-          echo "ARTIFACTS"
+          echo "FINAL ARTIFACTS"
           echo "========================================"
 
           ls -lh artifacts/
 
-      - name: Upload results
+      - name: Upload final kernel
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-permissive-ss310ap-analysis
+          name: xcover4s-FINAL-CP-OFF-SELINUX-PERMISSIVE
           path: artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
