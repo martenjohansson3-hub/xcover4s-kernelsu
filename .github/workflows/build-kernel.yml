@@ -1,117 +1,145 @@
 
-name: XCOVER4S V22 CP TARGETED TEST
+name: XCOVER4S V22 CP HARD OFF TEST
 
 on:
   workflow_dispatch:
 
 jobs:
-  cp-targeted-test:
+  hard-off-test:
     runs-on: ubuntu-22.04
     timeout-minutes: 25
 
     steps:
-      - name: Install compiler
+      - name: Install build tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            clang-14 \
-            lld-14 \
+            clang-14 lld-14 \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev libelf-dev
+            bc bison flex \
+            libssl-dev libelf-dev
 
-      - name: Download kernel
+      - name: Get kernel source
         run: |
+          set -euo pipefail
+
           git clone --depth 1 \
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
-      - name: Prepare CP experiment
+          mkdir -p diagnostics
+          git -C kernel rev-parse HEAD \
+            > diagnostics/source-commit.txt
+
+      - name: Create HARD OFF experiment
         run: |
           set -euo pipefail
-          mkdir -p diagnostics
 
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          p = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
+          p = Path(
+              "kernel/drivers/soc/samsung/cal-if/cal-if.c"
+          )
+
           original = p.read_text()
-
-          functions = [
-              "cal_cp_init",
-              "cal_cp_reset_release",
-          ]
-
           modified = original
 
-          for name in functions:
+          replacements = {
+              "cal_cp_init":
+                  'pr_warn("V22: CP hard off requested\\n");'
+                  '\n\tpmucal_cp_reset_assert();',
+
+              "cal_cp_reset_release":
+                  'pr_warn("V22: CP restart blocked\\n");'
+                  '\n\tpmucal_cp_reset_assert();',
+          }
+
+          for name, body in replacements.items():
               pattern = (
-                  r"(void\s+" + name +
-                  r"\s*\(\s*void\s*\)\s*\{)"
+                  r'(void\s+' + name +
+                  r'\s*\(\s*void\s*\)\s*\{)'
+                  r'([^{}]*)'
+                  r'(\})'
               )
-              match = re.search(pattern, modified)
 
-              if not match:
+              matches = list(
+                  re.finditer(pattern, modified)
+              )
+
+              if len(matches) != 1:
                   raise SystemExit(
-                      "Function not found: " + name
+                      "Cannot safely patch " + name
                   )
 
-              start = match.end()
-              depth = 1
-              end = start
-
-              while depth and end < len(modified):
-                  if modified[end] == "{":
-                      depth += 1
-                  elif modified[end] == "}":
-                      depth -= 1
-                  end += 1
-
-              if depth:
-                  raise SystemExit(
-                      "Unbalanced function: " + name
-                  )
-
-              replacement = (
-                  match.group(1) +
-                  "\n\t/* V22 EXPERIMENT: block CP start */"
-                  "\n\tpr_warn(\"V22: " + name +
-                  " blocked\\n\");\n}"
+              modified, count = re.subn(
+                  pattern,
+                  lambda m: (
+                      m.group(1) +
+                      "\n\t/* V22 CP HARD OFF TEST */\n\t" +
+                      body + "\n" +
+                      m.group(3)
+                  ),
+                  modified,
+                  count=1
               )
 
-              modified = (
-                  modified[:match.start()] +
-                  replacement +
-                  modified[end:]
-              )
+              assert count == 1
 
           p.write_text(modified)
 
-          print("CP functions patched:")
-          for name in functions:
-              print(name)
-
           assert modified != original
+          print("V22 CP HARD OFF patch prepared")
           PY
 
           git -C kernel diff \
-            > diagnostics/v22-cp-experiment.patch
+            > diagnostics/v22-hard-off.patch
 
-      - name: Check GNSS untouched
+      - name: Validate shutdown sequence
         run: |
           set -euo pipefail
 
-          if git -C kernel diff --name-only \
-            | grep -Ei 'gnss|gps|wifi|wlan'; then
-            echo "ERROR: GNSS or Wi-Fi changed"
+          FILE=kernel/drivers/soc/samsung/cal-if/exynos7885/pmucal_cp_exynos7885.h
+
+          test -f "$FILE"
+
+          grep -q 'struct pmucal_seq cp_reset_assert' \
+            "$FILE"
+
+          grep -q 'CP_CTRL_NS__CP_PWRON' "$FILE"
+
+          grep -q 'CENTRAL_SEQ_CP_STATUS__STATES' \
+            "$FILE"
+
+          {
+            echo "CP shutdown sequence found"
+            echo
+            grep -nE \
+              'cp_reset_assert|CP_PWRON|CENTRAL_SEQ_CP_STATUS' \
+              "$FILE"
+          } > diagnostics/power-sequence.txt
+
+      - name: Verify GNSS and WiFi untouched
+        run: |
+          set -euo pipefail
+
+          git -C kernel diff --name-only \
+            > diagnostics/changed-files.txt
+
+          if grep -Ei \
+            'gnss|gps|wifi|wlan|dts' \
+            diagnostics/changed-files.txt; then
+            echo "ERROR: protected sources changed"
             exit 1
           fi
 
-          echo "GNSS and Wi-Fi sources untouched"
+          echo "Protected sources unchanged" \
+            > diagnostics/protected-sources.txt
 
-      - name: Prepare kernel configuration
+      - name: Prepare kernel
         run: |
           set -euo pipefail
           cd kernel
@@ -121,11 +149,11 @@ jobs:
 
           make O=out lineage_xcover4s_defconfig
 
-          grep '^CONFIG_CP_PMUCAL=y' out/.config
+          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
 
           make O=out -j2 prepare scripts
 
-      - name: Compile CP control object only
+      - name: Compile modified CP object
         run: |
           set -o pipefail
           cd kernel
@@ -138,7 +166,7 @@ jobs:
             drivers/soc/samsung/cal-if/cal-if.o \
             2>&1 | tee ../diagnostics/compile.log
 
-      - name: Check compiled object
+      - name: Inspect compiled symbols
         run: |
           set -euo pipefail
 
@@ -147,16 +175,25 @@ jobs:
           test -s "$OBJ"
 
           aarch64-linux-gnu-nm "$OBJ" \
-            | grep -E 'cal_cp_init|cal_cp_reset_release' \
             > diagnostics/symbols.txt
+
+          grep -q 'cal_cp_init' diagnostics/symbols.txt
+          grep -q 'cal_cp_reset_release' \
+            diagnostics/symbols.txt
 
           echo "TARGETED COMPILE PASSED" \
             > diagnostics/result.txt
 
-      - name: Upload test results
+          echo "Runtime power-off NOT verified" \
+            >> diagnostics/result.txt
+
+          echo "DO NOT FLASH THIS TEST" \
+            >> diagnostics/result.txt
+
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-CP-TARGETED-TEST
+          name: XCOVER4S-V22-HARD-OFF-TEST
           path: diagnostics/
           if-no-files-found: warn
