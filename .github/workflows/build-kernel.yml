@@ -1,50 +1,85 @@
 
-name: XCover4s V22 CP diagnostics
+name: XCOVER4S V22 SOURCE AUDIT
 
 on:
   workflow_dispatch:
 
 jobs:
-  cp-diagnostics:
+  source-audit:
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
-
-      - name: Fetch kernel source
+      - name: Download kernel source
         run: |
-          git clone --depth 1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          set -euo pipefail
+          git clone --depth 1 \
+            --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
-      - name: Inspect CP startup paths
+      - name: Inspect modem and GNSS
         run: |
+          set -euo pipefail
           mkdir -p diagnostics
+
           {
-            echo "=== Kernel revision ==="
-            git -C kernel log -1 --oneline
+            echo "=== KERNEL VERSION ==="
+            git -C kernel log -1 --format=fuller
+
             echo
-            echo "=== CP function references ==="
+            echo "=== MODEM START FUNCTIONS ==="
             grep -RnE \
               'exynos_cp_init|exynos_cp_release|exynos_cp_reset|exynos_set_cp_power_onoff' \
-              kernel/drivers kernel/arch \
-              || true
-            echo
-            echo "=== CP power control references ==="
-            grep -RnE \
-              'CP_POWER_ON|CP_PWRON|CP_START|CP_POWER_OFF|exynos_smc_write' \
-              kernel/drivers/soc/samsung \
-              kernel/drivers/misc \
-              || true
-            echo
-            echo "=== Modem related source files ==="
-            find kernel/drivers kernel/arch \
-              -type f \
-              \( -iname '*modem*' -o -iname '*link_device*' -o -iname '*pmu-cp*' \) \
-              | sort
-          } > diagnostics/cp-startup-report.txt
+              kernel/drivers kernel/arch || true
 
-      - name: Save diagnostic report
+            echo
+            echo "=== MODEM POWER FUNCTIONS ==="
+            grep -RnE \
+              'CP_POWER_ON|CP_POWER_OFF|CP_PWRON|CP_START|CP_RESET|pmucal_cp' \
+              kernel/drivers kernel/arch || true
+
+            echo
+            echo "=== SS310AP REFERENCES ==="
+            grep -RniE \
+              'ss310ap|sh310ap|modemctl|modem_ctrl' \
+              kernel/drivers kernel/arch || true
+
+            echo
+            echo "=== GNSS REFERENCES ==="
+            grep -RniE \
+              'gnss|gps|bcm477|gnss_if' \
+              kernel/drivers/misc/gnss_if \
+              kernel/drivers/soc/samsung \
+              kernel/arch/arm64/boot/dts || true
+
+            echo
+            echo "=== MODEM SOURCE FILES ==="
+            find kernel/drivers \
+              -type f \
+              \( -iname '*modem*' \
+              -o -iname '*pmu-cp*' \
+              -o -iname '*gnss*' \) \
+              | sort
+          } > diagnostics/source-audit.txt
+
+      - name: Save important source files
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/source
+
+          find kernel/drivers kernel/arch \
+            -type f \
+            \( -name 'pmu-cp.c' \
+            -o -name 'pmucal_cp_exynos7885.h' \
+            -o -name 'modem_ctrl_ss310ap.c' \
+            -o -name 'modem_modemctl_device_sh310ap.c' \) \
+            -exec cp --parents {} diagnostics/source/ \;
+
+      - name: Upload diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-CP-DIAGNOSTICS
+          name: XCOVER4S-V22-SOURCE-AUDIT
           path: diagnostics/
+          if-no-files-found: warn
