@@ -1,5 +1,5 @@
 
-name: XCOVER4S V22 FULL KERNEL
+name: XCOVER4S V23 CP KERNEL
 
 on:
   workflow_dispatch:
@@ -10,70 +10,80 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Install tools
+      - name: Install build tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
             clang-14 lld-14 \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            bc bison flex \
-            libssl-dev libelf-dev cpio
+            bc bison flex libssl-dev \
+            libelf-dev cpio
 
-      - name: Download source
+      - name: Download kernel source
         run: |
           set -euo pipefail
           git clone --depth 1 \
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
+
           mkdir -p diagnostics
           git -C kernel rev-parse HEAD \
             > diagnostics/source-commit.txt
 
-      - name: Apply V22 CP experiment
+      - name: Apply V23 patches
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path(
-              "kernel/drivers/soc/samsung/cal-if/cal-if.c"
-          )
-          s = p.read_text()
+          def replace_exact(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              count = s.count(old)
 
-          changes = [
-              (
-                  "void cal_cp_init(void)\n"
-                  "{\n\tpmucal_cp_init();\n}",
-                  "void cal_cp_init(void)\n"
-                  "{\n"
-                  '\tpr_warn("V22 CP init blocked\\n");\n'
-                  "\tpmucal_cp_reset_assert();\n}"
-              ),
-              (
-                  "void cal_cp_reset_release(void)\n"
-                  "{\n\tpmucal_cp_reset_release();\n}",
-                  "void cal_cp_reset_release(void)\n"
-                  "{\n"
-                  '\tpr_warn("V22 CP release blocked\\n");\n'
-                  "\tpmucal_cp_reset_assert();\n}"
-              )
-          ]
-
-          for old, new in changes:
-              if s.count(old) != 1:
+              if count != 1:
                   raise SystemExit(
-                      "Unexpected CP source. Stopping."
+                      f"STOP: {path}: expected 1 match, got {count}"
                   )
-              s = s.replace(old, new)
 
-          p.write_text(s)
+              p.write_text(s.replace(old, new))
+              print("Patched:", path)
+
+          cp = "kernel/drivers/soc/samsung/cal-if/cal-if.c"
+
+          replace_exact(
+              cp,
+              "void cal_cp_init(void)\n"
+              "{\n\tpmucal_cp_init();\n}",
+              "void cal_cp_init(void)\n"
+              "{\n"
+              '\tpr_warn("V23 CP init blocked\\n");\n'
+              "\tpmucal_cp_reset_assert();\n}"
+          )
+
+          replace_exact(
+              cp,
+              "void cal_cp_reset_release(void)\n"
+              "{\n\tpmucal_cp_reset_release();\n}",
+              "void cal_cp_reset_release(void)\n"
+              "{\n"
+              '\tpr_warn("V23 CP release blocked\\n");\n'
+              "\tpmucal_cp_reset_assert();\n}"
+          )
+
+          replace_exact(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c",
+              "const double decon_clocks_table[][CLK_ID_MAX]",
+              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
+          )
           PY
 
           git -C kernel diff \
-            > diagnostics/v22.patch
+            > diagnostics/v23.patch
 
       - name: Configure kernel
         run: |
@@ -89,16 +99,28 @@ jobs:
 
           scripts/config --file out/.config \
             -e SECURITY_SELINUX_DEVELOP \
-            -d SECURITY_SELINUX_BOOTPARAM_VALUE \
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=out olddefconfig
 
           cp out/.config ../diagnostics/final.config
 
-      - name: Compile kernel
+      - name: Targeted display driver test
         run: |
-          set -o pipefail
+          set -euo pipefail
+          cd kernel
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
+
+          make O=out -j2 \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
+            2>&1 | tee ../diagnostics/display-test.log
+
+      - name: Full kernel build
+        run: |
+          set -euo pipefail
           cd kernel
 
           export ARCH=arm64
@@ -108,45 +130,40 @@ jobs:
           make O=out -j2 Image \
             2>&1 | tee ../diagnostics/build.log
 
-      - name: Collect kernel
+      - name: Prepare artifact
         run: |
           set -euo pipefail
-
           mkdir -p artifact
 
           cp kernel/out/arch/arm64/boot/Image \
             artifact/Image
+
+          cp diagnostics/v23.patch \
+            artifact/v23.patch
 
           test -s artifact/Image
 
           sha256sum artifact/Image \
             > artifact/SHA256SUMS
 
-          cp diagnostics/v22.patch artifact/
-
-          echo "Kernel compilation passed" \
+          printf '%s\n' \
+            "V23 kernel build passed" \
+            "NOT FLASHABLE YET" \
+            "CP power-off not hardware verified" \
+            "SELinux runtime state not verified" \
             > artifact/STATUS.txt
-
-          echo "CP hardware power-off unverified" \
-            >> artifact/STATUS.txt
-
-          echo "SELinux runtime state unverified" \
-            >> artifact/STATUS.txt
-
-          echo "NOT FLASHABLE" \
-            >> artifact/STATUS.txt
 
       - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-KERNEL
+          name: XCOVER4S-V23-KERNEL
           path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-BUILD-DIAGNOSTICS
+          name: XCOVER4S-V23-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
