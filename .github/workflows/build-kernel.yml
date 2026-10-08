@@ -1,4 +1,4 @@
-name: XCover4s - CP HARD OFF + SELinux Permissive v2
+name: XCover4s - CP HARD OFF + SELinux Permissive v3
 
 on:
   workflow_dispatch:
@@ -112,16 +112,14 @@ jobs:
           PY
 
       # ============================================================
-      # CELLULAR CP HARD LOCKOUT
+      # CENTRAL CELLULAR CP POWER LOCKOUT
       #
-      # IMPORTANT:
-      # Do NOT modify modem_ctrl_ss310ap.c.
-      #
-      # Block CP_POWER_ON centrally in Samsung PMU CP code.
-      # CP_POWER_OFF remains functional.
+      # Leave SS310AP modem driver untouched.
+      # Block CP_POWER_ON centrally.
+      # CP_POWER_OFF continues to work normally.
       # ============================================================
 
-      - name: Patch cellular CP power lockout
+      - name: Patch cellular CP HARD OFF
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         run: |
@@ -133,73 +131,49 @@ jobs:
 
           cp "$FILE" pmu-cp.original.c
 
-          echo "========================================"
-          echo "ORIGINAL FUNCTION"
-          echo "========================================"
-
-          grep -n -A90 -B10 \
-            "int exynos_set_cp_power_onoff" \
-            "$FILE" || true
-
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           p = Path("drivers/soc/samsung/pmu-cp.c")
+
           text = p.read_text()
-          original = text
 
-          pattern = (
-              r'(int\s+exynos_set_cp_power_onoff\s*'
-              r'\(\s*enum\s+cp_mode\s+mode\s*\)\s*\{)'
-          )
+          needle = "int exynos_set_cp_power_onoff(enum cp_mode mode)\n{"
 
-          matches = re.findall(pattern, text)
-
-          print(
-              "exynos_set_cp_power_onoff definitions found:",
-              len(matches)
-          )
-
-          if len(matches) != 1:
+          if text.count(needle) != 1:
               raise SystemExit(
                   "ERROR: Expected exactly one "
-                  "exynos_set_cp_power_onoff definition"
+                  "exynos_set_cp_power_onoff() definition"
               )
 
-          replacement = r'''\1
+          lines = [
+              "int exynos_set_cp_power_onoff(enum cp_mode mode)",
+              "{",
+              "\t/*",
+              "\t * XCOVER4S CELLULAR CP HARD LOCKOUT",
+              "\t *",
+              "\t * Never permit the cellular communication processor",
+              "\t * to transition into CP_POWER_ON.",
+              "\t *",
+              "\t * CP_POWER_OFF operations remain untouched.",
+              "\t */",
+              "\tif (mode == CP_POWER_ON) {",
+              "\t\tpr_info(\"XCOVER4S: blocked cellular CP_POWER_ON\\\\n\");",
+              "\t\treturn 0;",
+              "\t}",
+          ]
 
-          /*
-           * XCOVER4S CELLULAR CP LOCKOUT
-           *
-           * Never permit the cellular communication processor
-           * to transition into CP_POWER_ON.
-           *
-           * Power-off operations are left untouched.
-           */
-          if (mode == CP_POWER_ON) {
-              pr_info("XCOVER4S: blocked cellular CP_POWER_ON\n");
-              return 0;
-          }
-          '''
+          replacement = "\n".join(lines)
 
-          text = re.sub(
-              pattern,
+          text = text.replace(
+              needle,
               replacement,
-              text,
-              count=1
+              1
           )
-
-          if text == original:
-              raise SystemExit(
-                  "ERROR: pmu-cp.c was not changed"
-              )
 
           p.write_text(text)
 
-          print(
-              "Central CP_POWER_ON lockout installed."
-          )
+          print("CP HARD OFF patch installed.")
           PY
 
           echo
@@ -207,7 +181,7 @@ jobs:
           echo "PATCHED FUNCTION"
           echo "========================================"
 
-          grep -n -A105 -B10 \
+          grep -n -A30 -B5 \
             "int exynos_set_cp_power_onoff" \
             "$FILE"
 
@@ -217,6 +191,66 @@ jobs:
           echo "========================================"
 
           git diff -- "$FILE"
+
+      # ============================================================
+      # VERIFY GENERATED C SOURCE BEFORE BUILD
+      # ============================================================
+
+      - name: Verify CP patch syntax
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          FILE="drivers/soc/samsung/pmu-cp.c"
+
+          echo "========================================"
+          echo "VERIFY EXACT PATCH"
+          echo "========================================"
+
+          grep -nF \
+            'pr_info("XCOVER4S: blocked cellular CP_POWER_ON\n");' \
+            "$FILE"
+
+          COUNT="$(
+            grep -cF \
+              'pr_info("XCOVER4S: blocked cellular CP_POWER_ON\n");' \
+              "$FILE"
+          )"
+
+          if [ "$COUNT" != "1" ]; then
+            echo "ERROR: expected exactly one CP lockout message"
+            exit 1
+          fi
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/soc/samsung/pmu-cp.c")
+          text = p.read_text()
+
+          good = (
+              'pr_info("XCOVER4S: blocked '
+              'cellular CP_POWER_ON\\n");'
+          )
+
+          if good not in text:
+              raise SystemExit(
+                  "ERROR: correct pr_info C string not present"
+              )
+
+          bad = (
+              'pr_info("XCOVER4S: blocked '
+              'cellular CP_POWER_ON\n");'
+          )
+
+          if bad in text:
+              raise SystemExit(
+                  "ERROR: literal newline detected inside C string"
+              )
+
+          print("C string syntax verification PASSED")
+          PY
 
       # ============================================================
       # CONFIG
@@ -277,7 +311,7 @@ jobs:
           fi
 
       # ============================================================
-      # VERIFY PATCHES BEFORE BUILD
+      # FINAL SOURCE VERIFICATION
       # ============================================================
 
       - name: Verify final source
@@ -289,19 +323,8 @@ jobs:
           FILE="drivers/soc/samsung/pmu-cp.c"
 
           echo "========================================"
-          echo "VERIFY CP LOCKOUT"
+          echo "VERIFY CP HARD OFF"
           echo "========================================"
-
-          COUNT="$(
-            grep -c \
-              'XCOVER4S: blocked cellular CP_POWER_ON' \
-              "$FILE"
-          )"
-
-          if [ "$COUNT" != "1" ]; then
-            echo "ERROR: CP lockout marker count = $COUNT"
-            exit 1
-          fi
 
           grep -n -A8 -B8 \
             'XCOVER4S: blocked cellular CP_POWER_ON' \
@@ -309,23 +332,23 @@ jobs:
 
           echo
           echo "========================================"
-          echo "VERIFY MODEM DRIVER WAS NOT MODIFIED"
+          echo "VERIFY SS310AP DRIVER UNTOUCHED"
           echo "========================================"
 
           if ! git diff --quiet -- \
             drivers/misc/modem_v1/modem_ctrl_ss310ap.c
           then
-            echo "ERROR: SS310AP modem driver was unexpectedly modified"
+            echo "ERROR: SS310AP modem driver was modified"
             git diff -- \
               drivers/misc/modem_v1/modem_ctrl_ss310ap.c
             exit 1
           fi
 
-          echo "OK: modem driver untouched"
+          echo "OK: SS310AP driver untouched"
 
           echo
           echo "========================================"
-          echo "VERIFY SELINUX"
+          echo "SELINUX SOURCE"
           echo "========================================"
 
           grep -RInE \
@@ -334,7 +357,7 @@ jobs:
             || true
 
           echo
-          echo "SOURCE CHECK PASSED"
+          echo "FINAL SOURCE CHECK PASSED"
 
       # ============================================================
       # BUILD
@@ -394,10 +417,10 @@ jobs:
           exit "$STATUS"
 
       # ============================================================
-      # VERIFY RESULT
+      # STRICT RESULT VERIFICATION
       # ============================================================
 
-      - name: Verify kernel
+      - name: Verify successful kernel
         working-directory: ${{ env.KERNEL_DIR }}
         shell: bash
         run: |
@@ -405,10 +428,23 @@ jobs:
 
           IMAGE="out/arch/arm64/boot/Image"
 
-          test -f "$IMAGE"
+          if [ ! -f "$IMAGE" ]; then
+            echo "ERROR: Kernel Image does not exist"
+            exit 1
+          fi
 
+          SIZE="$(stat -c%s "$IMAGE")"
+
+          echo "Kernel size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 20000000 ]; then
+            echo "ERROR: Kernel Image unexpectedly small"
+            exit 1
+          fi
+
+          echo
           echo "========================================"
-          echo "KERNEL BUILT"
+          echo "KERNEL BUILD PASSED"
           echo "========================================"
 
           ls -lh "$IMAGE"
@@ -424,13 +460,13 @@ jobs:
             out/.config
 
           echo
-          echo "CP LOCKOUT:"
-          grep -n \
-            "XCOVER4S: blocked cellular CP_POWER_ON" \
+          echo "CP HARD OFF:"
+          grep -nF \
+            'pr_info("XCOVER4S: blocked cellular CP_POWER_ON\n");' \
             drivers/soc/samsung/pmu-cp.c
 
       # ============================================================
-      # IMPORTANT BUILD MESSAGES
+      # SHOW IMPORTANT MESSAGES
       # ============================================================
 
       - name: Show important messages
@@ -450,66 +486,58 @@ jobs:
           fi
 
       # ============================================================
-      # PACKAGE
+      # PACKAGE ONLY AFTER SUCCESS
       # ============================================================
 
-      - name: Package results
-        if: always()
+      - name: Package successful kernel
         shell: bash
         run: |
-          mkdir -p artifacts
+          set -eux
 
           IMAGE="${KERNEL_DIR}/out/arch/arm64/boot/Image"
 
-          if [ -f "$IMAGE" ]; then
-            cp \
-              "$IMAGE" \
-              artifacts/Image-CP-HARD-OFF-SELINUX-PERMISSIVE-v2
-          fi
+          test -f "$IMAGE"
 
-          if [ -f "${KERNEL_DIR}/out/.config" ]; then
-            cp \
-              "${KERNEL_DIR}/out/.config" \
-              artifacts/kernel-config
-          fi
+          mkdir -p artifacts
 
-          if [ -f "${KERNEL_DIR}/build.log" ]; then
-            cp \
-              "${KERNEL_DIR}/build.log" \
-              artifacts/build.log
-          fi
+          cp \
+            "$IMAGE" \
+            artifacts/Image-CP-HARD-OFF-SELINUX-PERMISSIVE-v3
 
-          if [ -f "${KERNEL_DIR}/pmu-cp.original.c" ]; then
-            cp \
-              "${KERNEL_DIR}/pmu-cp.original.c" \
-              artifacts/
-          fi
+          cp \
+            "${KERNEL_DIR}/out/.config" \
+            artifacts/kernel-config
 
-          if [ -f "${KERNEL_DIR}/drivers/soc/samsung/pmu-cp.c" ]; then
-            cp \
-              "${KERNEL_DIR}/drivers/soc/samsung/pmu-cp.c" \
-              artifacts/pmu-cp.PATCHED.c
-          fi
+          cp \
+            "${KERNEL_DIR}/build.log" \
+            artifacts/build.log
+
+          cp \
+            "${KERNEL_DIR}/pmu-cp.original.c" \
+            artifacts/
+
+          cp \
+            "${KERNEL_DIR}/drivers/soc/samsung/pmu-cp.c" \
+            artifacts/pmu-cp.PATCHED.c
 
           cd "${KERNEL_DIR}"
 
           git diff \
             -- security/selinux \
                drivers/soc/samsung/pmu-cp.c \
-            > ../artifacts/final-kernel.patch || true
+            > ../artifacts/final-kernel.patch
 
           cd ..
 
           echo "========================================"
-          echo "ARTIFACTS"
+          echo "FINAL ARTIFACTS"
           echo "========================================"
 
           ls -lh artifacts/
 
-      - name: Upload kernel
-        if: always()
+      - name: Upload successful kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-CP-HARD-OFF-SELINUX-PERMISSIVE-v2
+          name: xcover4s-CP-HARD-OFF-SELINUX-PERMISSIVE-v3
           path: artifacts/
           if-no-files-found: error
