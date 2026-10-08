@@ -1,13 +1,13 @@
 
-name: XCOVER4S V29 EVENT LOG FIX
+name: XCOVER4S V30 DECON DIAGNOSTICS
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  diagnose:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 15
 
     steps:
       - name: Install tools
@@ -17,117 +17,69 @@ jobs:
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev libelf-dev cpio
+            bc bison flex libssl-dev libelf-dev
 
       - name: Clone kernel
         run: |
           set -euo pipefail
-          mkdir -p diagnostics
           git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-          git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
+          mkdir -p diagnostics
 
-      - name: Apply V29 patches
+      - name: Inspect DECON source
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          cd kernel
 
-          def replace_once(path, old, new):
-              p = Path(path)
-              s = p.read_text()
-              if s.count(old) != 1:
-                  raise SystemExit(
-                      f"Patch mismatch in {path}: {old}"
-                  )
-              p.write_text(s.replace(old, new))
+          BASE=drivers/video/fbdev/exynos/dpu_7885
 
-          cp = Path(
-              "kernel/drivers/soc/samsung/cal-if/cal-if.c"
-          )
-          s = cp.read_text()
+          {
+            echo "=== SOURCE COMMIT ==="
+            git rev-parse HEAD
 
-          patches = [
-              (
-                  r'(void cal_cp_init\(void\)\s*\{\s*)'
-                  r'pmucal_cp_init\(\);',
-                  'pr_warn("V29 CP init blocked");\n'
-                  '\tpmucal_cp_reset_assert();'
-              ),
-              (
-                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
-                  r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V29 CP release blocked");\n'
-                  '\tpmucal_cp_reset_assert();'
-              )
-          ]
+            echo
+            echo "=== KCONFIG DEFINITIONS ==="
+            grep -RnE \
+              'config DECON_EVENT_LOG|DECON_EVENT_LOG|DPU_EVENT_LOG_MAX' \
+              --include='Kconfig*' \
+              --include='*.h' \
+              --include='*.c' \
+              "$BASE" || true
 
-          for pattern, body in patches:
-              s, count = re.subn(
-                  pattern,
-                  lambda m, b=body: m.group(1) + b,
-                  s
-              )
-              if count != 1:
-                  raise SystemExit(
-                      f"CP patch mismatch: {count}"
-                  )
+            echo
+            echo "=== EVENT LOG FIELD REFERENCES ==="
+            grep -RnE \
+              'event_log_idx|event_log\[|DPU_EVENT_LOG_MAX' \
+              "$BASE" || true
 
-          cp.write_text(s)
+            echo
+            echo "=== DECON DEBUG STRUCTURE ==="
+            grep -n -A110 -B15 \
+              'struct decon_debug' \
+              "$BASE/decon.h" || true
 
-          base = (
-              "kernel/drivers/video/fbdev/exynos/"
-              "dpu_7885/"
-          )
+            echo
+            echo "=== DECON ABD RELEVANT SOURCE ==="
+            sed -n '800,950p' \
+              "$BASE/decon_abd.c"
 
-          replace_once(
-              base + "decon_reg.c",
-              "const double decon_clocks_table[][CLK_ID_MAX]",
-              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-          )
+            echo
+            echo "=== DECON HEADER DEBUG MACROS ==="
+            sed -n '830,970p' \
+              "$BASE/decon.h"
 
-          replace_once(
-              base + "decon.h",
-              "#define decon_create_debugfs(...) do { } while(0)",
-              "#define decon_create_debugfs(...) (0)"
-          )
+            echo
+            echo "=== KCONFIG AND MAKEFILES ==="
+            grep -RnE \
+              'DECON_EVENT_LOG|DECON_DEBUG|DPU_DEBUG' \
+              "$BASE/Kconfig" \
+              "$BASE/Makefile" \
+              arch/arm64/configs/lineage_xcover4s_defconfig \
+              2>/dev/null || true
 
-          replace_once(
-              base + "decon.h",
-              "#define decon_destroy_debugfs(..) do { } while(0)",
-              "#define decon_destroy_debugfs(...) do { } while(0)"
-          )
+          } > ../diagnostics/source-analysis.txt 2>&1
 
-          # Retain the V27 provisional fence length fix.
-          helper = Path(base + "helper.c")
-          hs = helper.read_text()
-
-          if "ACQUIRE_FENCE_LEN" not in hs:
-              raise SystemExit("Fence symbol not found")
-
-          if re.search(
-              r'^\s*#\s*define\s+ACQUIRE_FENCE_LEN\b',
-              hs,
-              re.M
-          ):
-              raise SystemExit(
-                  "Fence length already defined in helper.c"
-              )
-
-          helper.write_text(
-              "#ifndef ACQUIRE_FENCE_LEN\n"
-              "#define ACQUIRE_FENCE_LEN 1024\n"
-              "#endif\n\n"
-              + hs
-          )
-
-          print("V29 source patches applied")
-          PY
-
-          git -C kernel diff > diagnostics/v29.patch
-
-      - name: Configure kernel
+      - name: Test kernel configuration
         run: |
           set -euo pipefail
           cd kernel
@@ -137,110 +89,56 @@ jobs:
 
           make O=out lineage_xcover4s_defconfig
 
-          scripts/config --file out/.config \
-            -d DEBUG_INFO \
-            -d DEBUG_INFO_DWARF4 \
-            -d DEBUG_INFO_DWARF5 \
-            -d DEBUG_INFO_BTF \
-            -d DEBUG_INFO_BTF_MODULES \
-            -d KALLSYMS_ALL
+          {
+            echo "=== ORIGINAL CONFIG ==="
+            grep -E \
+              'DECON_EVENT_LOG|DECON_DEBUG|DPU_DEBUG' \
+              out/.config || true
 
-          scripts/config --file out/.config \
-            -e SECURITY_SELINUX \
-            -e SECURITY_SELINUX_DEVELOP \
-            -e SECURITY_SELINUX_BOOTPARAM \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+            echo
+            echo "=== REQUEST ENABLE ==="
+            scripts/config --file out/.config \
+              -e DECON_EVENT_LOG
 
-          # V29: enable DECON event logging.
-          scripts/config --file out/.config \
-            -e DECON_EVENT_LOG
+            grep DECON_EVENT_LOG out/.config || true
 
-          make O=out olddefconfig
+            echo
+            echo "=== RUN OLDDEFCONFIG ==="
+            make O=out olddefconfig
 
-          grep '^CONFIG_DECON_EVENT_LOG=y$' out/.config
+            echo
+            echo "=== FINAL CONFIG ==="
+            grep -E \
+              'DECON_EVENT_LOG|DECON_DEBUG|DPU_DEBUG' \
+              out/.config || true
+
+            echo
+            echo "=== SYMBOL PRESENT? ==="
+            if grep -q '^CONFIG_DECON_EVENT_LOG=y$' out/.config; then
+              echo "RESULT: ENABLED"
+            else
+              echo "RESULT: NOT ENABLED"
+              echo "Possible missing Kconfig symbol or dependency"
+            fi
+
+          } > ../diagnostics/config-analysis.txt 2>&1
 
           cp out/.config ../diagnostics/final.config
 
-      - name: Fast targeted compile test
+      - name: Print results
+        if: always()
         run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 \
-            drivers/soc/samsung/cal-if/cal-if.o \
-            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
-            drivers/video/fbdev/exynos/dpu_7885/decon_core.o \
-            drivers/video/fbdev/exynos/dpu_7885/helper.o \
-            drivers/video/fbdev/exynos/dpu_7885/decon_abd.o \
-            2>&1 | tee ../diagnostics/targeted-build.log
-
-      - name: Full kernel build
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 Image \
-            2>&1 | tee ../diagnostics/build.log
-
-      - name: Package results
-        run: |
-          set -euo pipefail
-
-          IMAGE=kernel/out/arch/arm64/boot/Image
-          test -s "$IMAGE"
-
-          mkdir -p artifact
-          SIZE=$(stat -c%s "$IMAGE")
-
-          {
-            echo "V29 kernel size: $SIZE bytes"
-            echo "Boot partition capacity: 37748736 bytes"
-            echo "Final boot.img fit not yet verified"
-          } | tee diagnostics/kernel-size.txt
-
-          cp "$IMAGE" artifact/Image
-          cp diagnostics/v29.patch artifact/v29.patch
-          cp diagnostics/final.config artifact/final.config
-          cp diagnostics/kernel-size.txt artifact/kernel-size.txt
-
-          sha256sum artifact/Image > artifact/SHA256SUMS
-
-          cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V29
-
-          DECON_EVENT_LOG enabled.
-          CP reset-assert patch included.
-          Physical CP power-off is unverified.
-
-          SELinux permissive boot setting requested.
-          Runtime SELinux state is unverified.
-
-          ACQUIRE_FENCE_LEN uses provisional value 1024.
-          Confirm upstream intended value before flashing.
-
-          NOT FLASHABLE YET.
-          Boot image repacking and validation required.
-          EOF
-
-      - name: Upload kernel
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCOVER4S-V29-KERNEL
-          path: artifact/
+          for file in diagnostics/*.txt; do
+            if [ -f "$file" ]; then
+              echo "===== $file ====="
+              cat "$file"
+            fi
+          done
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V29-DIAGNOSTICS
+          name: XCOVER4S-V30-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
