@@ -24,12 +24,15 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+
           mkdir -p diagnostics
-          git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
+          git -C kernel rev-parse HEAD \
+            > diagnostics/source-commit.txt
 
       - name: Apply V25 patches
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -39,12 +42,14 @@ jobs:
 
           patches = [
               (
-                  r'(void cal_cp_init\(void\)\s*\{\s*)pmucal_cp_init\(\);',
+                  r'(void cal_cp_init\(void\)\s*\{\s*)'
+                  r'pmucal_cp_init\(\);',
                   'pr_warn("V25 CP init blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               ),
               (
-                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)pmucal_cp_reset_release\(\);',
+                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
+                  r'pmucal_cp_reset_release\(\);',
                   'pr_warn("V25 CP release blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               )
@@ -57,7 +62,9 @@ jobs:
                   s
               )
               if n != 1:
-                  raise SystemExit(f"CP patch failed: {n} matches")
+                  raise SystemExit(
+                      f"CP patch failed: {n} matches"
+                  )
 
           cp.write_text(s)
 
@@ -65,22 +72,28 @@ jobs:
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon_reg.c"
           )
+
           s = decon.read_text()
           old = "const double decon_clocks_table[][CLK_ID_MAX]"
           new = "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
+
           if s.count(old) != 1:
               raise SystemExit("decon_reg.c patch failed")
+
           decon.write_text(s.replace(old, new))
 
           header = Path(
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon.h"
           )
+
           s = header.read_text()
           old = "#define decon_destroy_debugfs(..)"
           new = "#define decon_destroy_debugfs(...)"
+
           if s.count(old) != 1:
               raise SystemExit("decon.h patch failed")
+
           header.write_text(s.replace(old, new))
 
           print("All V25 patches applied")
@@ -88,7 +101,7 @@ jobs:
 
           git -C kernel diff > diagnostics/v25.patch
 
-      - name: Configure
+      - name: Configure kernel
         run: |
           set -euo pipefail
           cd kernel
@@ -113,6 +126,7 @@ jobs:
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=out olddefconfig
+
           cp out/.config ../diagnostics/final.config
 
       - name: Fast targeted test
@@ -154,9 +168,9 @@ jobs:
 
           {
             echo "V25 Image: $SIZE bytes"
-            echo "Current kernel reference: 23327848 bytes"
+            echo "Original kernel: 23327848 bytes"
             echo "Boot partition: 37748736 bytes"
-            echo "Actual fit must be checked after boot image repacking."
+            echo "Actual fit requires boot image repacking."
           } | tee diagnostics/kernel-size.txt
 
           cp "$IMAGE" artifact/Image
