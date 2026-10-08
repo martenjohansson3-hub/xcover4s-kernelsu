@@ -1,4 +1,4 @@
-name: XCover4s Kernel - SELinux Permissive
+name: XCover4s Kernel - SELinux Permissive Test
 
 on:
   workflow_dispatch:
@@ -8,7 +8,10 @@ permissions:
 
 env:
   KERNEL_DIR: kernel
+  KERNEL_REPO: https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git
+  KERNEL_BRANCH: lineage-18.1
   KERNEL_DEFCONFIG: lineage_xcover4s_defconfig
+
   ARCH: arm64
   CC: clang
   CLANG_TRIPLE: aarch64-linux-gnu-
@@ -19,15 +22,18 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
+
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 1
 
       - name: Install build dependencies
         run: |
+          set -eux
+
           sudo apt-get update
+
           sudo apt-get install -y \
             bc \
             bison \
@@ -44,60 +50,44 @@ jobs:
             make \
             cpio \
             rsync \
-            python3
+            python3 \
+            git \
+            curl
 
-      - name: Check kernel tree
+      - name: Clone XCover4s kernel
         run: |
           set -eux
-          test -d "$KERNEL_DIR"
+
+          rm -rf "$KERNEL_DIR"
+
+          git clone \
+            --depth 1 \
+            --branch "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" \
+            "$KERNEL_DIR"
+
           test -f "$KERNEL_DIR/Makefile"
           test -f "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
 
-          echo "Kernel:"
-          git -C "$KERNEL_DIR" rev-parse --short HEAD || true
+          echo "=== KERNEL ==="
+          git -C "$KERNEL_DIR" rev-parse HEAD
 
-          echo "Defconfig:"
-          ls -l "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
+          echo "=== DEFCONFIG ==="
+          ls -lh "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
 
       - name: Locate SELinux enforcement code
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -eux
 
-          echo "=== SELinux enforcement references ==="
+          echo "=== SELINUX REFERENCES ==="
 
           grep -RInE \
             "selinux_enforcing|SELINUX_ENFORCING|security_setenforce" \
-            security/selinux security 2>/dev/null | head -100 || true
+            security/selinux security 2>/dev/null \
+            | head -100 || true
 
-      - name: Locate modem and RF power control
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set +e
-
-          echo "=== MODEM / RF / CP references ==="
-
-          grep -RInE \
-            "modem|cpif|cp_power|cp.*power|radio|rfkill|rf.*power|mif|modap|link_pm" \
-            arch/arm64 drivers include 2>/dev/null | head -300
-
-          echo
-          echo "=== REGULATOR references ==="
-
-          grep -RInE \
-            "regulator_(enable|disable)|regulator_get|regulator_bulk|regulator.*disable|regulator.*enable" \
-            drivers/regulator drivers/mfd drivers/power arch/arm64 2>/dev/null | head -300
-
-          echo
-          echo "=== DEVICE TREE modem/RF/regulator references ==="
-
-          grep -RInE \
-            "modem|cpif|cp_power|vdd.*cp|vdd.*modem|regulator.*cp|regulator.*modem|mif|modap" \
-            arch/arm64/boot/dts 2>/dev/null | head -300
-
-          true
-
-      - name: Apply SELinux permissive kernel change
+      - name: Apply SELinux permissive default
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -eux
@@ -106,98 +96,151 @@ jobs:
           from pathlib import Path
           import re
 
-          candidates = []
+          matches = []
 
           for p in Path("security/selinux").rglob("*.c"):
-              try:
-                  s = p.read_text(errors="ignore")
-              except Exception:
-                  continue
+              text = p.read_text(errors="ignore")
 
-              if "selinux_enforcing" in s:
-                  candidates.append((p, s))
+              if "selinux_enforcing" in text:
+                  matches.append((p, text))
 
           print("SELinux candidate files:")
-          for p, _ in candidates:
+
+          for p, _ in matches:
               print("  ", p)
 
-          if not candidates:
-              raise SystemExit("ERROR: Could not find selinux_enforcing")
+          if not matches:
+              raise SystemExit(
+                  "ERROR: selinux_enforcing was not found."
+              )
 
           changed = []
 
-          for p, s in candidates:
-              old = s
+          for p, text in matches:
+              original = text
 
-              # Common Android/Linux form:
-              # int selinux_enforcing = CONFIG_SECURITY_SELINUX_DEVELOP;
-              #
-              # We only alter a literal default of 1.
-              s = re.sub(
+              text = re.sub(
                   r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
                   r'\g<1>0\g<2>',
-                  s
+                  text
               )
 
-              if s != old:
-                  p.write_text(s)
+              if text != original:
+                  p.write_text(text)
                   changed.append(str(p))
 
-          if len(changed) != 1:
-              print("Changed files:", changed)
-              raise SystemExit(
-                  "ERROR: Expected exactly one unambiguous SELinux enforcement "
-                  "definition to change."
-              )
+          print("Changed files:")
 
-          print("Changed:", changed[0])
+          for x in changed:
+              print("  ", x)
+
+          if len(changed) != 1:
+              raise SystemExit(
+                  "ERROR: Expected exactly one SELinux "
+                  "enforcement definition to change."
+              )
           PY
 
           echo
-          echo "=== VERIFY SELinux CHANGE ==="
-          grep -RInE "selinux_enforcing" security/selinux
+          echo "=== SELINUX AFTER CHANGE ==="
 
-      - name: Preserve Wi-Fi and GNSS
+          grep -RInE \
+            "selinux_enforcing\s*=" \
+            security/selinux 2>/dev/null
+
+      - name: Locate modem RF and regulator control
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set +e
+
+          echo
+          echo "========================================"
+          echo "MODEM / CP / RF REFERENCES"
+          echo "========================================"
+
+          grep -RInE \
+            "modem|cpif|cp_power|cp.*power|modap|link_pm|mif|radio" \
+            arch/arm64 drivers include 2>/dev/null \
+            | head -400
+
+          echo
+          echo "========================================"
+          echo "REGULATOR REFERENCES"
+          echo "========================================"
+
+          grep -RInE \
+            "regulator_(enable|disable)|regulator_get|regulator_bulk|regulator.*disable|regulator.*enable" \
+            drivers arch/arm64 2>/dev/null \
+            | head -400
+
+          echo
+          echo "========================================"
+          echo "DEVICE TREE MODEM / RF / POWER"
+          echo "========================================"
+
+          grep -RInE \
+            "modem|cpif|cp_power|vdd.*cp|vdd.*modem|regulator.*cp|regulator.*modem|modap|mif" \
+            arch/arm64/boot/dts 2>/dev/null \
+            | head -400
+
+          echo
+          echo "NOTE:"
+          echo "No modem/RF regulator is disabled by this test."
+          echo "This step is identification only."
+
+          true
+
+      - name: Verify WiFi and GNSS remain untouched
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -eux
 
-          echo "No Wi-Fi/GNSS source files are modified by this workflow."
+          echo "WiFi/GNSS source code is not modified."
 
           git diff -- \
-            ':(exclude)security/selinux/*' \
-            'arch/arm64/boot/dts' \
-            'drivers/net' \
-            'drivers/gps' \
-            'drivers/gnss' \
-            'drivers/media' || true
+            drivers/net \
+            drivers/gnss \
+            drivers/gps \
+            arch/arm64/boot/dts \
+            2>/dev/null || true
 
-      - name: Prepare output
+      - name: Prepare kernel configuration
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -eux
 
-          make O="$PWD/out" ARCH="$ARCH" \
+          rm -rf out
+
+          make \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
             "$KERNEL_DEFCONFIG"
 
-          # Force SELinux support and development mode where available.
-          ./scripts/config --file "$PWD/out/.config" \
+          ./scripts/config \
+            --file "$PWD/out/.config" \
             -e SECURITY_SELINUX || true
 
-          ./scripts/config --file "$PWD/out/.config" \
+          ./scripts/config \
+            --file "$PWD/out/.config" \
             -e SECURITY_SELINUX_DEVELOP || true
 
-          ./scripts/config --file "$PWD/out/.config" \
+          ./scripts/config \
+            --file "$PWD/out/.config" \
             -e SECURITY_SELINUX_BOOTPARAM || true
 
-          make O="$PWD/out" ARCH="$ARCH" olddefconfig
+          make \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            olddefconfig
 
-          echo "=== SELINUX CONFIG ==="
+          echo
+          echo "=== FINAL SELINUX CONFIG ==="
+
           grep -E \
-            'CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM' \
-            "$PWD/out/.config" || true
+            "CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM" \
+            out/.config || true
 
-      - name: Build kernel
+      - name: Build full kernel
         working-directory: ${{ env.KERNEL_DIR }}
         env:
           KCFLAGS: -Wno-error
@@ -211,7 +254,8 @@ jobs:
             CLANG_TRIPLE="$CLANG_TRIPLE" \
             CROSS_COMPILE="$CROSS_COMPILE" \
             KCFLAGS="$KCFLAGS" \
-            Image dtbs
+            Image dtbs \
+            2>&1 | tee build.log
 
       - name: Verify kernel
         working-directory: ${{ env.KERNEL_DIR }}
@@ -220,15 +264,27 @@ jobs:
 
           test -f out/arch/arm64/boot/Image
 
-          echo "=== KERNEL IMAGE ==="
+          echo
+          echo "========================================"
+          echo "KERNEL IMAGE"
+          echo "========================================"
+
           ls -lh out/arch/arm64/boot/Image
 
-          echo "=== SHA256 ==="
+          echo
+          echo "========================================"
+          echo "SHA256"
+          echo "========================================"
+
           sha256sum out/arch/arm64/boot/Image
 
-          echo "=== CONFIG SELINUX ==="
+          echo
+          echo "========================================"
+          echo "SELINUX CONFIG"
+          echo "========================================"
+
           grep -E \
-            'CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM' \
+            "CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM" \
             out/.config || true
 
       - name: Package artifacts
@@ -245,11 +301,16 @@ jobs:
             "${KERNEL_DIR}/out/.config" \
             artifacts/kernel-config
 
+          cp \
+            "${KERNEL_DIR}/build.log" \
+            artifacts/build.log
+
           tar -czf \
             artifacts/xcover4s-kernel-selinux-permissive.tar.gz \
             -C artifacts \
             Image-permissive \
-            kernel-config
+            kernel-config \
+            build.log
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
