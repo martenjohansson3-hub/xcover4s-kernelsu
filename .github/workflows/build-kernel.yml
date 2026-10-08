@@ -1,5 +1,5 @@
 
-name: XCOVER4S V43 DISPLAY FIX DIAGNOSTICS
+name: XCOVER4S V44 FIX AND FULL BUILD
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     env:
       ARCH: arm64
@@ -21,10 +21,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare
-        run: mkdir -p dist
+      - name: Prepare output
+        run: |
+          mkdir -p dist
+          echo "V44 - NOT FLASH READY" > dist/status.txt
 
-      - name: Install build tools
+      - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -33,9 +35,9 @@ jobs:
             binutils-aarch64-linux-gnu \
             build-essential bc bison flex \
             libssl-dev libelf-dev \
-            libncurses-dev python3 cpio rsync
+            libncurses-dev python3 cpio rsync file
 
-      - name: Clone kernel
+      - name: Clone pinned kernel
         run: |
           set -euo pipefail
           git clone --branch lineage-18.1 \
@@ -44,91 +46,225 @@ jobs:
             kernel
           git -C kernel checkout \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git -C kernel rev-parse HEAD \
+            > dist/source-commit.txt
 
-      - name: Capture display clock code
+      - name: Fix display floating point compilation
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
 
-          FILE=kernel/drivers/video/fbdev/exynos/dpu_7885/decon_reg.c
+          p = Path(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c"
+          )
 
-          sed -n '2390,2520p' "$FILE" \
-            > dist/display-clock-source.txt
+          s = p.read_text()
+          old = "const double decon_clocks_table[][CLK_ID_MAX]"
+          new = "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
 
-          grep -RnE \
-            'struct decon_clocks|decon_clocks_table|CLK_ID_VCLK' \
-            kernel/drivers/video/fbdev/exynos/dpu_7885 \
-            > dist/display-clock-references.txt || true
+          if s.count(old) != 1:
+              raise SystemExit(
+                  "Unexpected display source. Patch aborted."
+              )
 
-          cp "$FILE" dist/decon_reg-original.c
+          s = s.replace(old, new, 1)
+          p.write_text(s)
 
-          echo "Display clock source captured."
+          print("Display clock table fixed.")
+          PY
+
+      - name: Apply V42 CP start denial
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "kernel/drivers/soc/samsung/cal-if/"
+              "pmucal_cp.c"
+          )
+          s = p.read_text()
+
+          for header in (
+              "#include <linux/errno.h>",
+              "#include <linux/printk.h>"
+          ):
+              if header not in s:
+                  s = header + "\n" + s
+
+          for name in (
+              "pmucal_cp_init",
+              "pmucal_cp_reset_release"
+          ):
+              pattern = (
+                  r"(int\s+" + re.escape(name) +
+                  r"\s*\(\s*void\s*\)\s*\{\s*"
+                  r"int\s+ret\s*;)"
+              )
+
+              def patch(match):
+                  return (
+                      match.group(1) +
+                      "\n\t/* CPLOCK_V44 */\n"
+                      '\tpr_warn("CPLOCK V44: denied '
+                      + name + '\\n");\n'
+                      "\treturn -EPERM;\n"
+                  )
+
+              s, count = re.subn(
+                  pattern, patch, s, count=1
+              )
+
+              if count != 1:
+                  raise SystemExit(
+                      "CP patch failed: " + name
+                  )
+
+          p.write_text(s)
+          print("CP start denial applied.")
+          PY
+
+      - name: Save patch
+        run: |
+          git -C kernel diff > dist/v44.patch
+          test -s dist/v44.patch
 
       - name: Configure kernel
         run: |
           set -euo pipefail
-
           make -C kernel O=out \
             lineage_xcover4s_defconfig \
             2>&1 | tee dist/configure.log
+          cp kernel/out/.config dist/kernel.config
 
-      - name: Prepare kernel headers
+      - name: Prepare build
         run: |
           set -euo pipefail
-
           make -C kernel O=out -j2 prepare \
             2>&1 | tee dist/prepare.log
-
           make -C kernel O=out -j2 scripts \
             2>&1 | tee dist/scripts.log
 
-      - name: Compile only failing display object
-        shell: bash
+      - name: Fast display compile test
         run: |
-          set -uo pipefail
-
-          echo "Testing decon_reg.o only"
-
-          make -C kernel O=out -j1 \
+          set -euo pipefail
+          make -C kernel O=out -j2 \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
             2>&1 | tee dist/display-test.log
+          echo "DISPLAY PASS" > dist/display-result.txt
 
-          STATUS=${PIPESTATUS[0]}
+      - name: Fast CP compile test
+        run: |
+          set -euo pipefail
+          make -C kernel O=out -j2 \
+            drivers/soc/samsung/cal-if/pmucal_cp.o \
+            2>&1 | tee dist/cp-test.log
+          echo "CP COMPILE PASS" > dist/cp-result.txt
 
-          if [ "$STATUS" -eq 0 ]; then
-            echo PASS | tee dist/result.txt
-          else
-            echo FAIL | tee dist/result.txt
-          fi
+      - name: Full kernel build
+        run: |
+          set -euo pipefail
+          echo "Starting full kernel build"
+          make -C kernel O=out -j2 Image \
+            2>&1 | tee dist/build.log
+          echo "FULL BUILD PASS" > dist/build-result.txt
 
-          exit "$STATUS"
+      - name: Validate kernel Image
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
 
-      - name: Collect error details
+          p = Path(
+              "kernel/out/arch/arm64/boot/Image"
+          )
+
+          if not p.is_file():
+              raise SystemExit("Kernel Image missing")
+
+          with p.open("rb") as f:
+              f.seek(0x38)
+              magic = struct.unpack(
+                  "<I", f.read(4)
+              )[0]
+
+          if magic != 0x644D5241:
+              raise SystemExit(
+                  "Invalid ARM64 Image"
+              )
+
+          print("ARM64 kernel Image valid")
+          print("Size:", p.stat().st_size)
+          PY
+
+          cp kernel/out/arch/arm64/boot/Image \
+            dist/Image
+
+          sha256sum dist/Image \
+            > dist/Image.sha256
+
+          cat > dist/status.txt <<'EOF'
+          V44 FULL KERNEL BUILD PASSED
+
+          ARM64 Image: VALID
+          Display compile test: PASSED
+          CP compile test: PASSED
+
+          CP start denial: PATCHED
+          CP physical power off: NOT VERIFIED
+          CP permanent lock: NOT VERIFIED
+          Boot image: NOT CREATED
+          Odin TAR: NOT CREATED
+
+          FLASH READY: NO
+          DO NOT FLASH THE RAW IMAGE.
+          EOF
+
+      - name: Collect diagnostics
         if: always()
         run: |
           mkdir -p dist
 
-          if [ -f dist/display-test.log ]; then
-            grep -nEi \
-              'error:|fatal error:|Error [0-9]+' \
-              dist/display-test.log \
-              > dist/errors.txt || true
+          for name in \
+            display-test \
+            cp-test \
+            build
+          do
+            if [ -f "dist/$name.log" ]; then
+              grep -nEi \
+                'fatal error:|error:|undefined reference|Error [0-9]+' \
+                "dist/$name.log" \
+                > "dist/$name-errors.txt" || true
 
-            tail -100 dist/display-test.log \
-              > dist/build-tail.txt
+              tail -100 "dist/$name.log" \
+                > "dist/$name-tail.txt"
+            fi
+          done
+
+          if [ -d kernel/.git ]; then
+            git -C kernel diff \
+              > dist/v44.patch || true
           fi
 
-          if [ ! -f dist/result.txt ]; then
-            echo INCOMPLETE > dist/result.txt
-          fi
+          {
+            echo "XCOVER4S V44"
+            echo "Run: $GITHUB_RUN_ID"
+            echo "Flash ready: NO"
+            echo
+            find dist -maxdepth 1 \
+              -type f -printf '%f %s bytes\n'
+          } > dist/diagnostics.txt
 
-          echo "Diagnostic only. Do not flash." \
-            > dist/flash-status.txt
-
-      - name: Upload diagnostics
+      - name: Upload V44 results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V43-DISPLAY-DIAGNOSTICS
+          name: XCOVER4S-V44-BUILD
           path: dist/
-          retention-days: 30
           if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
