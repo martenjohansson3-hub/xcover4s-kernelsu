@@ -1,51 +1,246 @@
-          print('V35 patched modem_v1 SS310AP power-on request to CP_POWER_OFF')
+
+name: XCOVER4S V35 CP POWER OFF EXPERIMENT
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev cpio
+
+      - name: Clone exact V34 source
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics artifact
+          git clone --depth 1 --branch lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
+
+      - name: Apply V33.1 baseline and V35 experimental power-off
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('kernel')
+
+          def exact(path, old, new):
+              p = root / path
+              s = p.read_text()
+              if s.count(old) != 1:
+                  raise SystemExit(
+                      f'Expected exactly one occurrence in {path}: {old[:80]}'
+                  )
+              p.write_text(s.replace(old, new))
+
+          base = 'drivers/video/fbdev/exynos/dpu_7885/'
+
+          exact(
+              base + 'decon_reg.c',
+              'const double decon_clocks_table[][CLK_ID_MAX]',
+              'const unsigned long decon_clocks_table[][CLK_ID_MAX]'
+          )
+
+          exact(
+              base + 'decon.h',
+              '#define decon_create_debugfs(...) do { } while(0)',
+              '#define decon_create_debugfs(...) (0)'
+          )
+
+          exact(
+              base + 'decon.h',
+              '#define decon_destroy_debugfs(..) do { } while(0)',
+              '#define decon_destroy_debugfs(...) do { } while(0)'
+          )
+
+          helper = root / (base + 'helper.c')
+          hs = helper.read_text()
+
+          if '#define ACQUIRE_FENCE_LEN' not in hs:
+              helper.write_text(
+                  '#ifndef ACQUIRE_FENCE_LEN\n'
+                  '#define ACQUIRE_FENCE_LEN 1024\n'
+                  '#endif\n\n' + hs
+              )
+
+          abd = root / (base + 'decon_abd.c')
+          s = abd.read_text()
+
+          pattern = (
+              r'(static void decon_abd_print_ss_log'
+              r'\(struct abd_protect \*abd, struct seq_file \*m\)'
+              r'\s*\{)[\s\S]*?(\n\}\n)'
+          )
+
+          s, n = re.subn(
+              pattern,
+              r'\1\n\t/* V35: disabled event log reader '
+              r'(V33.1 baseline) */\n\2',
+              s,
+              count=1
+          )
+
+          if n != 1:
+              raise SystemExit('ABD function not found')
+
+          abd.write_text(s)
+
+          # Experimental SS310AP power-off request.
+          # Not proof of electrical isolation.
+          modem = root / 'drivers/misc/modem_v1/modem_ctrl_ss310ap.c'
+          src = modem.read_text()
+
+          old = 'exynos_set_cp_power_onoff(CP_POWER_ON);'
+          count = src.count(old)
+
+          if count != 1:
+              raise SystemExit(
+                  f'SS310AP power-on call count {count}, expected 1'
+              )
+
+          src = src.replace(
+              old,
+              'exynos_set_cp_power_onoff(CP_POWER_OFF); '
+              '/* V35 experimental */'
+          )
+
+          modem.write_text(src)
+
+          # Retain V33.1 CP reset guard.
+          cal = root / 'drivers/soc/samsung/cal-if/cal-if.c'
+          src = cal.read_text()
+
+          for fn, oldcall in [
+              ('cal_cp_init', 'pmucal_cp_init();'),
+              ('cal_cp_reset_release', 'pmucal_cp_reset_release();')
+          ]:
+              pattern = (
+                  r'(void ' + fn + r'\(void\)\s*\{\s*)'
+                  + re.escape(oldcall)
+              )
+
+              src, n = re.subn(
+                  pattern,
+                  lambda m: m.group(1)
+                  + 'pmucal_cp_reset_assert(); '
+                  '/* V35 reset guard */',
+                  src,
+                  count=1
+              )
+
+              if n != 1:
+                  raise SystemExit('Cannot guard ' + fn)
+
+          cal.write_text(src)
+
+          print('V35 SS310AP power-off patch applied')
           PY
+
           git -C kernel diff > diagnostics/v35.patch
-          grep -n -C 12 'V35 experimental' kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c > diagnostics/power-off-context.txt
-          grep -R -n 'CONFIG_.*MODEM\|CONFIG_.*SS310' kernel/arch/arm64/configs/lineage_xcover4s_defconfig > diagnostics/modem-config-hints.txt || true
+
+          grep -n -C 12 'V35 experimental' \
+            kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c \
+            > diagnostics/power-off-context.txt
+
+          grep -R -n 'CONFIG_.*MODEM\|CONFIG_.*SS310' \
+            kernel/arch/arm64/configs/lineage_xcover4s_defconfig \
+            > diagnostics/modem-config-hints.txt || true
+
       - name: Configure kernel
         run: |
           set -euo pipefail
           cd kernel
-          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
           make O=out lineage_xcover4s_defconfig
-          scripts/config --file out/.config -d DEBUG_INFO -d DEBUG_INFO_BTF -d KALLSYMS_ALL -e SECURITY_SELINUX -e SECURITY_SELINUX_DEVELOP -e SECURITY_SELINUX_BOOTPARAM --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+
+          scripts/config --file out/.config \
+            -d DEBUG_INFO \
+            -d DEBUG_INFO_BTF \
+            -d KALLSYMS_ALL \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_DEVELOP \
+            -e SECURITY_SELINUX_BOOTPARAM \
+            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+
           make O=out olddefconfig
+
           cp out/.config ../diagnostics/final.config
-          grep -Ei 'MODEM|SS310|CP_PMUCAL' out/.config > ../diagnostics/modem-config.txt || true
+
+          grep -Ei 'MODEM|SS310|CP_PMUCAL' \
+            out/.config > ../diagnostics/modem-config.txt || true
+
       - name: Targeted compile first
         run: |
           set -euo pipefail
           cd kernel
-          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
-          make O=out -j2 drivers/misc/modem_v1/modem_ctrl_ss310ap.o drivers/soc/samsung/cal-if/cal-if.o drivers/video/fbdev/exynos/dpu_7885/decon_abd.o drivers/video/fbdev/exynos/dpu_7885/decon_reg.o drivers/video/fbdev/exynos/dpu_7885/decon_core.o drivers/video/fbdev/exynos/dpu_7885/helper.o 2>&1 | tee ../diagnostics/targeted-build.log
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
+
+          make O=out -j2 \
+            drivers/misc/modem_v1/modem_ctrl_ss310ap.o \
+            drivers/soc/samsung/cal-if/cal-if.o \
+            drivers/video/fbdev/exynos/dpu_7885/decon_abd.o \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
+            drivers/video/fbdev/exynos/dpu_7885/decon_core.o \
+            drivers/video/fbdev/exynos/dpu_7885/helper.o \
+            2>&1 | tee ../diagnostics/targeted-build.log
+
       - name: Full Image build
         run: |
           set -euo pipefail
           cd kernel
-          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
-          make O=out -j2 Image 2>&1 | tee ../diagnostics/full-build.log
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
+
+          make O=out -j2 Image \
+            2>&1 | tee ../diagnostics/full-build.log
+
       - name: Package kernel and warnings
         run: |
           set -euo pipefail
+
           cp kernel/out/arch/arm64/boot/Image artifact/Image
           cp diagnostics/v35.patch artifact/v35.patch
           cp diagnostics/final.config artifact/final.config
+
           sha256sum artifact/Image > artifact/SHA256SUMS
+
           cat > artifact/READ-ME-FIRST.txt <<'EOF'
           V35 IS EXPERIMENTAL AND NOT ODIN FLASHABLE.
-          V35 replaces one SS310AP modem_v1 CP_POWER_ON call with CP_POWER_OFF.
-          This may not be the active driver on XCover4s. Bootloop risk is substantial.
-          CP_POWER_OFF does NOT prove zero voltage on modem rails.
-          This build has NOT been boot-tested or hardware-verified.
-          Do not flash until active driver and hardware sequence are confirmed.
+
+          V35 replaces one SS310AP modem_v1
+          CP_POWER_ON call with CP_POWER_OFF.
+
+          This may not be the active XCover4s driver.
+          Bootloop risk is substantial.
+
+          CP_POWER_OFF does NOT prove zero voltage.
+          Hardware measurement is required.
+
+          This build has not been boot-tested.
+          Do not flash until verified.
           EOF
+
       - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: XCOVER4S-V35-EXPERIMENTAL-KERNEL
           path: artifact/
+
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
