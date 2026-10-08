@@ -1,5 +1,5 @@
 
-name: XCOVER4S V33 ABD FIX AND BUILD
+name: XCOVER4S V33.1 ABD FIX AND BUILD
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply V33 patches
+      - name: Apply V33.1 patches
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -48,13 +48,13 @@ jobs:
               (
                   r'(void cal_cp_init\(void\)\s*\{\s*)'
                   r'pmucal_cp_init\(\);',
-                  'pr_warn("V33 CP init blocked");\n'
+                  'pr_warn("V33.1 CP init blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               ),
               (
                   r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
                   r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V33 CP release blocked");\n'
+                  'pr_warn("V33.1 CP release blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               )
           ]:
@@ -104,10 +104,6 @@ jobs:
                   "#endif\n\n" + hs
               )
 
-          # ABD event-log reader references definitions
-          # that are unavailable in the current build.
-          # Locate the containing function by braces,
-          # rather than guessing its name.
           abd = Path(base + "decon_abd.c")
           src = abd.read_text()
 
@@ -115,7 +111,6 @@ jobs:
           if pos < 0:
               raise SystemExit("ABD event_log_idx not found")
 
-          # Locate nearest enclosing function opening.
           candidates = list(re.finditer(
               r'(?m)^[\w\s\*]+\b([A-Za-z_]\w*)'
               r'\s*\([^;{}]*\)\s*\{',
@@ -149,18 +144,16 @@ jobs:
               )
 
           original = src[start:end]
+
           if "event_log_idx" not in original:
               raise SystemExit("Wrong ABD function selected")
 
-          # Preserve the original source for diagnostics.
-          Path("diagnostics-abd-original.txt").write_text(
+          Path("diagnostics/abd-original.txt").write_text(
               original
           )
 
-          # Replace only the diagnostic reader with
-          # a minimal no-op body. Do not alter other ABD
-          # logic or any kernel structures.
           signature = src[start:opening]
+
           if not re.search(r'\bvoid\s+\w+\s*\(', signature):
               raise SystemExit(
                   "ABD reader is not void; refusing unsafe patch"
@@ -168,7 +161,7 @@ jobs:
 
           replacement = (
               signature + "{\n"
-              "\t/* V33: event-log reader disabled. */\n"
+              "\t/* V33.1: event-log reader disabled. */\n"
               "}\n"
           )
 
@@ -176,12 +169,10 @@ jobs:
               src[:start] + replacement + src[end:]
           )
 
-          print("V33 ABD reader patched")
+          print("V33.1 ABD reader patched")
           PY
 
-          cp kernel/diagnostics-abd-original.txt \
-            diagnostics/abd-original.txt
-          git -C kernel diff > diagnostics/v33.patch
+          git -C kernel diff > diagnostics/v33-1.patch
 
       - name: Configure kernel
         run: |
@@ -241,11 +232,12 @@ jobs:
       - name: Package results
         run: |
           set -euo pipefail
+
           IMAGE=kernel/out/arch/arm64/boot/Image
           test -s "$IMAGE"
 
           cp "$IMAGE" artifact/Image
-          cp diagnostics/v33.patch artifact/v33.patch
+          cp diagnostics/v33-1.patch artifact/v33-1.patch
           cp diagnostics/final.config artifact/final.config
 
           sha256sum artifact/Image > artifact/SHA256SUMS
@@ -253,9 +245,9 @@ jobs:
             > artifact/kernel-size.txt
 
           cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V33
+          XCOVER4S V33.1
 
-          Kernel compiled successfully.
+          Kernel compilation completed.
 
           ABD event-log reader disabled.
           CP reset-assert patch included.
@@ -271,13 +263,13 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V33-KERNEL
+          name: XCOVER4S-V33-1-KERNEL
           path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V33-DIAGNOSTICS
+          name: XCOVER4S-V33-1-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
