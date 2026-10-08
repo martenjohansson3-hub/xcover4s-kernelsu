@@ -1,4 +1,4 @@
-name: XCover4s - SELinux Permissive Kernel Build
+name: XCover4s - Clean SELinux Permissive Build
 
 on:
   workflow_dispatch:
@@ -25,8 +25,6 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Install dependencies
         run: |
@@ -53,7 +51,7 @@ jobs:
             python3 \
             git
 
-      - name: Clone XCover4s kernel
+      - name: Clone kernel
         run: |
           set -eux
 
@@ -68,6 +66,7 @@ jobs:
           test -f "$KERNEL_DIR/Makefile"
           test -f "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
 
+          echo
           echo "========================================"
           echo "KERNEL SOURCE OK"
           echo "========================================"
@@ -127,7 +126,7 @@ jobs:
 
           git diff -- security/selinux
 
-      - name: Find modem RF power control
+      - name: Find modem RF power paths
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set +e
@@ -140,17 +139,19 @@ jobs:
             grep -RInE \
               "modem|cpif|cp_power|cp.*power|modap|link_pm|mif|radio" \
               arch/arm64 drivers include \
-              2>/dev/null | head -500
+              2>/dev/null \
+              | head -500
 
             echo
             echo "========================================"
-            echo "REGULATORS"
+            echo "REGULATOR CONTROL"
             echo "========================================"
 
             grep -RInE \
               "regulator_(enable|disable)|regulator_get|regulator_bulk" \
               drivers arch/arm64 \
-              2>/dev/null | head -500
+              2>/dev/null \
+              | head -500
 
             echo
             echo "========================================"
@@ -160,7 +161,8 @@ jobs:
             grep -RInE \
               "modem|cpif|cp_power|vdd.*cp|vdd.*modem|regulator.*cp|regulator.*modem|modap|mif" \
               arch/arm64/boot/dts \
-              2>/dev/null | head -500
+              2>/dev/null \
+              | head -500
 
             echo
             echo "========================================"
@@ -170,7 +172,8 @@ jobs:
             grep -RInE \
               "CONFIG_.*(MODEM|CPIF|RADIO|RF|MIF|MODAP)" \
               arch/arm64/configs \
-              2>/dev/null | head -300
+              2>/dev/null \
+              | head -300
 
           } | tee modem-analysis.log
 
@@ -202,16 +205,21 @@ jobs:
             "CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM" \
             out/.config || true
 
-      - name: Build full kernel
+      - name: Build kernel - objdump garbage filtered
         working-directory: ${{ env.KERNEL_DIR }}
         env:
           KCFLAGS: -Wno-error
+        shell: bash
         run: |
           set -o pipefail
 
+          echo
           echo "========================================"
-          echo "BUILD START"
+          echo "FULL KERNEL BUILD"
+          echo "OBJDUMP WARNINGS ARE DISCARDED"
           echo "========================================"
+
+          FILTER='aarch64-linux-gnu-objdump: Warning:'
 
           make -j"$(nproc)" \
             O="$PWD/out" \
@@ -221,46 +229,36 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             KCFLAGS="$KCFLAGS" \
             Image dtbs \
-            > >(tee build-full.log \
-              | grep -v -E \
-              'aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x22|Unrecognized form: 0x23|Corrupt attribute|Corrupt attribute block length|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)') \
-            2> >(tee -a build-full.log >&2 \
-              | grep -v -E \
-              'aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x22|Unrecognized form: 0x23|Corrupt attribute|Corrupt attribute block length|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)' >&2)
+            2>&1 \
+            | grep --line-buffered -v -F "$FILTER" \
+            | tee build.log
 
-          BUILD_STATUS=$?
+          STATUS=${PIPESTATUS[0]}
 
           echo
           echo "========================================"
-          echo "BUILD EXIT CODE: $BUILD_STATUS"
+          echo "MAKE EXIT CODE: $STATUS"
           echo "========================================"
 
-          exit "$BUILD_STATUS"
+          exit "$STATUS"
 
-      - name: Create clean build log
+      - name: Show important build messages
         if: always()
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          if [ -f build-full.log ]; then
-
-            grep -v -E \
-              'aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x22|Unrecognized form: 0x23|Corrupt attribute|Corrupt attribute block length|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)' \
-              build-full.log \
-              > build-clean.log || true
-
-          else
-            touch build-clean.log
-          fi
-
           echo
           echo "========================================"
           echo "IMPORTANT BUILD MESSAGES"
           echo "========================================"
 
-          grep -iE \
-            "error:|fatal error:|undefined reference|warning:|FAILED|Error [0-9]+" \
-            build-clean.log \
-            | tail -200 || true
+          if [ -f build.log ]; then
+
+            grep -iE \
+              "error:|fatal error:|undefined reference|warning:|FAILED|Error [0-9]+" \
+              build.log \
+              | tail -300 || true
+
+          fi
 
       - name: Verify kernel
         working-directory: ${{ env.KERNEL_DIR }}
@@ -277,8 +275,18 @@ jobs:
           ls -lh out/arch/arm64/boot/Image
 
           echo
-          echo "SHA256:"
+          echo "SHA256"
           sha256sum out/arch/arm64/boot/Image
+
+          echo
+          echo "========================================"
+          echo "FINAL SELINUX ASSIGNMENTS"
+          echo "========================================"
+
+          grep -RInE \
+            "selinux_enforcing[[:space:]]*=" \
+            security/selinux \
+            2>/dev/null || true
 
       - name: Package results
         if: always()
@@ -297,16 +305,10 @@ jobs:
               artifacts/kernel-config
           fi
 
-          if [ -f "${KERNEL_DIR}/build-clean.log" ]; then
+          if [ -f "${KERNEL_DIR}/build.log" ]; then
             cp \
-              "${KERNEL_DIR}/build-clean.log" \
-              artifacts/build-clean.log
-          fi
-
-          if [ -f "${KERNEL_DIR}/build-full.log" ]; then
-            cp \
-              "${KERNEL_DIR}/build-full.log" \
-              artifacts/build-full.log
+              "${KERNEL_DIR}/build.log" \
+              artifacts/build.log
           fi
 
           if [ -f "${KERNEL_DIR}/modem-analysis.log" ]; then
@@ -315,10 +317,17 @@ jobs:
               artifacts/modem-analysis.log
           fi
 
+          echo
+          echo "========================================"
+          echo "ARTIFACTS"
+          echo "========================================"
+
+          ls -lh artifacts/
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-build-results
+          name: xcover4s-clean-build
           path: artifacts/
           if-no-files-found: warn
