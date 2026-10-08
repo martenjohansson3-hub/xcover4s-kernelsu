@@ -1,4 +1,4 @@
-name: XCover4s - Clean SELinux Permissive Build
+name: XCover4s - Permissive + SS310AP Analysis
 
 on:
   workflow_dispatch:
@@ -68,13 +68,14 @@ jobs:
 
           echo
           echo "========================================"
-          echo "KERNEL SOURCE OK"
+          echo "KERNEL SOURCE"
           echo "========================================"
 
           git -C "$KERNEL_DIR" rev-parse HEAD
 
-      - name: Force SELinux permissive
+      - name: Patch SELinux default permissive
         working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
         run: |
           set -eux
 
@@ -98,20 +99,20 @@ jobs:
                   p.write_text(text)
                   changed.append(str(p))
 
-          print("Changed SELinux files:")
+          print("Changed SELinux source files:")
 
           for p in changed:
               print("  " + p)
 
           if not changed:
               raise SystemExit(
-                  "ERROR: No SELinux enforcing assignment changed"
+                  "ERROR: No selinux_enforcing assignment was changed"
               )
           PY
 
           echo
           echo "========================================"
-          echo "SELINUX RESULT"
+          echo "SELINUX SOURCE AFTER PATCH"
           echo "========================================"
 
           grep -RInE \
@@ -121,66 +122,146 @@ jobs:
 
           echo
           echo "========================================"
-          echo "SELINUX DIFF"
+          echo "SELINUX SOURCE DIFF"
           echo "========================================"
 
           git diff -- security/selinux
 
-      - name: Find modem RF power paths
+      - name: Targeted SS310AP modem analysis
         working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
         run: |
           set +e
 
+          OUT="modem-analysis.log"
+
+          : > "$OUT"
+
           {
             echo "========================================"
-            echo "MODEM / CP / RF"
+            echo "XCOVER4S SS310AP MODEM ANALYSIS"
             echo "========================================"
+            echo
 
-            grep -RInE \
-              "modem|cpif|cp_power|cp.*power|modap|link_pm|mif|radio" \
-              arch/arm64 drivers include \
-              2>/dev/null \
-              | head -500
+            echo "===== SS310AP FILES ====="
+
+            find . -type f \
+              \( \
+                -iname '*ss310*' \
+                -o -iname '*s327*' \
+                -o -iname '*modem*' \
+                -o -iname '*cpif*' \
+              \) \
+              | sort
 
             echo
-            echo "========================================"
-            echo "REGULATOR CONTROL"
-            echo "========================================"
+            echo "===== SS310AP / S327AP REFERENCES ====="
 
             grep -RInE \
-              "regulator_(enable|disable)|regulator_get|regulator_bulk" \
-              drivers arch/arm64 \
-              2>/dev/null \
-              | head -500
+              "SS310AP|ss310ap|S327AP|s327ap" \
+              drivers \
+              arch/arm64 \
+              include \
+              2>/dev/null
 
             echo
-            echo "========================================"
-            echo "MODEM DEVICE TREE"
-            echo "========================================"
+            echo "===== XCOVER4S DTS REFERENCES ====="
 
             grep -RInE \
-              "modem|cpif|cp_power|vdd.*cp|vdd.*modem|regulator.*cp|regulator.*modem|modap|mif" \
+              "xcover4s|s327ap|ss310ap|modem|cpif" \
+              arch/arm64/boot/dts \
+              2>/dev/null
+
+            echo
+            echo "===== MODEM POWER FUNCTIONS ====="
+
+            grep -RInE \
+              "modem.*power|power.*modem|cp.*power|power.*cp|modem_on|modem_off|modem_reset|cp_on|cp_off|cp_reset|power_on|power_off" \
+              drivers \
+              arch/arm64 \
+              include \
+              2>/dev/null
+
+            echo
+            echo "===== GPIO / RESET / ACTIVE CONTROL ====="
+
+            grep -RInE \
+              "gpio.*cp|cp.*gpio|gpio.*modem|modem.*gpio|cp_reset|cp_on|cp_active|phone_active|pda_active|reset_req|cp_wakeup|ap_wakeup" \
+              drivers \
+              arch/arm64/boot/dts \
+              include \
+              2>/dev/null
+
+            echo
+            echo "===== REGULATORS NEAR MODEM / CP ====="
+
+            grep -RInE \
+              "vdd.*(cp|modem)|vcc.*(cp|modem)|(cp|modem).*vdd|(cp|modem).*vcc|regulator.*(cp|modem)|(cp|modem).*regulator" \
+              drivers \
+              arch/arm64/boot/dts \
+              include \
+              2>/dev/null
+
+            echo
+            echo "===== REGULATOR ENABLE / DISABLE ====="
+
+            grep -RInE \
+              "regulator_(get|enable|disable|force_disable)|devm_regulator_get" \
+              drivers \
+              2>/dev/null \
+              | grep -Ei \
+                "modem|cp|ss310|s327|mif|link" || true
+
+            echo
+            echo "===== MODEM CONTROL STRUCTURES ====="
+
+            grep -RInE \
+              "modem_ctl|modem_data|modem_ops|modemctl|modem_ctrl|cp_ctrl|cpif" \
+              drivers \
+              include \
+              2>/dev/null
+
+            echo
+            echo "===== MODEM CONFIG ====="
+
+            grep -RInE \
+              "CONFIG_.*(SS310|MODEM|CPIF|SIPC)" \
+              arch/arm64/configs \
+              2>/dev/null
+
+            echo
+            echo "===== WIFI / WLAN REFERENCES FOR SEPARATION ====="
+
+            grep -RInE \
+              "wlan|wifi|bcmdhd|dhd" \
               arch/arm64/boot/dts \
               2>/dev/null \
-              | head -500
+              | head -200
 
             echo
-            echo "========================================"
-            echo "RADIO CONFIG"
-            echo "========================================"
+            echo "===== GPS / GNSS REFERENCES FOR SEPARATION ====="
 
             grep -RInE \
-              "CONFIG_.*(MODEM|CPIF|RADIO|RF|MIF|MODAP)" \
-              arch/arm64/configs \
+              "gps|gnss" \
+              arch/arm64/boot/dts \
+              drivers \
               2>/dev/null \
-              | head -300
+              | head -200
 
-          } | tee modem-analysis.log
+          } >> "$OUT"
+
+          echo
+          echo "========================================"
+          echo "MODEM ANALYSIS CREATED"
+          echo "========================================"
+
+          wc -l "$OUT"
 
           true
 
       - name: Prepare kernel configuration
         working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
         run: |
           set -eux
 
@@ -190,6 +271,24 @@ jobs:
             O="$PWD/out" \
             ARCH="$ARCH" \
             "$KERNEL_DEFCONFIG"
+
+          CONFIG="out/.config"
+
+          test -f "$CONFIG"
+
+          if grep -q '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' "$CONFIG"; then
+
+            sed -i \
+              's/^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=.*/CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0/' \
+              "$CONFIG"
+
+          else
+
+            echo \
+              'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' \
+              >> "$CONFIG"
+
+          fi
 
           make \
             O="$PWD/out" \
@@ -202,24 +301,32 @@ jobs:
           echo "========================================"
 
           grep -E \
-            "CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM" \
-            out/.config || true
+            "^CONFIG_SECURITY_SELINUX=|^CONFIG_SECURITY_SELINUX_BOOTPARAM=|^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=|^CONFIG_SECURITY_SELINUX_DEVELOP=" \
+            "$CONFIG" || true
 
-      - name: Build kernel - objdump garbage filtered
+          VALUE="$(grep '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' "$CONFIG" | cut -d= -f2)"
+
+          if [ "$VALUE" != "0" ]; then
+            echo "ERROR: SELinux bootparam value is NOT 0"
+            exit 1
+          fi
+
+          echo
+          echo "SELinux bootparam default = PERMISSIVE"
+
+      - name: Build kernel
         working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
         env:
           KCFLAGS: -Wno-error
-        shell: bash
         run: |
           set -o pipefail
 
           echo
           echo "========================================"
-          echo "FULL KERNEL BUILD"
-          echo "OBJDUMP WARNINGS ARE DISCARDED"
+          echo "BUILDING XCOVER4S KERNEL"
           echo "========================================"
-
-          FILTER='aarch64-linux-gnu-objdump: Warning:'
+          echo
 
           make -j"$(nproc)" \
             O="$PWD/out" \
@@ -230,8 +337,27 @@ jobs:
             KCFLAGS="$KCFLAGS" \
             Image dtbs \
             2>&1 \
-            | grep --line-buffered -v -F "$FILTER" \
-            | tee build.log
+          | awk '
+              /aarch64-linux-gnu-objdump: Warning:/ { next }
+              /Unrecognized form: 0x[0-9a-fA-F]+/ { next }
+              /Corrupt attribute/ { next }
+              /Bogus end-of-siblings marker/ { next }
+              /Further warnings about bogus end-of-sibling markers suppressed/ { next }
+
+              /^[[:space:]]+CC[[:space:]]+/ { next }
+              /^[[:space:]]+CC[[:space:]]+\[M\]/ { next }
+              /^[[:space:]]+LD[[:space:]]+/ { next }
+              /^[[:space:]]+AS[[:space:]]+/ { next }
+              /^[[:space:]]+AR[[:space:]]+/ { next }
+              /^[[:space:]]+HOSTCC[[:space:]]+/ { next }
+              /^[[:space:]]+HOSTLD[[:space:]]+/ { next }
+
+              {
+                  print
+                  fflush()
+              }
+            ' \
+          | tee build.log
 
           STATUS=${PIPESTATUS[0]}
 
@@ -242,9 +368,50 @@ jobs:
 
           exit "$STATUS"
 
+      - name: Verify new kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          test -f "$IMAGE"
+
+          echo
+          echo "========================================"
+          echo "NEW KERNEL SUCCESSFULLY BUILT"
+          echo "========================================"
+
+          ls -lh "$IMAGE"
+
+          echo
+          echo "SHA256:"
+          sha256sum "$IMAGE"
+
+          echo
+          echo "========================================"
+          echo "FINAL SELINUX CONFIG"
+          echo "========================================"
+
+          grep -E \
+            "^CONFIG_SECURITY_SELINUX=|^CONFIG_SECURITY_SELINUX_BOOTPARAM=|^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=|^CONFIG_SECURITY_SELINUX_DEVELOP=" \
+            out/.config || true
+
+          echo
+          echo "========================================"
+          echo "FINAL SELINUX SOURCE"
+          echo "========================================"
+
+          grep -RInE \
+            "selinux_enforcing[[:space:]]*=" \
+            security/selinux \
+            2>/dev/null || true
+
       - name: Show important build messages
         if: always()
         working-directory: ${{ env.KERNEL_DIR }}
+        shell: bash
         run: |
           echo
           echo "========================================"
@@ -254,48 +421,23 @@ jobs:
           if [ -f build.log ]; then
 
             grep -iE \
-              "error:|fatal error:|undefined reference|warning:|FAILED|Error [0-9]+" \
+              "error:|fatal error:|undefined reference|warning:|FAILED|Error [0-9]+|section mismatch" \
               build.log \
               | tail -300 || true
 
           fi
 
-      - name: Verify kernel
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -eux
-
-          test -f out/arch/arm64/boot/Image
-
-          echo
-          echo "========================================"
-          echo "BUILD SUCCESS"
-          echo "========================================"
-
-          ls -lh out/arch/arm64/boot/Image
-
-          echo
-          echo "SHA256"
-          sha256sum out/arch/arm64/boot/Image
-
-          echo
-          echo "========================================"
-          echo "FINAL SELINUX ASSIGNMENTS"
-          echo "========================================"
-
-          grep -RInE \
-            "selinux_enforcing[[:space:]]*=" \
-            security/selinux \
-            2>/dev/null || true
-
       - name: Package results
         if: always()
+        shell: bash
         run: |
           mkdir -p artifacts
 
-          if [ -f "${KERNEL_DIR}/out/arch/arm64/boot/Image" ]; then
+          IMAGE="${KERNEL_DIR}/out/arch/arm64/boot/Image"
+
+          if [ -f "$IMAGE" ]; then
             cp \
-              "${KERNEL_DIR}/out/arch/arm64/boot/Image" \
+              "$IMAGE" \
               artifacts/Image-selinux-permissive
           fi
 
@@ -328,6 +470,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-clean-build
+          name: xcover4s-permissive-ss310ap-analysis
           path: artifacts/
           if-no-files-found: warn
