@@ -1,5 +1,5 @@
 
-name: XCOVER4S V24 FIXED
+name: XCOVER4S V25 FIXED
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Install build tools
+      - name: Install tools
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -19,68 +19,76 @@ jobs:
             binutils-aarch64-linux-gnu \
             bc bison flex libssl-dev libelf-dev cpio
 
-      - name: Download kernel source
+      - name: Clone source
         run: |
           set -euo pipefail
           git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-
           mkdir -p diagnostics
           git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply corrected V24 patches
+      - name: Apply V25 patches
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          p = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
-          s = p.read_text()
+          cp = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
+          s = cp.read_text()
 
-          changes = [
+          patches = [
               (
-                  r'(void cal_cp_init\(void\)\s*\{\s*)'
-                  r'pmucal_cp_init\(\);',
-                  r'\g<1>pr_warn("V24 CP init blocked\n");'
-                  '\n\tpmucal_cp_reset_assert();'
+                  r'(void cal_cp_init\(void\)\s*\{\s*)pmucal_cp_init\(\);',
+                  'pr_warn("V25 CP init blocked");\n'
+                  '\tpmucal_cp_reset_assert();'
               ),
               (
-                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
-                  r'pmucal_cp_reset_release\(\);',
-                  r'\g<1>pr_warn("V24 CP release blocked\n");'
-                  '\n\tpmucal_cp_reset_assert();'
+                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)pmucal_cp_reset_release\(\);',
+                  'pr_warn("V25 CP release blocked");\n'
+                  '\tpmucal_cp_reset_assert();'
               )
           ]
 
-          for pattern, replacement in changes:
-              s, count = re.subn(pattern, replacement, s)
-              if count != 1:
-                  raise SystemExit(
-                      f"CP patch failed: expected 1 match, got {count}"
-                  )
+          for pattern, body in patches:
+              s, n = re.subn(
+                  pattern,
+                  lambda m, b=body: m.group(1) + b,
+                  s
+              )
+              if n != 1:
+                  raise SystemExit(f"CP patch failed: {n} matches")
 
-          p.write_text(s)
+          cp.write_text(s)
 
-          p = Path(
+          decon = Path(
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon_reg.c"
           )
-          s = p.read_text()
+          s = decon.read_text()
           old = "const double decon_clocks_table[][CLK_ID_MAX]"
           new = "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-
           if s.count(old) != 1:
-              raise SystemExit("Display patch target not found")
+              raise SystemExit("decon_reg.c patch failed")
+          decon.write_text(s.replace(old, new))
 
-          p.write_text(s.replace(old, new))
-          print("V24 patches applied successfully")
+          header = Path(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon.h"
+          )
+          s = header.read_text()
+          old = "#define decon_destroy_debugfs(..)"
+          new = "#define decon_destroy_debugfs(...)"
+          if s.count(old) != 1:
+              raise SystemExit("decon.h patch failed")
+          header.write_text(s.replace(old, new))
+
+          print("All V25 patches applied")
           PY
 
-          git -C kernel diff > diagnostics/v24.patch
+          git -C kernel diff > diagnostics/v25.patch
 
-      - name: Configure kernel
+      - name: Configure
         run: |
           set -euo pipefail
           cd kernel
@@ -105,29 +113,9 @@ jobs:
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=out olddefconfig
-
           cp out/.config ../diagnostics/final.config
 
-          grep -E \
-            'CONFIG_CP_PMUCAL=|CONFIG_SECURITY_SELINUX|CONFIG_DEBUG_INFO|CONFIG_KALLSYMS' \
-            out/.config > ../diagnostics/config-check.txt || true
-
-      - name: Verify patches
-        run: |
-          set -euo pipefail
-
-          grep -n 'V24 CP init blocked' \
-            kernel/drivers/soc/samsung/cal-if/cal-if.c
-
-          grep -n 'V24 CP release blocked' \
-            kernel/drivers/soc/samsung/cal-if/cal-if.c
-
-          grep -n 'const unsigned long decon_clocks_table' \
-            kernel/drivers/video/fbdev/exynos/dpu_7885/decon_reg.c
-
-          echo "PATCHES VERIFIED" > diagnostics/patch-result.txt
-
-      - name: Targeted compile test
+      - name: Fast targeted test
         run: |
           set -euo pipefail
           cd kernel
@@ -141,7 +129,7 @@ jobs:
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
             2>&1 | tee ../diagnostics/targeted-build.log
 
-      - name: Build kernel
+      - name: Full kernel build
         run: |
           set -euo pipefail
           cd kernel
@@ -153,64 +141,55 @@ jobs:
           make O=out -j2 Image \
             2>&1 | tee ../diagnostics/build.log
 
-      - name: Measure kernel
+      - name: Measure and package
         run: |
           set -euo pipefail
 
           IMAGE=kernel/out/arch/arm64/boot/Image
           test -s "$IMAGE"
 
+          mkdir -p artifact
+
           SIZE=$(stat -c%s "$IMAGE")
 
           {
-            echo "V21 original target: 23327848 bytes"
-            echo "V23 kernel: 25139944 bytes"
-            echo "V24 kernel: $SIZE bytes"
-            echo
-            echo "Boot partition capacity: 37748736 bytes"
-            echo "Final fit requires repacking and checking boot.img."
+            echo "V25 Image: $SIZE bytes"
+            echo "Current kernel reference: 23327848 bytes"
+            echo "Boot partition: 37748736 bytes"
+            echo "Actual fit must be checked after boot image repacking."
           } | tee diagnostics/kernel-size.txt
 
-      - name: Prepare kernel artifact
-        run: |
-          set -euo pipefail
-
-          mkdir -p artifact
-
-          cp kernel/out/arch/arm64/boot/Image artifact/Image
-          cp diagnostics/v24.patch artifact/v24.patch
-          cp diagnostics/kernel-size.txt artifact/kernel-size.txt
+          cp "$IMAGE" artifact/Image
+          cp diagnostics/v25.patch artifact/v25.patch
           cp diagnostics/final.config artifact/final.config
+          cp diagnostics/kernel-size.txt artifact/kernel-size.txt
 
           sha256sum artifact/Image > artifact/SHA256SUMS
 
           cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V24
-
-          Kernel build completed.
+          XCOVER4S V25
 
           CP reset-assert patch included.
-          CP supply power-off is NOT proven.
+          Actual modem power-off is unverified.
 
-          SELinux permissive boot configuration requested.
-          Runtime SELinux state is NOT yet verified.
+          SELinux permissive boot setting requested.
+          Runtime SELinux state is unverified.
 
-          NOT FLASHABLE.
-          Repack with original boot components first.
-          Verify boot.img fits partition before flashing.
+          NOT FLASHABLE YET.
+          Requires boot.img repacking and verification.
           EOF
 
       - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V24-KERNEL
+          name: XCOVER4S-V25-KERNEL
           path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V24-DIAGNOSTICS
+          name: XCOVER4S-V25-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
