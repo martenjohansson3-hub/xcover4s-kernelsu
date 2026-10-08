@@ -1,5 +1,5 @@
 
-name: XCOVER4S V25 FIXED
+name: XCOVER4S V26 FIXED
 
 on:
   workflow_dispatch:
@@ -19,23 +19,29 @@ jobs:
             binutils-aarch64-linux-gnu \
             bc bison flex libssl-dev libelf-dev cpio
 
-      - name: Clone source
+      - name: Clone kernel
         run: |
           set -euo pipefail
           git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-
           mkdir -p diagnostics
-          git -C kernel rev-parse HEAD \
-            > diagnostics/source-commit.txt
+          git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply V25 patches
+      - name: Apply V26 patches
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
           import re
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if s.count(old) != 1:
+                  raise SystemExit(
+                      f"Patch mismatch in {path}: {old}"
+                  )
+              p.write_text(s.replace(old, new))
 
           cp = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
           s = cp.read_text()
@@ -44,62 +50,57 @@ jobs:
               (
                   r'(void cal_cp_init\(void\)\s*\{\s*)'
                   r'pmucal_cp_init\(\);',
-                  'pr_warn("V25 CP init blocked");\n'
+                  'pr_warn("V26 CP init blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               ),
               (
                   r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
                   r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V25 CP release blocked");\n'
+                  'pr_warn("V26 CP release blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               )
           ]
 
           for pattern, body in patches:
-              s, n = re.subn(
+              s, count = re.subn(
                   pattern,
                   lambda m, b=body: m.group(1) + b,
                   s
               )
-              if n != 1:
+              if count != 1:
                   raise SystemExit(
-                      f"CP patch failed: {n} matches"
+                      f"CP patch mismatch: {count}"
                   )
 
           cp.write_text(s)
 
-          decon = Path(
+          base = (
               "kernel/drivers/video/fbdev/exynos/"
-              "dpu_7885/decon_reg.c"
+              "dpu_7885/"
           )
 
-          s = decon.read_text()
-          old = "const double decon_clocks_table[][CLK_ID_MAX]"
-          new = "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-
-          if s.count(old) != 1:
-              raise SystemExit("decon_reg.c patch failed")
-
-          decon.write_text(s.replace(old, new))
-
-          header = Path(
-              "kernel/drivers/video/fbdev/exynos/"
-              "dpu_7885/decon.h"
+          replace_once(
+              base + "decon_reg.c",
+              "const double decon_clocks_table[][CLK_ID_MAX]",
+              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
           )
 
-          s = header.read_text()
-          old = "#define decon_destroy_debugfs(..)"
-          new = "#define decon_destroy_debugfs(...)"
+          replace_once(
+              base + "decon.h",
+              "#define decon_create_debugfs(...) do { } while(0)",
+              "#define decon_create_debugfs(...) (0)"
+          )
 
-          if s.count(old) != 1:
-              raise SystemExit("decon.h patch failed")
+          replace_once(
+              base + "decon.h",
+              "#define decon_destroy_debugfs(..) do { } while(0)",
+              "#define decon_destroy_debugfs(...) do { } while(0)"
+          )
 
-          header.write_text(s.replace(old, new))
-
-          print("All V25 patches applied")
+          print("All V26 patches applied")
           PY
 
-          git -C kernel diff > diagnostics/v25.patch
+          git -C kernel diff > diagnostics/v26.patch
 
       - name: Configure kernel
         run: |
@@ -129,7 +130,7 @@ jobs:
 
           cp out/.config ../diagnostics/final.config
 
-      - name: Fast targeted test
+      - name: Fast targeted compile test
         run: |
           set -euo pipefail
           cd kernel
@@ -141,6 +142,7 @@ jobs:
           make O=out -j2 \
             drivers/soc/samsung/cal-if/cal-if.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
+            drivers/video/fbdev/exynos/dpu_7885/decon_core.o \
             2>&1 | tee ../diagnostics/targeted-build.log
 
       - name: Full kernel build
@@ -155,7 +157,7 @@ jobs:
           make O=out -j2 Image \
             2>&1 | tee ../diagnostics/build.log
 
-      - name: Measure and package
+      - name: Package results
         run: |
           set -euo pipefail
 
@@ -167,43 +169,42 @@ jobs:
           SIZE=$(stat -c%s "$IMAGE")
 
           {
-            echo "V25 Image: $SIZE bytes"
-            echo "Original kernel: 23327848 bytes"
-            echo "Boot partition: 37748736 bytes"
-            echo "Actual fit requires boot image repacking."
+            echo "V26 kernel size: $SIZE bytes"
+            echo "Boot partition capacity: 37748736 bytes"
+            echo "Final boot.img fit not yet verified"
           } | tee diagnostics/kernel-size.txt
 
           cp "$IMAGE" artifact/Image
-          cp diagnostics/v25.patch artifact/v25.patch
+          cp diagnostics/v26.patch artifact/v26.patch
           cp diagnostics/final.config artifact/final.config
           cp diagnostics/kernel-size.txt artifact/kernel-size.txt
 
           sha256sum artifact/Image > artifact/SHA256SUMS
 
           cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V25
+          XCOVER4S V26
 
           CP reset-assert patch included.
-          Actual modem power-off is unverified.
+          Physical CP power-off is unverified.
 
           SELinux permissive boot setting requested.
           Runtime SELinux state is unverified.
 
           NOT FLASHABLE YET.
-          Requires boot.img repacking and verification.
+          Boot image repacking and validation required.
           EOF
 
       - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V25-KERNEL
+          name: XCOVER4S-V26-KERNEL
           path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V25-DIAGNOSTICS
+          name: XCOVER4S-V26-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
