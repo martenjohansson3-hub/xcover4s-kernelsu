@@ -1,6 +1,114 @@
+name: XCOVER4S V24 SIZE TEST
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -qq
+
+          sudo apt-get install -y \
+            clang-14 \
+            lld-14 \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            cpio
+
+      - name: Download kernel source
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
+
+          mkdir -p diagnostics
+
+          git -C kernel rev-parse HEAD \
+            > diagnostics/source-commit.txt
+
+      - name: Apply V24 patches
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+
+              count = s.count(old)
+
+              if count != 1:
+                  raise SystemExit(
+                      f"STOP: {path}: expected 1 match, got {count}"
+                  )
+
+              p.write_text(s.replace(old, new))
+              print(f"Patched {path}")
+
+          cp = "kernel/drivers/soc/samsung/cal-if/cal-if.c"
+
+          replace_exact(
+              cp,
+              """void cal_cp_init(void)
+          {
+              pmucal_cp_init();
+          }""",
+              """void cal_cp_init(void)
+          {
+              pr_warn("V24 CP init blocked\\n");
+              pmucal_cp_reset_assert();
+          }"""
+          )
+
+          replace_exact(
+              cp,
+              """void cal_cp_reset_release(void)
+          {
+              pmucal_cp_reset_release();
+          }""",
+              """void cal_cp_reset_release(void)
+          {
+              pr_warn("V24 CP release blocked\\n");
+              pmucal_cp_reset_assert();
+          }"""
+          )
+
+          decon = (
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c"
+          )
+
+          replace_exact(
+              decon,
+              "const double decon_clocks_table[][CLK_ID_MAX]",
+              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
+          )
+          PY
+
+          git -C kernel diff \
+            > diagnostics/v24.patch
+
       - name: Configure kernel
         run: |
           set -euo pipefail
+
           cd kernel
 
           export ARCH=arm64
@@ -10,14 +118,143 @@
 
           grep -q '^CONFIG_CP_PMUCAL=y' out/.config
 
-          # Keep CP HARD OFF patch.
-          # Reduce kernel image size.
           scripts/config --file out/.config \
             -d DEBUG_INFO \
             -d DEBUG_INFO_DWARF4 \
             -d DEBUG_INFO_DWARF5 \
-            -d DEBUG_INFO_REDUCED
+            -d DEBUG_INFO_BTF \
+            -d DEBUG_INFO_BTF_MODULES
+
+          scripts/config --file out/.config \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_DEVELOP \
+            -e SECURITY_SELINUX_BOOTPARAM \
+            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=out olddefconfig
 
           cp out/.config ../diagnostics/final.config
+
+      - name: Verify CP patch
+        run: |
+          set -euo pipefail
+
+          grep -n \
+            'V24 CP init blocked' \
+            kernel/drivers/soc/samsung/cal-if/cal-if.c
+
+          grep -n \
+            'V24 CP release blocked' \
+            kernel/drivers/soc/samsung/cal-if/cal-if.c
+
+          echo "CP patch verified" \
+            > diagnostics/cp-patch.txt
+
+      - name: Targeted display driver test
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
+
+          make O=out -j2 \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
+            2>&1 | tee ../diagnostics/display-test.log
+
+      - name: Full kernel build
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
+
+          make O=out -j2 Image \
+            2>&1 | tee ../diagnostics/build.log
+
+      - name: Check kernel size
+        run: |
+          set -euo pipefail
+
+          IMAGE="kernel/out/arch/arm64/boot/Image"
+
+          test -s "$IMAGE"
+
+          SIZE=$(stat -c%s "$IMAGE")
+
+          echo "V24 kernel size: $SIZE bytes"
+          echo "Maximum target: 23327848 bytes"
+
+          echo "$SIZE" \
+            > diagnostics/kernel-size.txt
+
+          if [ "$SIZE" -gt 23327848 ]; then
+            echo "ERROR: kernel is still too large"
+            exit 1
+          fi
+
+          echo "KERNEL FITS TARGET SIZE" \
+            > diagnostics/size-result.txt
+
+      - name: Prepare artifact
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+
+          cp \
+            kernel/out/arch/arm64/boot/Image \
+            artifact/Image
+
+          cp \
+            diagnostics/v24.patch \
+            artifact/v24.patch
+
+          cp \
+            diagnostics/kernel-size.txt \
+            artifact/kernel-size.txt
+
+          cp \
+            diagnostics/final.config \
+            artifact/final.config
+
+          sha256sum \
+            artifact/Image \
+            > artifact/SHA256SUMS
+
+          cat > artifact/STATUS.txt <<'EOF'
+          V24 kernel build passed.
+
+          CP HARD OFF patch included.
+
+          SELinux permissive configuration included.
+
+          Kernel size verified against target.
+
+          NOT FLASHABLE YET.
+
+          Boot image must still be rebuilt using
+          the current boot image header/ramdisk.
+
+          Hardware CP power-off has not been verified.
+          EOF
+
+      - name: Upload V24 kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V24-KERNEL
+          path: artifact/
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V24-DIAGNOSTICS
+          path: diagnostics/
+          if-no-files-found: warn
