@@ -1,11 +1,11 @@
 
-name: XCOVER4S V22 SOURCE AUDIT
+name: XCOVER4S V22 CONFIG AUDIT
 
 on:
   workflow_dispatch:
 
 jobs:
-  source-audit:
+  config-audit:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
 
@@ -13,73 +13,169 @@ jobs:
       - name: Download kernel source
         run: |
           set -euo pipefail
+
           git clone --depth 1 \
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
-      - name: Inspect modem and GNSS
-        run: |
-          set -euo pipefail
           mkdir -p diagnostics
 
-          {
-            echo "=== KERNEL VERSION ==="
-            git -C kernel log -1 --format=fuller
+          git -C kernel rev-parse HEAD \
+            > diagnostics/kernel-commit.txt
 
-            echo
-            echo "=== MODEM START FUNCTIONS ==="
-            grep -RnE \
-              'exynos_cp_init|exynos_cp_release|exynos_cp_reset|exynos_set_cp_power_onoff' \
-              kernel/drivers kernel/arch || true
-
-            echo
-            echo "=== MODEM POWER FUNCTIONS ==="
-            grep -RnE \
-              'CP_POWER_ON|CP_POWER_OFF|CP_PWRON|CP_START|CP_RESET|pmucal_cp' \
-              kernel/drivers kernel/arch || true
-
-            echo
-            echo "=== SS310AP REFERENCES ==="
-            grep -RniE \
-              'ss310ap|sh310ap|modemctl|modem_ctrl' \
-              kernel/drivers kernel/arch || true
-
-            echo
-            echo "=== GNSS REFERENCES ==="
-            grep -RniE \
-              'gnss|gps|bcm477|gnss_if' \
-              kernel/drivers/misc/gnss_if \
-              kernel/drivers/soc/samsung \
-              kernel/arch/arm64/boot/dts || true
-
-            echo
-            echo "=== MODEM SOURCE FILES ==="
-            find kernel/drivers \
-              -type f \
-              \( -iname '*modem*' \
-              -o -iname '*pmu-cp*' \
-              -o -iname '*gnss*' \) \
-              | sort
-          } > diagnostics/source-audit.txt
-
-      - name: Save important source files
+      - name: Find XCover4s configuration
         run: |
           set -euo pipefail
+
+          {
+            echo "=== DEFCONFIG FILES ==="
+
+            find kernel/arch/arm64/configs \
+              -type f \
+              | sort
+
+            echo
+            echo "=== EXYNOS7885 CONFIG REFERENCES ==="
+
+            grep -RnEi \
+              'g398|xcover4s|exynos7885|jackpotlte' \
+              kernel/arch/arm64/configs \
+              || true
+
+            echo
+            echo "=== CP CONFIG OPTIONS ==="
+
+            grep -RnE \
+              'CONFIG_CP_PMUCAL|CONFIG_EXYNOS_MODEM|CONFIG_LINK_DEVICE|CONFIG_MODEM' \
+              kernel/arch/arm64/configs \
+              || true
+
+          } > diagnostics/config-report.txt
+
+      - name: Inspect modem driver selection
+        run: |
+          set -euo pipefail
+
+          {
+            echo "=== CP PMUCAL REFERENCES ==="
+
+            grep -RnE \
+              'CONFIG_CP_PMUCAL|cal_cp_init|cal_cp_status|cal_cp_reset|cal_cp_release|cal_cp_enable|cal_cp_disable' \
+              kernel/drivers \
+              kernel/arch/arm64 \
+              || true
+
+            echo
+            echo "=== MODEM DRIVER BUILD RULES ==="
+
+            grep -RnEi \
+              'ss310ap|sh310ap|modem_ctrl|modem_modemctl|cp_pmucal' \
+              kernel/drivers/misc \
+              kernel/drivers/soc/samsung \
+              --include='Makefile' \
+              --include='Kconfig' \
+              || true
+
+            echo
+            echo "=== MODEM START AND POWER PATHS ==="
+
+            grep -RnE \
+              'exynos_cp_init|exynos_cp_release|exynos_cp_reset|exynos_set_cp_power_onoff|cal_cp_' \
+              kernel/drivers \
+              || true
+
+          } > diagnostics/modem-selection.txt
+
+      - name: Inspect Device Tree
+        run: |
+          set -euo pipefail
+
+          {
+            echo "=== XCOVER4S DEVICE TREE FILES ==="
+
+            find kernel/arch/arm64/boot/dts \
+              -type f \
+              | grep -Ei \
+              'g398|xcover|exynos7885|jackpot' \
+              || true
+
+            echo
+            echo "=== MODEM DEVICE TREE REFERENCES ==="
+
+            grep -RnEi \
+              'ss310ap|sh310ap|modem_if|modemctl|cp_active|cp_pwr|cp_reset' \
+              kernel/arch/arm64/boot/dts \
+              || true
+
+            echo
+            echo "=== GNSS DEVICE TREE REFERENCES ==="
+
+            grep -RnEi \
+              'gnss|gps|bcm477|gnss_if' \
+              kernel/arch/arm64/boot/dts \
+              || true
+
+          } > diagnostics/device-tree.txt
+
+      - name: Inspect GNSS dependencies
+        run: |
+          set -euo pipefail
+
+          {
+            echo "=== GNSS DRIVER FILES ==="
+
+            find kernel/drivers/misc/gnss_if \
+              -type f \
+              | sort || true
+
+            echo
+            echo "=== GNSS POWER AND RESET ==="
+
+            grep -RnEi \
+              'power|reset|pmu|regulator|clock|cal_|exynos' \
+              kernel/drivers/misc/gnss_if \
+              || true
+
+            echo
+            echo "=== SHARED CP GNSS REFERENCES ==="
+
+            grep -RnEi \
+              'gnss|gps|cp_power|cp_reset|cp_active' \
+              kernel/drivers/soc/samsung \
+              kernel/drivers/misc/modem_if \
+              || true
+
+          } > diagnostics/gnss-dependencies.txt
+
+      - name: Save configuration and build files
+        run: |
+          set -euo pipefail
+
           mkdir -p diagnostics/source
 
-          find kernel/drivers kernel/arch \
+          find kernel/arch/arm64/configs \
             -type f \
-            \( -name 'pmu-cp.c' \
-            -o -name 'pmucal_cp_exynos7885.h' \
-            -o -name 'modem_ctrl_ss310ap.c' \
-            -o -name 'modem_modemctl_device_sh310ap.c' \) \
+            \( -iname '*g398*' \
+            -o -iname '*xcover*' \
+            -o -iname '*exynos7885*' \) \
             -exec cp --parents {} diagnostics/source/ \;
+
+          find kernel/drivers \
+            -type f \
+            \( -name 'Makefile' -o -name 'Kconfig' \) \
+            -path '*modem*' \
+            -exec cp --parents {} diagnostics/source/ \;
+
+          find kernel/drivers/misc/gnss_if \
+            -maxdepth 2 -type f \
+            -exec cp --parents {} diagnostics/source/ \; \
+            2>/dev/null || true
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-SOURCE-AUDIT
+          name: XCOVER4S-V22-CONFIG-AUDIT
           path: diagnostics/
           if-no-files-found: warn
