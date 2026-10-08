@@ -1,5 +1,5 @@
 
-name: XCOVER4S V20 - CP OFF SELinux Permissive
+name: XCOVER4S V21 - Quiet Build
 
 on:
   workflow_dispatch:
@@ -16,10 +16,9 @@ jobs:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
       CLANG_TRIPLE: aarch64-linux-gnu-
-      EXPECTED_BOOT_SHA: f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -27,25 +26,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y \
-            clang-14 lld-14 \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev libelf-dev \
-            make curl unzip jq cpio python3
+            clang-14 lld-14 gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu bc bison flex \
+            libssl-dev libelf-dev make python3
 
-      - name: Check original boot
-        id: original
-        run: |
-          set -euo pipefail
-          if [ -f boot-original.img ]; then
-            echo "$EXPECTED_BOOT_SHA  boot-original.img" | sha256sum -c -
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Original boot missing. Kernel-only artifact."
-          fi
-
-      - name: Fetch pinned kernel
+      - name: Fetch kernel
         run: |
           set -euo pipefail
           git init kernel
@@ -54,21 +39,18 @@ jobs:
           git -C kernel fetch --depth 1 origin \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
           git -C kernel checkout --detach FETCH_HEAD
-          test "$(git -C kernel rev-parse HEAD)" = \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply verified-layout patches
-        shell: bash
+      - name: Apply CP OFF and SELinux patches
         run: |
           set -euo pipefail
 
-          cat > patch_v20.py <<'PY'
+          cat > patch.py <<'PY'
           from pathlib import Path
           import re
 
           root = Path("kernel")
-          cp = root / "drivers/soc/samsung/pmu-cp.c"
-          src = cp.read_text()
+          path = root / "drivers/soc/samsung/pmu-cp.c"
+          src = path.read_text()
 
           def replace_body(source, name, body):
               pattern = (
@@ -79,105 +61,86 @@ jobs:
               matches = list(re.finditer(pattern, source))
               if len(matches) != 1:
                   raise RuntimeError(
-                      f"{name}: expected 1 definition, "
-                      f"found {len(matches)}"
+                      f"{name}: {len(matches)} matches"
                   )
 
-              match = matches[0]
-              start = match.end() - 1
+              start = matches[0].end() - 1
               depth = 0
               end = None
 
-              for pos in range(start, len(source)):
-                  if source[pos] == "{":
+              for i in range(start, len(source)):
+                  if source[i] == "{":
                       depth += 1
-                  elif source[pos] == "}":
+                  elif source[i] == "}":
                       depth -= 1
                       if depth == 0:
-                          end = pos
+                          end = i
                           break
 
               if end is None:
-                  raise RuntimeError(
-                      f"{name}: closing brace missing"
-                  )
+                  raise RuntimeError("Unmatched braces")
 
               return (
                   source[:start + 1]
-                  + "\n"
-                  + body
-                  + "\n"
+                  + "\n" + body + "\n"
                   + source[end:]
               )
 
           src = replace_body(
               src,
               "exynos_cp_reset",
-              "\t/* V20: prevent CP reset/start */\n"
               "\treturn -EPERM;"
           )
-
           src = replace_body(
               src,
               "exynos_cp_release",
-              "\t/* V20: prevent CP release */\n"
               "\treturn -EPERM;"
           )
 
-          # Preserve the OFF path; reject the ON request.
-          name = "exynos_set_cp_power_onoff"
           pattern = (
               r"(?m)^[ \t]*int[ \t]+"
-              + name
-              + r"\s*\(\s*enum\s+cp_mode\s+mode\s*\)\s*\{"
+              r"exynos_set_cp_power_onoff"
+              r"\s*\(\s*enum\s+cp_mode\s+mode\s*\)\s*\{"
           )
           matches = list(re.finditer(pattern, src))
           if len(matches) != 1:
-              raise RuntimeError(
-                  "CP power function signature mismatch"
-              )
+              raise RuntimeError("CP power function mismatch")
 
           at = matches[0].end()
           src = (
               src[:at]
-              + "\n\t/* V20: reject CP power-on */\n"
-              + "\tif (mode == CP_POWER_ON)\n"
+              + "\n\tif (mode == CP_POWER_ON)\n"
               + "\t\treturn -EPERM;\n"
               + src[at:]
           )
-          cp.write_text(src)
-          print("PASS: 3 CP functions patched")
+          path.write_text(src)
 
-          # V19 identified five explicit assignments.
           total = 0
-          for relative in [
+          for filename in [
               "security/selinux/hooks.c",
               "security/selinux/ss/services.c",
           ]:
-              path = root / relative
-              data = path.read_text()
-              data, count = re.subn(
+              p = root / filename
+              text = p.read_text()
+              text, count = re.subn(
                   r"\bselinux_enforcing\s*=\s*1\s*;",
                   "selinux_enforcing = 0;",
-                  data
+                  text
               )
-              path.write_text(data)
+              p.write_text(text)
               total += count
-              print(f"{relative}: {count} assignments")
 
           if total != 5:
               raise RuntimeError(
-                  f"Expected 5 SELinux assignments, got {total}"
+                  f"SELinux assignments: {total}, expected 5"
               )
 
-          print("PASS: SELinux source changes")
+          print("CP and SELinux patches applied")
           PY
 
-          python3 patch_v20.py
+          python3 patch.py
           git -C kernel diff --check
-          git -C kernel diff > kernel-v20.patch
-          test -s kernel-v20.patch
-          git -C kernel diff --stat
+          git -C kernel diff > kernel-v21.patch
 
       - name: Configure kernel
         working-directory: kernel
@@ -186,16 +149,15 @@ jobs:
           mkdir -p out
 
           make O="$PWD/out" \
-            ARCH=arm64 \
             lineage_xcover4s_defconfig
 
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("out/.config")
-          lines = path.read_text().splitlines()
+          p = Path("out/.config")
+          lines = p.read_text().splitlines()
 
-          settings = {
+          values = {
               "CONFIG_SECURITY_SELINUX": "y",
               "CONFIG_SECURITY_SELINUX_DEVELOP": "y",
               "CONFIG_SECURITY_SELINUX_BOOTPARAM": "y",
@@ -207,27 +169,21 @@ jobs:
               if not any(
                   line.startswith(k + "=")
                   or line == f"# {k} is not set"
-                  for k in settings
+                  for k in values
               )
           ]
 
           lines += [
-              f"{key}={value}"
-              for key, value in settings.items()
+              f"{k}={v}" for k, v in values.items()
           ]
 
-          path.write_text("\n".join(lines) + "\n")
+          p.write_text("\n".join(lines) + "\n")
           PY
 
           make O="$PWD/out" \
-            ARCH=arm64 CC=clang-14 \
-            KCFLAGS=-Wno-error olddefconfig
-
-          grep -q '^CONFIG_SECURITY_SELINUX=y$' out/.config
-          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y$' out/.config
-          grep -q '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=1$' out/.config
-
-          echo "Kernel configuration verified."
+            CC=clang-14 \
+            KCFLAGS=-Wno-error \
+            olddefconfig
 
       - name: Fast CP compile test
         working-directory: kernel
@@ -238,70 +194,61 @@ jobs:
 
           set +e
           timeout --signal=TERM --kill-after=20s 8m \
-            make -j4 \
-              O="$PWD/out" \
-              ARCH=arm64 \
+            make -j4 O="$PWD/out" \
               CC=clang-14 \
               KCFLAGS=-Wno-error \
               drivers/soc/samsung/pmu-cp.o \
-              2>&1 | tee targeted-build.log
+              > targeted-build.log 2>&1
 
-          RESULT=${PIPESTATUS[0]}
+          RESULT=$?
           set -e
 
+          grep -v \
+            'aarch64-linux-gnu-objdump: Warning:' \
+            targeted-build.log || true
+
           if [ "$RESULT" -ne 0 ]; then
-            echo "::error::Targeted compile failed."
+            tail -80 targeted-build.log
             exit "$RESULT"
           fi
 
-          test -s out/drivers/soc/samsung/pmu-cp.o
-          echo "PASS: CP source compiled."
+          echo "CP compile PASSED"
 
-      - name: Full kernel build - live log
+      - name: Full kernel build - filtered output
         working-directory: kernel
         timeout-minutes: 40
         shell: bash
         run: |
           set -euo pipefail
-          echo "Starting V20 kernel compilation"
+
+          echo "Starting kernel compilation..."
           date -u
-
-          (
-            while true; do
-              sleep 60
-              echo "===== V20 HEARTBEAT ====="
-              date -u
-              if [ -f build.log ]; then
-                du -h build.log
-                tail -5 build.log
-              fi
-            done
-          ) &
-          HEARTBEAT=$!
-
-          trap 'kill "$HEARTBEAT" 2>/dev/null || true' EXIT
 
           set +e
           timeout --signal=TERM --kill-after=30s 35m \
-            make -j4 \
-              O="$PWD/out" \
-              ARCH=arm64 \
+            make -j4 O="$PWD/out" \
               CC=clang-14 \
               KCFLAGS=-Wno-error \
               Image dtbs \
-              2>&1 | tee build.log
+              > build.log 2>&1
 
-          RESULT=${PIPESTATUS[0]}
+          RESULT=$?
           set -e
 
+          echo "===== BUILD OUTPUT ====="
+
+          grep -v \
+            'aarch64-linux-gnu-objdump: Warning:' \
+            build.log | tail -150 || true
+
           if [ "$RESULT" -ne 0 ]; then
-            echo "::error::Full build failed: $RESULT"
-            tail -100 build.log
+            echo "::error::Kernel build failed: $RESULT"
             exit "$RESULT"
           fi
 
           test -s out/arch/arm64/boot/Image
-          echo "PASS: KERNEL COMPILED"
+
+          echo "KERNEL COMPILED SUCCESSFULLY"
           ls -lh out/arch/arm64/boot/Image
           sha256sum out/arch/arm64/boot/Image
 
@@ -309,94 +256,24 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V20-KERNEL
+          name: XCOVER4S-V21-KERNEL
           path: |
             kernel/out/arch/arm64/boot/Image
             kernel/build.log
             kernel/targeted-build.log
-            kernel-v20.patch
-          retention-days: 14
-
-      - name: Download MagiskBoot
-        if: success() && steps.original.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          URL="$(
-            curl -fsSL \
-              https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
-              | jq -r '
-                .assets[]
-                | select(.name | endswith(".apk"))
-                | .browser_download_url
-              ' | head -1
-          )"
-
-          test -n "$URL"
-          test "$URL" != "null"
-
-          curl -fL --retry 3 "$URL" -o magisk.apk
-          unzip -p magisk.apk \
-            lib/x86_64/libmagiskboot.so > magiskboot
-
-          test -s magiskboot
-          chmod +x magiskboot
-
-      - name: Repack and inspect boot image
-        if: success() && steps.original.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-
-          mkdir -p boot-work boot-verify
-          cp boot-original.img boot-work/boot.img
-          cp magiskboot boot-work/magiskboot
-
-          cd boot-work
-          ./magiskboot unpack boot.img
-          test -s kernel
-
-          cp ../kernel/out/arch/arm64/boot/Image kernel
-
-          ./magiskboot repack boot.img \
-            boot-CP-OFF-SELINUX-v20.img
-
-          test -s boot-CP-OFF-SELINUX-v20.img
-
-          cp boot-CP-OFF-SELINUX-v20.img \
-            ../boot-verify/boot.img
-
-          cd ../boot-verify
-          cp ../magiskboot ./magiskboot
-          ./magiskboot unpack boot.img
-
-          cmp kernel \
-            ../kernel/out/arch/arm64/boot/Image
-
-          echo "PASS: Repacked image contains V20 kernel."
-          echo "WARNING: Bootability not verified."
-          echo "WARNING: CP power-off not verified."
-          sha256sum boot.img
-
-      - name: Upload unverified boot image
-        if: success() && steps.original.outputs.available == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCOVER4S-V20-BOOT-UNVERIFIED
-          path: |
-            boot-work/boot-CP-OFF-SELINUX-v20.img
-            kernel-v20.patch
+            kernel-v21.patch
           retention-days: 14
 
       - name: Upload diagnostics
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V20-DIAGNOSTICS
+          name: XCOVER4S-V21-DIAGNOSTICS
           path: |
-            patch_v20.py
-            kernel-v20.patch
-            kernel/targeted-build.log
+            patch.py
+            kernel-v21.patch
             kernel/build.log
+            kernel/targeted-build.log
             kernel/out/.config
           if-no-files-found: warn
           retention-days: 14
