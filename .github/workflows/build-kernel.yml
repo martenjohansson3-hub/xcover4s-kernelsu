@@ -1,5 +1,5 @@
 
-name: XCOVER4S V26 FIXED
+name: XCOVER4S V27 FIXED
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
           mkdir -p diagnostics
           git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply V26 patches
+      - name: Apply V27 patches
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -43,20 +43,22 @@ jobs:
                   )
               p.write_text(s.replace(old, new))
 
-          cp = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
+          cp = Path(
+              "kernel/drivers/soc/samsung/cal-if/cal-if.c"
+          )
           s = cp.read_text()
 
           patches = [
               (
                   r'(void cal_cp_init\(void\)\s*\{\s*)'
                   r'pmucal_cp_init\(\);',
-                  'pr_warn("V26 CP init blocked");\n'
+                  'pr_warn("V27 CP init blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               ),
               (
                   r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
                   r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V26 CP release blocked");\n'
+                  'pr_warn("V27 CP release blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               )
           ]
@@ -97,10 +99,35 @@ jobs:
               "#define decon_destroy_debugfs(...) do { } while(0)"
           )
 
-          print("All V26 patches applied")
+          # V27: temporary fence-log length definition.
+          # Confirm the intended upstream length before flashing.
+          helper = Path(base + "helper.c")
+          hs = helper.read_text()
+
+          if "ACQUIRE_FENCE_LEN" not in hs:
+              raise SystemExit("Fence symbol not found")
+
+          if re.search(
+              r'^\s*#\s*define\s+ACQUIRE_FENCE_LEN\b',
+              hs,
+              re.M
+          ):
+              raise SystemExit(
+                  "Fence length already defined in helper.c"
+              )
+
+          hs = (
+              "#ifndef ACQUIRE_FENCE_LEN\n"
+              "#define ACQUIRE_FENCE_LEN 1024\n"
+              "#endif\n\n"
+              + hs
+          )
+          helper.write_text(hs)
+
+          print("All V27 patches applied")
           PY
 
-          git -C kernel diff > diagnostics/v26.patch
+          git -C kernel diff > diagnostics/v27.patch
 
       - name: Configure kernel
         run: |
@@ -127,7 +154,6 @@ jobs:
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=out olddefconfig
-
           cp out/.config ../diagnostics/final.config
 
       - name: Fast targeted compile test
@@ -143,6 +169,7 @@ jobs:
             drivers/soc/samsung/cal-if/cal-if.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_core.o \
+            drivers/video/fbdev/exynos/dpu_7885/helper.o \
             2>&1 | tee ../diagnostics/targeted-build.log
 
       - name: Full kernel build
@@ -165,30 +192,32 @@ jobs:
           test -s "$IMAGE"
 
           mkdir -p artifact
-
           SIZE=$(stat -c%s "$IMAGE")
 
           {
-            echo "V26 kernel size: $SIZE bytes"
+            echo "V27 kernel size: $SIZE bytes"
             echo "Boot partition capacity: 37748736 bytes"
             echo "Final boot.img fit not yet verified"
           } | tee diagnostics/kernel-size.txt
 
           cp "$IMAGE" artifact/Image
-          cp diagnostics/v26.patch artifact/v26.patch
+          cp diagnostics/v27.patch artifact/v27.patch
           cp diagnostics/final.config artifact/final.config
           cp diagnostics/kernel-size.txt artifact/kernel-size.txt
 
           sha256sum artifact/Image > artifact/SHA256SUMS
 
           cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V26
+          XCOVER4S V27
 
           CP reset-assert patch included.
           Physical CP power-off is unverified.
 
           SELinux permissive boot setting requested.
           Runtime SELinux state is unverified.
+
+          ACQUIRE_FENCE_LEN uses provisional value 1024.
+          Confirm upstream intended value before flashing.
 
           NOT FLASHABLE YET.
           Boot image repacking and validation required.
@@ -198,13 +227,13 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V26-KERNEL
+          name: XCOVER4S-V27-KERNEL
           path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V26-DIAGNOSTICS
+          name: XCOVER4S-V27-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
