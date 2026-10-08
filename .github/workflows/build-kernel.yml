@@ -1,90 +1,3 @@
-
-name: XCOVER4S V23 CP KERNEL
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
-    steps:
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            clang-14 lld-14 \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev \
-            libelf-dev cpio
-
-      - name: Download kernel source
-        run: |
-          set -euo pipefail
-          git clone --depth 1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
-          mkdir -p diagnostics
-          git -C kernel rev-parse HEAD \
-            > diagnostics/source-commit.txt
-
-      - name: Apply V23 patches
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_exact(path, old, new):
-              p = Path(path)
-              s = p.read_text()
-              count = s.count(old)
-
-              if count != 1:
-                  raise SystemExit(
-                      f"STOP: {path}: expected 1 match, got {count}"
-                  )
-
-              p.write_text(s.replace(old, new))
-              print("Patched:", path)
-
-          cp = "kernel/drivers/soc/samsung/cal-if/cal-if.c"
-
-          replace_exact(
-              cp,
-              "void cal_cp_init(void)\n"
-              "{\n\tpmucal_cp_init();\n}",
-              "void cal_cp_init(void)\n"
-              "{\n"
-              '\tpr_warn("V23 CP init blocked\\n");\n'
-              "\tpmucal_cp_reset_assert();\n}"
-          )
-
-          replace_exact(
-              cp,
-              "void cal_cp_reset_release(void)\n"
-              "{\n\tpmucal_cp_reset_release();\n}",
-              "void cal_cp_reset_release(void)\n"
-              "{\n"
-              '\tpr_warn("V23 CP release blocked\\n");\n'
-              "\tpmucal_cp_reset_assert();\n}"
-          )
-
-          replace_exact(
-              "kernel/drivers/video/fbdev/exynos/"
-              "dpu_7885/decon_reg.c",
-              "const double decon_clocks_table[][CLK_ID_MAX]",
-              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-          )
-          PY
-
-          git -C kernel diff \
-            > diagnostics/v23.patch
-
       - name: Configure kernel
         run: |
           set -euo pipefail
@@ -97,73 +10,14 @@ jobs:
 
           grep -q '^CONFIG_CP_PMUCAL=y' out/.config
 
+          # Keep CP HARD OFF patch.
+          # Reduce kernel image size.
           scripts/config --file out/.config \
-            -e SECURITY_SELINUX_DEVELOP \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+            -d DEBUG_INFO \
+            -d DEBUG_INFO_DWARF4 \
+            -d DEBUG_INFO_DWARF5 \
+            -d DEBUG_INFO_REDUCED
 
           make O=out olddefconfig
 
           cp out/.config ../diagnostics/final.config
-
-      - name: Targeted display driver test
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 \
-            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
-            2>&1 | tee ../diagnostics/display-test.log
-
-      - name: Full kernel build
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 Image \
-            2>&1 | tee ../diagnostics/build.log
-
-      - name: Prepare artifact
-        run: |
-          set -euo pipefail
-          mkdir -p artifact
-
-          cp kernel/out/arch/arm64/boot/Image \
-            artifact/Image
-
-          cp diagnostics/v23.patch \
-            artifact/v23.patch
-
-          test -s artifact/Image
-
-          sha256sum artifact/Image \
-            > artifact/SHA256SUMS
-
-          printf '%s\n' \
-            "V23 kernel build passed" \
-            "NOT FLASHABLE YET" \
-            "CP power-off not hardware verified" \
-            "SELinux runtime state not verified" \
-            > artifact/STATUS.txt
-
-      - name: Upload kernel
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCOVER4S-V23-KERNEL
-          path: artifact/
-
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCOVER4S-V23-DIAGNOSTICS
-          path: diagnostics/
-          if-no-files-found: warn
