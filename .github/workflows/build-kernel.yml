@@ -1,5 +1,5 @@
 
-name: XCOVER4S V38 FULL CPLOCK BUILD
+name: XCOVER4S V39 BUILD AND ODIN CANDIDATE
 
 on:
   workflow_dispatch:
@@ -18,6 +18,9 @@ jobs:
       KCFLAGS: -Wno-error
 
     steps:
+      - name: Checkout private repository
+        uses: actions/checkout@v4
+
       - name: Install dependencies
         run: |
           set -euo pipefail
@@ -26,223 +29,124 @@ jobs:
             git make bc bison flex build-essential \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev python3
+            libssl-dev libelf-dev python3 \
+            python3-pip lz4
 
-      - name: Clone V36 source
+      - name: Verify private boot backup
         run: |
           set -euo pipefail
+
+          test -s private/boot-backup.img
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("private/boot-backup.img")
+          header = p.open("rb").read(8)
+
+          if header != b"ANDROID!":
+              raise SystemExit(
+                  "Unsupported boot image magic. "
+                  "Refusing to repack."
+              )
+
+          print("Android boot image magic OK")
+          print("Boot backup size:", p.stat().st_size)
+          PY
+
+      - name: Clone exact kernel source
+        run: |
+          set -euo pipefail
+
           git clone \
+            --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
+
           git -C kernel checkout \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply V38 patches
+      - name: Apply guarded V39 CPLOCK
         run: |
           set -euo pipefail
 
-          cat > /tmp/patch_v38.py <<'PY'
+          cat > /tmp/patch.py <<'PY'
           from pathlib import Path
           import re
 
-          root = Path("kernel")
-
-          def replace_once(path, old, new):
-              p = root / path
-              s = p.read_text()
-              if s.count(old) != 1:
-                  raise RuntimeError(
-                      f"Expected one match in {path}: {old!r}; "
-                      f"found {s.count(old)}"
-                  )
-              p.write_text(s.replace(old, new, 1))
-              print("PATCHED", path)
-
-          # Previously needed DPU build fixes.
-          replace_once(
-              "drivers/video/fbdev/exynos/dpu_7885/decon_reg.c",
-              "const double decon_clocks_table",
-              "const unsigned long decon_clocks_table"
+          path = Path(
+              "kernel/drivers/soc/samsung/cal-if/pmucal_cp.c"
           )
 
-          replace_once(
-              "drivers/video/fbdev/exynos/dpu_7885/decon.h",
-              "#define decon_create_debugfs(...) do { } while(0)",
-              "#define decon_create_debugfs(...) (0)"
-          )
+          source = path.read_text()
 
-          replace_once(
-              "drivers/video/fbdev/exynos/dpu_7885/decon.h",
-              "#define decon_destroy_debugfs(..) do { } while(0)",
-              "#define decon_destroy_debugfs(...) do { } while(0)"
-          )
-
-          helper = root / (
-              "drivers/video/fbdev/exynos/dpu_7885/helper.c"
-          )
-          h = helper.read_text()
-          if "ACQUIRE_FENCE_LEN" not in h:
-              raise RuntimeError("ACQUIRE_FENCE_LEN not found")
-          if "#define ACQUIRE_FENCE_LEN" not in h:
-              helper.write_text(
-                  "#ifndef ACQUIRE_FENCE_LEN\n"
-                  "#define ACQUIRE_FENCE_LEN 1024\n"
-                  "#endif\n\n" + h
-              )
-
-          # CPLOCK: PMUCAL functions have int ret as
-          # their first declaration. Insert AFTER it.
-          cp = (
-              "drivers/soc/samsung/cal-if/pmucal_cp.c"
-          )
-
-          for func in (
+          for name in (
               "pmucal_cp_init",
               "pmucal_cp_reset_release",
           ):
-              old = (
-                  f"int {func}(void)\n"
-                  "{\n"
-                  "\tint ret;\n"
+              pattern = re.compile(
+                  r"(\bint\s+"
+                  + re.escape(name)
+                  + r"\s*\(\s*void\s*\)\s*\{"
+                  r"\s*int\s+ret\s*;)"
               )
-              new = (
-                  old
+
+              matches = list(pattern.finditer(source))
+
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Unexpected source layout: {name}"
+                  )
+
+              insertion = (
+                  matches[0].group(1)
                   + "\n"
-                  + "\t/* CPLOCK V38 */\n"
+                  + "\t/* CPLOCK_V39 */\n"
                   + "\tpr_warn_ratelimited("
-                  + f"\"CPLOCK: denied {func}\\n\");\n"
+                  + f"\"CPLOCK: denied {name}\\n\""
+                  + ");\n"
                   + "\treturn -EPERM;\n"
               )
-              replace_once(cp, old, new)
 
-          # Reject SS310AP modem_on before any CP
-          # activation code, but after declarations.
-          modem = (
-              "drivers/misc/modem_v1/"
-              "modem_ctrl_ss310ap.c"
-          )
-          p = root / modem
-          s = p.read_text()
-
-          pattern = (
-              r"(static int ss310ap_on"
-              r"\(struct modem_ctl \*mc\)\s*\{"
-              r".*?"
-              r"int cp_status = mbox_extract_value"
-              r"\(MCU_CP, mc->mbx_cp_status,"
-              r".*?;\s*)"
-              r"(\s*mif_err\(\"\+\+\+\\n\"\);)"
-          )
-
-          def patch_on(match):
-              return (
-                  match.group(1)
-                  + '\n\t/* CPLOCK V38 */\n'
-                  + '\tmif_err("CPLOCK: modem_on denied\\n");\n'
-                  + '\tmc->phone_state = STATE_OFFLINE;\n'
-                  + '\treturn -EPERM;\n\n'
-                  + match.group(2)
+              source = (
+                  source[:matches[0].start()]
+                  + insertion
+                  + source[matches[0].end():]
               )
 
-          s, count = re.subn(
-              pattern,
-              patch_on,
-              s,
-              count=1,
-              flags=re.S
-          )
-
-          if count != 1:
-              raise RuntimeError(
-                  "Could not safely patch ss310ap_on"
+          if "#include <linux/errno.h>" not in source:
+              source = (
+                  "#include <linux/errno.h>\n"
+                  + source
               )
 
-          p.write_text(s)
-          print("PATCHED SS310AP modem_on")
+          if "#include <linux/printk.h>" not in source:
+              source = (
+                  "#include <linux/printk.h>\n"
+                  + source
+              )
 
-          # Add an explicit, non-panicking OFF attempt.
-          # This is not proof of physical power removal.
-          p = root / cp
-          s = p.read_text()
+          path.write_text(source)
 
-          if "CPLOCK V38 FORCE OFF" in s:
-              raise RuntimeError("Already patched")
-
-          s = (
-              '#include <linux/init.h>\n'
-              '#include <linux/errno.h>\n'
-              '#include <linux/printk.h>\n'
-              + s
-          )
-
-          s += r'''
-
-          /* CPLOCK V38 FORCE OFF */
-          static int __init xcover4s_cp_force_off(void)
-          {
-              int ret;
-
-              pr_info("CPLOCK: force-off requested\n");
-
-              if (!pmucal_cp_list.reset_assert) {
-                  pr_err("CPLOCK: OFF sequence missing\n");
-                  return 0;
-              }
-
-              ret = pmucal_rae_handle_cp_seq(
-                  pmucal_cp_list.reset_assert,
-                  pmucal_cp_list.num_reset_assert);
-
-              if (ret)
-                  pr_err("CPLOCK: OFF failed: %d\n", ret);
-              else
-                  pr_info("CPLOCK: OFF sequence complete\n");
-
-              return 0;
-          }
-          late_initcall(xcover4s_cp_force_off);
-          '''
-
-          p.write_text(s)
-          print("PATCHED CP force-off")
-
-          # Archive source references for next revision.
-          pattern = re.compile(
-              r"CP_POWER_ON|CP_POWER_OFF|"
-              r"cal_cp_init|cal_cp_reset_release|"
-              r"pmucal_cp_init|pmucal_cp_reset_release"
-          )
-
-          with open("/tmp/v38-callers.txt", "w") as out:
-              for file in (root / "drivers").rglob("*.c"):
-                  for number, line in enumerate(
-                      file.read_text(
-                          errors="replace"
-                      ).splitlines(), 1
-                  ):
-                      if pattern.search(line):
-                          out.write(
-                              f"{file}:{number}: {line}\n"
-                          )
-
-          print("V38 patches applied")
+          if source.count("/* CPLOCK_V39 */") != 2:
+              raise SystemExit("CPLOCK patch verification failed")
           PY
 
-          python3 /tmp/patch_v38.py
+          python3 /tmp/patch.py
+
+          git -C kernel diff --check
 
       - name: Configure kernel
         run: |
           set -euo pipefail
           cd kernel
-          mkdir -p out
 
-          make O=out \
-            lineage_xcover4s_defconfig
-
+          make O=out lineage_xcover4s_defconfig
           make O=out olddefconfig
 
           grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
           grep -qx 'CONFIG_SEC_MODEM_SS310AP=y' out/.config
+          grep -qx 'CONFIG_UMTS_MODEM_SS310AP=y' out/.config
 
       - name: Full kernel build
         run: |
@@ -250,99 +154,90 @@ jobs:
           cd kernel
 
           make O=out -j2 Image \
-            2>&1 | tee /tmp/v38-build.log
+            2>&1 | tee ../v39-build.log
 
           test -s out/arch/arm64/boot/Image
 
-      - name: Validate ARM64 image
+      - name: Install Android boot image tools
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import struct
+          git clone \
+            --depth 1 \
+            https://github.com/osm0sis/mkbootimg.git \
+            boottools
 
-          p = Path(
-              "kernel/out/arch/arm64/boot/Image"
-          )
+          test -f boottools/unpackbootimg
+          test -f boottools/mkbootimg
 
-          data = p.read_bytes()
+      - name: Prepare Odin candidate
+        run: |
+          set -euo pipefail
 
-          if len(data) < 1000000:
-              raise SystemExit("Kernel unexpectedly small")
+          mkdir -p dist unpacked
 
-          magic = struct.unpack_from(
-              "<I", data, 0x38
-          )[0]
+          cp private/boot-backup.img \
+            dist/known-good-boot.img
 
-          if magic != 0x644d5241:
-              raise SystemExit(
-                  "Invalid ARM64 kernel header"
-              )
+          cp kernel/out/arch/arm64/boot/Image \
+            dist/Image
 
-          print("ARM64 kernel header OK")
-          print("Image size:", len(data))
-          PY
+          # A boot image cannot be safely repacked
+          # until all original boot parameters,
+          # ramdisk, DTB and header layout have
+          # been verified.
+          #
+          # Deliberately fail closed rather than
+          # producing an unvalidated Odin tar.
+
+          echo \
+            "Boot repack requires verified original layout." \
+            > dist/REPACK-NOT-VALIDATED.txt
+
+          echo \
+            "No flashable Odin package generated." \
+            >> dist/REPACK-NOT-VALIDATED.txt
 
       - name: Collect diagnostics
         if: always()
         run: |
           mkdir -p dist
 
-          if [ -f kernel/out/arch/arm64/boot/Image ]; then
-            cp kernel/out/arch/arm64/boot/Image \
-              dist/Image
-          fi
-
-          if [ -f kernel/out/.config ]; then
-            cp kernel/out/.config dist/final.config
-          fi
-
-          if [ -f /tmp/v38-build.log ]; then
-            cp /tmp/v38-build.log dist/build.log
-          fi
-
-          if [ -f /tmp/v38-callers.txt ]; then
-            cp /tmp/v38-callers.txt \
-              dist/cp-callers.txt
+          if [ -f v39-build.log ]; then
+            cp v39-build.log dist/build.log
           fi
 
           if [ -d kernel/.git ]; then
-            git -C kernel diff > dist/v38.patch
+            git -C kernel diff > dist/v39.patch
             git -C kernel rev-parse HEAD \
               > dist/source-commit.txt
           fi
 
-          if [ -f dist/Image ]; then
-            sha256sum dist/Image \
-              > dist/Image.sha256
+          if [ -f kernel/out/.config ]; then
+            cp kernel/out/.config dist/kernel.config
           fi
 
           cat > dist/README.txt <<'EOF'
-          XCOVER4S V38 EXPERIMENTAL
+          XCOVER4S V39
 
-          Full kernel build.
-          Not an Odin package.
+          Experimental CPLOCK kernel build.
 
-          C90 declaration issue addressed.
-          PMUCAL CP start gates added.
-          SS310AP modem_on denied.
-          PMUCAL OFF attempted at late init.
+          This build blocks two PMUCAL CP-start
+          entry points but does not implement
+          a complete verified CP power-off lock.
 
-          Remaining risks:
-          - Other CP reactivation paths
-          - Late power-off timing
-          - Kernel boot compatibility
-          - Unknown physical CP power state
+          The kernel has not been boot-tested.
 
-          DO NOT FLASH IMAGE DIRECTLY.
+          No Odin flash package is generated.
+
+          DO NOT FLASH THE OUTPUT.
           EOF
 
-      - name: Upload V38
+      - name: Upload V39 results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V38-FULL-KERNEL
+          name: XCOVER4S-V39-BUILD-AND-REPACK-AUDIT
           path: dist/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
