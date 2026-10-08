@@ -1,889 +1,200 @@
-name: XCover4s CP OFF + SELinux Permissive v13
 
+name: XCover4s V14 CP OFF and SELinux permissive
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-env:
-  ARCH: arm64
-  CC: clang
-  CLANG_TRIPLE: aarch64-linux-gnu-
-  CROSS_COMPILE: aarch64-linux-gnu-
-  KCFLAGS: -Wno-error
-
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 50
-
+    timeout-minutes: 65
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CLANG_TRIPLE: aarch64-linux-gnu-
     steps:
-
-      # ==========================================================
-      # TOOLS
-      # ==========================================================
-
-      - name: Install dependencies
+      - uses: actions/checkout@v4
+      - name: Install build tools
         run: |
-          set -eux
-
           sudo apt-get update
-
-          sudo apt-get install -y \
-            git \
-            python3 \
-            make \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            libncurses-dev \
-            device-tree-compiler \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            clang \
-            lld \
-            llvm \
-            cpio \
-            rsync \
-            unzip \
-            wget \
-            curl \
-            file
-
-      # ==========================================================
-      # SOURCE
-      # ==========================================================
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+          sudo apt-get install -y git python3 make bc bison flex libssl-dev libelf-dev libncurses-dev device-tree-compiler gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu clang-14 lld-14 llvm-14 cpio rsync unzip wget curl file
       - name: Clone kernel
         run: |
-          set -eux
-
-          git clone \
-            --depth 1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
-          echo "KERNEL COMMIT:"
-          git -C kernel rev-parse HEAD
-
-      # ==========================================================
-      # EXACT CP PATCH
-      # ==========================================================
-
-      - name: Apply exact CP OFF patch
-        working-directory: kernel
+          git clone --depth 1 --branch lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git -C kernel rev-parse HEAD | tee source-commit.txt
+      - name: Write and test CP patch
         shell: bash
         run: |
-          set -eux
-
-          python3 <<'PY'
+          set -euo pipefail
+          cat > patch_v14.py <<'PYCODE'
           from pathlib import Path
-
-          p = Path("drivers/soc/samsung/pmu-cp.c")
-          s = p.read_text()
-
-          original = s
-
-          # ------------------------------------------------------
-          # 1. CP RESET
-          # ------------------------------------------------------
-
-          old = "cp_ctrl |= CP_RESET_SET | CP_PWRON;"
-
-          if s.count(old) != 1:
-              raise SystemExit(
-                  "Expected exactly one CP_RESET_SET | CP_PWRON"
-              )
-
-          s = s.replace(
-              old,
-              """/*
-               * XCOVER4S_V13:
-               * Reset CP without powering the cellular CP on.
-               */
-              cp_ctrl |= CP_RESET_SET;""",
-              1
-          )
-
-          # ------------------------------------------------------
-          # FUNCTION PARSER
-          # ------------------------------------------------------
-
-          def find_function(text, name):
-              candidates = [
-                  "int " + name + "(",
-                  "static int " + name + "(",
-              ]
-
-              start = -1
-
-              for marker in candidates:
-                  x = text.find(marker)
-                  if x >= 0:
-                      start = x
-                      break
-
-              if start < 0:
-                  raise SystemExit(
-                      "Function not found: " + name
-                  )
-
-              brace = text.find("{", start)
-
-              if brace < 0:
-                  raise SystemExit(
-                      "Opening brace not found: " + name
-                  )
-
-              depth = 0
-              i = brace
-
-              while i < len(text):
-                  if text[i] == "{":
-                      depth += 1
-                  elif text[i] == "}":
-                      depth -= 1
-                      if depth == 0:
-                          return start, i + 1
-                  i += 1
-
-              raise SystemExit(
-                  "Closing brace not found: " + name
-              )
-
-          # ------------------------------------------------------
-          # 2. CP RELEASE
-          # ------------------------------------------------------
-
-          start, end = find_function(
-              s,
-              "exynos_cp_release"
-          )
-
-          release = """int exynos_cp_release(void)
-          {
-              /*
-               * XCOVER4S_V13:
-               *
-               * Never execute the normal:
-               *
-               *     CP_START | CP_POWER_ON
-               *
-               * release operation.
-               */
-              pr_info(
-                  "XCOVER4S_V13: CP release blocked\\\\n"
-              );
-
-              return exynos_set_cp_power_onoff(
-                  CP_POWER_OFF
-              );
-          }"""
-
-          s = s[:start] + release + s[end:]
-
-          # ------------------------------------------------------
-          # 3. CENTRAL CP POWER FUNCTION
-          # ------------------------------------------------------
-
-          marker = """int exynos_set_cp_power_onoff(enum cp_mode mode)
-          {
-              u32 cp_ctrl;
-              u32 __maybe_unused cp_ctrl2;
-              int ret = 0;
-              int wait_count = 0;
-
-              pr_info("%s: mode[%d]\\n", __func__, mode);
-          """
-
-          if s.count(marker) != 1:
-              raise SystemExit(
-                  "Central CP function marker not found exactly once"
-              )
-
-          replacement = """int exynos_set_cp_power_onoff(enum cp_mode mode)
-          {
-              u32 cp_ctrl;
-              u32 __maybe_unused cp_ctrl2;
-              int ret = 0;
-              int wait_count = 0;
-
-              pr_info("%s: mode[%d]\\\\n", __func__, mode);
-
-              /*
-               * XCOVER4S_V13:
-               *
-               * Never allow a caller to request CP_POWER_ON.
-               */
-              if (mode == CP_POWER_ON) {
-                  pr_info(
-                      "XCOVER4S_V13: CP_POWER_ON blocked\\\\n"
-                  );
-
-                  mode = CP_POWER_OFF;
-              }
-          """
-
-          s = s.replace(
-              marker,
-              replacement,
-              1
-          )
-
-          # ------------------------------------------------------
-          # 4. SECURE OFF PATH
-          # ------------------------------------------------------
-
-          secure_old = """ret = exynos_smc_write(CP_CTRL_NS, cp_ctrl & ~CP_PWRON);
-          if (ret < 0)
-              pr_err("ERR! write Fail: %d\\n", ret);
-          else
-              pr_info("%s: CP Power Down: [0x%08X] -> [0x%08X]\\n", __func__,
-                  cp_ctrl, exynos_smc_read(CP_CTRL_NS));"""
-
-          secure_new = """ret = exynos_smc_write(
-              CP_CTRL_NS,
-              cp_ctrl & ~CP_PWRON
-          );
-
-          if (ret < 0)
-              pr_err("ERR! write Fail: %d\\\\n", ret);
-          else
-              pr_info(
-                  "%s: CP Power Down: [0x%08X] -> [0x%08X]\\\\n",
-                  __func__,
-                  cp_ctrl,
-                  exynos_smc_read(CP_CTRL_NS)
-              );
-
-          /*
-           * XCOVER4S_V13:
-           * Also clear CP_START.
-           */
-          cp_ctrl = exynos_smc_read(CP_CTRL_S);
-
-          if (cp_ctrl == (u32)-1)
-              return -1;
-
-          ret = exynos_smc_write(
-              CP_CTRL_S,
-              cp_ctrl & ~CP_START
-          );
-
-          if (ret < 0)
-              pr_err(
-                  "XCOVER4S_V13: CP_START clear failed: %d\\\\n",
-                  ret
-              );
-          else
-              pr_info(
-                  "XCOVER4S_V13: CP_START cleared\\\\n"
-              );"""
-
-          if secure_old not in s:
-              raise SystemExit(
-                  "Secure OFF block not found exactly"
-              )
-
-          s = s.replace(
-              secure_old,
-              secure_new,
-              1
-          )
-
-          # ------------------------------------------------------
-          # 5. NON-SECURE OFF PATH
-          # ------------------------------------------------------
-
-          ns_old = """ret = exynos_pmu_read(EXYNOS_PMU_CP_CTRL_NS, &cp_ctrl);
-          cp_ctrl &= ~CP_PWRON;
-
-          ret = exynos_pmu_write(EXYNOS_PMU_CP_CTRL_NS, cp_ctrl);
-          if (ret < 0)
-              pr_err("ERR! write Fail: %d\\n", ret);"""
-
-          ns_new = """ret = exynos_pmu_read(
-              EXYNOS_PMU_CP_CTRL_NS,
-              &cp_ctrl
-          );
-
-          if (ret < 0)
-              return ret;
-
-          cp_ctrl &= ~CP_PWRON;
-
-          ret = exynos_pmu_write(
-              EXYNOS_PMU_CP_CTRL_NS,
-              cp_ctrl
-          );
-
-          if (ret < 0)
-              pr_err(
-                  "ERR! CP_PWRON clear Fail: %d\\\\n",
-                  ret
-              );
-
-          /*
-           * XCOVER4S_V13:
-           * Also clear CP_START.
-           */
-          ret = exynos_pmu_read(
-              EXYNOS_PMU_CP_CTRL_S,
-              &cp_ctrl
-          );
-
-          if (ret < 0)
-              return ret;
-
-          cp_ctrl &= ~CP_START;
-
-          ret = exynos_pmu_write(
-              EXYNOS_PMU_CP_CTRL_S,
-              cp_ctrl
-          );
-
-          if (ret < 0)
-              pr_err(
-                  "XCOVER4S_V13: CP_START clear failed: %d\\\\n",
-                  ret
-              );
-          else
-              pr_info(
-                  "XCOVER4S_V13: CP_START cleared\\\\n"
-              );"""
-
-          if ns_old not in s:
-              raise SystemExit(
-                  "Non-secure OFF block not found exactly"
-              )
-
-          s = s.replace(
-              ns_old,
-              ns_new,
-              1
-          )
-
-          if s == original:
-              raise SystemExit(
-                  "PATCH MADE NO CHANGES"
-              )
-
+          import re,sys
+          p=Path(sys.argv[1]); s=p.read_text()
+          def body(name):
+           global s
+           m=re.search(r'(?m)^int '+name+r'\([^\n]*\)\n\{',s)
+           if not m: raise RuntimeError('Function not found: '+name)
+           depth=0
+           for i in range(s.index('{',m.start()),len(s)):
+            if s[i]=='{': depth+=1
+            elif s[i]=='}':
+             depth-=1
+             if depth==0: return m.start(),i+1
+           raise RuntimeError('Unclosed '+name)
+          for name in ['exynos_cp_reset','exynos_cp_release']:
+           a,b=body(name)
+           s=s[:a]+f'int {name}(void)\n{{\n\tpr_info("XCOVER4S_V14: {name} blocked\\n");\n\treturn -EPERM;\n}}'+s[b:]
+          a,b=body('exynos_set_cp_power_onoff'); f=s[a:b]
+          needle='\tpr_info("%s: mode[%d]\\n", __func__, mode);'
+          assert f.count(needle)==1
+          f=f.replace(needle,needle+'\n\t/* XCOVER4S_V14: force every ON request into OFF path */\n\tif (mode == CP_POWER_ON)\n\t\tmode = CP_POWER_OFF;',1)
+          # clear CP_START in secure and nonsecure off paths, before function return
+          assert f.count('cp_ctrl & ~CP_PWRON')==1
+          assert f.count('cp_ctrl &= ~CP_PWRON;')==1
+          secure='''\n\t\t/* XCOVER4S_V14: clear CP_START on secure path */
+          \t\tcp_ctrl = exynos_smc_read(CP_CTRL_S);
+          \t\tif (cp_ctrl == (u32)-1)
+          \t\t\treturn -EIO;
+          \t\tret = exynos_smc_write(CP_CTRL_S, cp_ctrl & ~CP_START);
+          \t\tif (ret < 0)
+          \t\t\treturn ret;
+          '''
+          nonsecure='''\n\t\t/* XCOVER4S_V14: clear CP_START on nonsecure path */
+          \t\tret = exynos_pmu_read(EXYNOS_PMU_CP_CTRL_S, &cp_ctrl);
+          \t\tif (ret < 0)
+          \t\t\treturn ret;
+          \t\tret = exynos_pmu_write(EXYNOS_PMU_CP_CTRL_S, cp_ctrl & ~CP_START);
+          \t\tif (ret < 0)
+          \t\t\treturn ret;
+          '''
+          # locate else OFF branches using anchor
+          secure_anchor='\t\tret = exynos_smc_write(CP_CTRL_NS, cp_ctrl & ~CP_PWRON);'
+          ns_anchor='\t\tcp_ctrl &= ~CP_PWRON;'
+          # inject before anchored operation, no need for after; cp start clear before power down
+          f=f.replace(secure_anchor,secure+secure_anchor,1)
+          f=f.replace(ns_anchor,nonsecure+ns_anchor,1)
+          s=s[:a]+f+s[b:]
+          assert s.count('XCOVER4S_V14')>=5
           p.write_text(s)
-
-          print("========================================")
-          print("CP OFF PATCH APPLIED")
-          print("========================================")
-          PY
-
-      # ==========================================================
-      # SELINUX PERMISSIVE - SAME KERNEL
-      # ==========================================================
-
-      - name: Apply SELinux permissive
-        working-directory: kernel
+          print('PATCH V14 SUCCESS: reset/release blocked, ON redirected, START clear in both OFF paths')
+          PYCODE
+          python3 -m py_compile patch_v14.py
+          python3 patch_v14.py kernel/drivers/soc/samsung/pmu-cp.c
+          git -C kernel diff --check
+          git -C kernel diff -- drivers/soc/samsung/pmu-cp.c > cp-v14.patch
+          test -s cp-v14.patch
+      - name: Patch SELinux boot default
         shell: bash
         run: |
-          set -eux
-
-          python3 <<'PY'
+          set -euo pipefail
+          python3 - <<'PYCODE'
           from pathlib import Path
           import re
-
-          changed = []
-
-          for p in Path("security/selinux").rglob("*.c"):
-              old = p.read_text()
-
-              new = re.sub(
-                  r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
-                  r'\g<1>0\g<2>',
-                  old
-              )
-
-              if new != old:
+          found=[]
+          for p in Path('kernel/security/selinux').rglob('*.c'):
+              old=p.read_text()
+              new,n=re.subn(r'(\bselinux_enforcing\s*=\s*)1(\s*;)',r'\g<1>0\g<2>',old)
+              if n:
                   p.write_text(new)
-                  changed.append(str(p))
-
-          if not changed:
-              raise SystemExit(
-                  "SELinux permissive patch was NOT applied"
-              )
-
-          print("SELinux files changed:")
-
-          for x in changed:
-              print(x)
-          PY
-
-      # ==========================================================
-      # VERIFY CP + SELINUX BEFORE COMPILING
-      # ==========================================================
-
-      - name: Verify CP and SELinux patches
+                  found.append((str(p),n))
+          if not found:
+              raise SystemExit('STOP: Cannot locate SELinux initial enforcing assignment. No image will be built.')
+          print('SELinux initial assignment patched:',found)
+          PYCODE
+      - name: Configure kernel and verify permissive default
         working-directory: kernel
         shell: bash
         run: |
-          set -eux
-
-          python3 <<'PY'
-          from pathlib import Path
-
-          s = Path(
-              "drivers/soc/samsung/pmu-cp.c"
-          ).read_text()
-
-          # CP markers
-          for x in [
-              "XCOVER4S_V13",
-              "CP_POWER_ON blocked",
-              "CP release blocked",
-              "CP_START cleared",
-          ]:
-              if x not in s:
-                  raise SystemExit(
-                      "MISSING CP PATCH: " + x
-                  )
-
-          # Dangerous original operations must be gone.
-          for x in [
-              "CP_RESET_SET | CP_PWRON",
-              "CP_START | CP_POWER_ON",
-          ]:
-              if x in s:
-                  raise SystemExit(
-                      "DANGEROUS CP OPERATION REMAINS: " + x
-                  )
-
-          # Required OFF operations.
-          if "cp_ctrl &= ~CP_PWRON;" not in s:
-              raise SystemExit(
-                  "CP_PWRON clear missing"
-              )
-
-          if "cp_ctrl &= ~CP_START;" not in s:
-              raise SystemExit(
-                  "CP_START clear missing"
-              )
-
-          # SELinux source must contain our permissive change.
-          selinux_hits = []
-
-          for p in Path("security/selinux").rglob("*.c"):
-              text = p.read_text()
-
-              if re_search := __import__("re").search(
-                  r'\bselinux_enforcing\s*=\s*0\s*;',
-                  text
-              ):
-                  selinux_hits.append(str(p))
-
-          if not selinux_hits:
-              raise SystemExit(
-                  "SELinux permissive assignment not found"
-              )
-
-          print("========================================")
-          print("CP OFF VERIFIED")
-          print("SELINUX PERMISSIVE VERIFIED")
-          print("========================================")
-          print("SELinux files:")
-          for x in selinux_hits:
-              print(x)
-          PY
-
-      # ==========================================================
-      # CONFIG
-      # ==========================================================
-
-      - name: Configure kernel
-        working-directory: kernel
-        run: |
-          set -eux
-
-          make \
-            O="$PWD/out" \
-            ARCH="$ARCH" \
-            lineage_xcover4s_defconfig
-
-          make \
-            O="$PWD/out" \
-            ARCH="$ARCH" \
-            olddefconfig
-
-          echo
-          echo "SELINUX CONFIG:"
-          grep -E \
-            '^CONFIG_SECURITY_SELINUX|^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE' \
-            out/.config \
-            || true
-
-      # ==========================================================
-      # TARGETED COMPILE
-      # ==========================================================
-
-      - name: Targeted PMU compile
+          set -euo pipefail
+          export CC=clang-14
+          make O="$PWD/out" lineage_xcover4s_defconfig
+          ./scripts/config --file out/.config -e SECURITY_SELINUX -e SECURITY_SELINUX_DEVELOP -e SECURITY_SELINUX_BOOTPARAM --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+          make O="$PWD/out" olddefconfig
+          grep -q '^CONFIG_SECURITY_SELINUX=y$' out/.config
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y$' out/.config
+          grep -q '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0$' out/.config
+          grep -E '^CONFIG_SECURITY_SELINUX' out/.config
+      - name: Targeted CP compilation
         working-directory: kernel
         shell: bash
-        timeout-minutes: 5
         run: |
-          set -o pipefail
-
-          make -j"$(nproc)" \
-            O="$PWD/out" \
-            ARCH="$ARCH" \
-            CC="$CC" \
-            CLANG_TRIPLE="$CLANG_TRIPLE" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            KCFLAGS="$KCFLAGS" \
-            drivers/soc/samsung/pmu-cp.o \
-            2>&1 \
-          | tee targeted-build.log
-
-          echo "TARGETED PMU COMPILE PASSED"
-
-      # ==========================================================
-      # FULL BUILD
-      # ==========================================================
-
+          set -euo pipefail
+          make -j"$(nproc)" O="$PWD/out" CC=clang-14 KCFLAGS=-Wno-error drivers/soc/samsung/pmu-cp.o 2>&1 | tee targeted.log
       - name: Full kernel build
         working-directory: kernel
         shell: bash
-        timeout-minutes: 25
         run: |
-          set -o pipefail
-
-          make -j"$(nproc)" \
-            O="$PWD/out" \
-            ARCH="$ARCH" \
-            CC="$CC" \
-            CLANG_TRIPLE="$CLANG_TRIPLE" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            KCFLAGS="$KCFLAGS" \
-            Image dtbs \
-            2>&1 \
-          | tee build.log \
-          | awk '
-              /aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/ {
-                  next
-              }
-
-              /aarch64-linux-gnu-objdump: Warning: Bogus end-of-siblings marker/ {
-                  next
-              }
-
-              /aarch64-linux-gnu-objdump: Warning: Further warnings about bogus end-of-sibling markers suppressed/ {
-                  next
-              }
-
-              /aarch64-linux-gnu-objdump: Warning: DIE at offset/ {
-                  next
-              }
-
-              {
-                  print
-                  fflush()
-              }
-            '
-
-          echo
-          echo "========================================"
-          echo "FULL KERNEL BUILD PASSED"
-          echo "========================================"
-
-      # ==========================================================
-      # IMAGE
-      # ==========================================================
-
-      - name: Verify kernel Image
-        working-directory: kernel
+          set -euo pipefail
+          make -j"$(nproc)" O="$PWD/out" CC=clang-14 KCFLAGS=-Wno-error Image dtbs 2>&1 | tee build.log | grep -vE 'objdump: Warning: (Unrecognized form|DIE at offset|Bogus end-of-siblings)' || test "${PIPESTATUS[0]}" -eq 0
+          test -s out/arch/arm64/boot/Image
+      - name: Check exact original boot
+        shell: bash
         run: |
-          set -eux
-
-          IMAGE="out/arch/arm64/boot/Image"
-
-          test -s "$IMAGE"
-
-          file "$IMAGE"
-
-          SIZE="$(stat -c%s "$IMAGE")"
-
-          echo "Image size: $SIZE"
-
-          if [ "$SIZE" -lt 20000000 ]; then
-              echo "ERROR: Image unexpectedly small"
-              exit 1
-          fi
-
-          sha256sum "$IMAGE"
-
-      # ==========================================================
-      # ORIGINAL BOOT
-      # ==========================================================
-
-      - name: Verify original boot
-        run: |
-          set -eux
-
+          set -euo pipefail
           test -f boot-original.img
-
-          SHA="$(
-            sha256sum boot-original.img |
-            awk '{print $1}'
-          )"
-
-          EXPECTED="f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9"
-
-          echo "Original SHA256:"
-          echo "$SHA"
-
-          if [ "$SHA" != "$EXPECTED" ]; then
-              echo "ERROR: ORIGINAL BOOT HASH MISMATCH"
-              exit 1
-          fi
-
-          echo "ORIGINAL BOOT VERIFIED"
-
-      # ==========================================================
-      # MAGISKBOOT
-      # ==========================================================
-
-      - name: Get magiskboot
+          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
+      - name: Download magiskboot
+        shell: bash
         run: |
-          set -eux
-
-          API="https://api.github.com/repos/topjohnwu/Magisk/releases/latest"
-
-          URL="$(
-            curl -fsSL "$API" |
-            python3 -c '
+          set -euo pipefail
+          curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest > magisk-release.json
+          python3 - <<'PYCODE'
           import json
-          import sys
-
-          d = json.load(sys.stdin)
-
-          for a in d["assets"]:
-              if a["name"].endswith(".apk"):
-                  print(a["browser_download_url"])
-                  break
-          '
-          )"
-
-          test -n "$URL"
-
-          wget -q \
-            "$URL" \
-            -O Magisk.apk
-
-          unzip -j -o \
-            Magisk.apk \
-            'lib/x86_64/libmagiskboot.so' \
-            -d .
-
-          mv \
-            libmagiskboot.so \
-            magiskboot
-
+          from urllib.request import urlretrieve
+          d=json.load(open('magisk-release.json'))
+          u=next(x['browser_download_url'] for x in d['assets'] if x['name'].endswith('.apk'))
+          urlretrieve(u,'Magisk.apk')
+          PYCODE
+          unzip -p Magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
           chmod +x magiskboot
-
-          file magiskboot
-
-      # ==========================================================
-      # UNPACK
-      # ==========================================================
-
-      - name: Unpack original boot
+          test -s magiskboot
+      - name: Repack and verify embedded kernel
+        shell: bash
         run: |
-          set -eux
-
-          rm -rf boot-work
-
+          set -euo pipefail
           mkdir boot-work
-
           cd boot-work
-
-          ../magiskboot unpack \
-            ../boot-original.img
-
+          ../magiskboot unpack ../boot-original.img
           test -s kernel
-
-      # ==========================================================
-      # REPLACE KERNEL
-      # ==========================================================
-
-      - name: Replace kernel
-        run: |
-          set -eux
-
-          cp \
-            kernel/out/arch/arm64/boot/Image \
-            boot-work/kernel
-
-          test -s boot-work/kernel
-
-          file boot-work/kernel
-
-          sha256sum boot-work/kernel
-
-      # ==========================================================
-      # REPACK
-      # ==========================================================
-
-      - name: Repack final boot image
-        run: |
-          set -eux
-
-          cd boot-work
-
-          ../magiskboot repack \
-            ../boot-original.img
-
+          cp ../kernel/out/arch/arm64/boot/Image kernel
+          ../magiskboot repack ../boot-original.img
           test -s new-boot.img
-
-          cp \
-            new-boot.img \
-            ../boot-CP-OFF-SELINUX-PERMISSIVE-v13.img
-
+          cp new-boot.img ../boot-CP-OFF-SELINUX-PERMISSIVE-v14.img
           cd ..
-
-          test -s \
-            boot-CP-OFF-SELINUX-PERMISSIVE-v13.img
-
-          file \
-            boot-CP-OFF-SELINUX-PERMISSIVE-v13.img
-
-          sha256sum \
-            boot-CP-OFF-SELINUX-PERMISSIVE-v13.img
-
-      # ==========================================================
-      # FINAL VERIFICATION
-      # ==========================================================
-
-      - name: Re-unpack and verify final boot
+          mkdir verify-boot
+          cd verify-boot
+          ../magiskboot unpack ../boot-CP-OFF-SELINUX-PERMISSIVE-v14.img
+          cmp kernel ../kernel/out/arch/arm64/boot/Image
+          cd ..
+          sha256sum boot-CP-OFF-SELINUX-PERMISSIVE-v14.img
+      - name: Collect successful build
+        shell: bash
         run: |
-          set -eux
-
-          rm -rf final-check
-
-          mkdir final-check
-
-          cd final-check
-
-          ../magiskboot unpack \
-            ../boot-CP-OFF-SELINUX-PERMISSIVE-v13.img
-
-          test -s kernel
-
-          echo "Final embedded kernel:"
-          file kernel
-
-          sha256sum kernel
-
-          echo
-          echo "========================================"
-          echo "FINAL BOOT IMAGE VERIFIED"
-          echo "========================================"
-
-      # ==========================================================
-      # PACKAGE
-      # ==========================================================
-
-      - name: Package artifacts
-        run: |
-          set -eux
-
           mkdir -p artifacts
-
-          cp \
-            boot-CP-OFF-SELINUX-PERMISSIVE-v13.img \
-            artifacts/
-
-          cp \
-            kernel/out/arch/arm64/boot/Image \
-            artifacts/Image-CP-OFF-SELINUX-PERMISSIVE-v13
-
-          cp \
-            boot-original.img \
-            artifacts/
-
-          cp \
-            kernel/drivers/soc/samsung/pmu-cp.c \
-            artifacts/pmu-cp-v13.c
-
-          cp \
-            kernel/build.log \
-            artifacts/
-
-          cp \
-            kernel/targeted-build.log \
-            artifacts/
-
-          git -C kernel diff \
-            -- drivers/soc/samsung/pmu-cp.c \
-               security/selinux \
-            > artifacts/kernel.patch
-
-          git -C kernel rev-parse HEAD \
-            > artifacts/source-commit.txt
-
-          sha256sum \
-            artifacts/boot-CP-OFF-SELINUX-PERMISSIVE-v13.img \
-            artifacts/Image-CP-OFF-SELINUX-PERMISSIVE-v13 \
-            artifacts/boot-original.img \
-            > artifacts/SHA256SUMS
-
-          ls -lh artifacts/
-
-      # ==========================================================
-      # UPLOAD
-      # ==========================================================
-
-      - name: Upload final artifact
+          cp boot-CP-OFF-SELINUX-PERMISSIVE-v14.img cp-v14.patch source-commit.txt artifacts/
+          cp kernel/out/.config artifacts/kernel.config
+          git -C kernel diff > artifacts/all-v14.patch
+          sha256sum artifacts/boot-CP-OFF-SELINUX-PERMISSIVE-v14.img > artifacts/SHA256SUMS
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-CP-OFF-SELINUX-PERMISSIVE-v13
+          name: XCOVER4S-V14-UNTESTED-BOOT
           path: artifacts/
           if-no-files-found: error
-
-      # ==========================================================
-      # FAILURE DIAGNOSTICS
-      # ==========================================================
-
-      - name: Collect failure diagnostics
+      - name: Collect diagnostics on failure
         if: failure()
+        shell: bash
         run: |
-          mkdir -p failure-diagnostics
-
-          if [ -f kernel/build.log ]; then
-            cp kernel/build.log failure-diagnostics/
-          fi
-
-          if [ -f kernel/targeted-build.log ]; then
-            cp kernel/targeted-build.log failure-diagnostics/
-          fi
-
-          if [ -f kernel/drivers/soc/samsung/pmu-cp.c ]; then
-            cp \
-              kernel/drivers/soc/samsung/pmu-cp.c \
-              failure-diagnostics/
-          fi
-
-          if [ -d kernel ]; then
-            git -C kernel diff \
-              > failure-diagnostics/kernel.patch \
-              || true
-          fi
-
+          mkdir -p failure
+          for f in source-commit.txt cp-v14.patch kernel/targeted.log kernel/build.log kernel/out/.config kernel/drivers/soc/samsung/pmu-cp.c; do
+            if [ -f "$f" ]; then mkdir -p "failure/$(dirname "$f")"; cp "$f" "failure/$f"; fi
+          done
+          if [ -d kernel/.git ]; then git -C kernel diff > failure/all.patch || true; fi
+          echo 'Review the failing GitHub Actions step as well as these diagnostics.' > failure/README.txt
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-v13-FAILURE-DIAGNOSTICS
-          path: failure-diagnostics/
-          if-no-files-found: ignore
+          name: XCOVER4S-V14-FAILURE
+          path: failure/
+          if-no-files-found: error
