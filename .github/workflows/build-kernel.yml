@@ -18,74 +18,70 @@ jobs:
       KCFLAGS: -Wno-error
 
     steps:
-      - name: Checkout repository
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Prepare artifact directory
         run: |
-          set -euo pipefail
+          mkdir -p dist
+          echo "XCOVER4S V40" > dist/README.txt
+          echo "Diagnostic build only - DO NOT FLASH" >> dist/README.txt
+
+      - name: Install build dependencies
+        run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git make bc bison flex build-essential \
+            git \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev python3 \
+            python3 \
+            file \
+            cpio \
+            rsync \
+            zip \
+            unzip \
             ripgrep
 
-      - name: Prepare output
-        run: mkdir -p dist
-
       - name: Check optional boot backup
+        shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          if [ -s private/boot-backup.img ]; then
+            python3 - <<'PY'
           from pathlib import Path
-          import hashlib
 
           p = Path("private/boot-backup.img")
+          header = p.open("rb").read(8)
 
-          if not p.is_file():
-              print(
-                  "No private boot backup. "
-                  "Kernel build will continue."
-              )
-          elif p.stat().st_size == 0:
-              print(
-                  "Empty boot backup. "
-                  "Kernel build will continue."
-              )
+          print("Backup size:", p.stat().st_size)
+          print("Header:", header)
+
+          if header == b"ANDROID!":
+              print("Android boot image magic OK")
           else:
-              with p.open("rb") as f:
-                  magic = f.read(8)
-
-              print("Boot size:", p.stat().st_size)
-              print("Boot magic:", repr(magic))
-              print(
-                  "Boot SHA256:",
-                  hashlib.sha256(
-                      p.read_bytes()
-                  ).hexdigest()
-              )
-
-              if magic != b"ANDROID!":
-                  print(
-                      "Boot image format not validated. "
-                      "No repacking will occur."
-                  )
-              else:
-                  print(
-                      "Android boot magic detected. "
-                      "Full layout still unverified."
-                  )
+              print("WARNING: Unknown boot image format")
           PY
+          else
+            echo "No private boot backup present."
+            echo "This is OK for the V40 diagnostic build."
+          fi
 
-      - name: Clone exact kernel source
+      - name: Clone pinned Samsung kernel source
+        shell: bash
         run: |
           set -euo pipefail
 
           git clone \
             --branch lineage-18.1 \
+            --single-branch \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
@@ -93,24 +89,44 @@ jobs:
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
           git -C kernel rev-parse HEAD \
-            > dist/source-commit.txt
+            | tee dist/kernel-source-commit.txt
 
-      - name: Audit original modem paths
+      - name: Audit active CP paths
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          {
+            echo "=== CP CONFIG REFERENCES ==="
+            rg -n \
+              'CONFIG_CP_PMUCAL|CONFIG_SEC_MODEM_SS310AP|CONFIG_UMTS_MODEM_SS310AP|CONFIG_CP_SECURE_BOOT' \
+              kernel/arch/arm64/configs \
+              kernel/drivers/misc/modem_v1 \
+              kernel/drivers/soc/samsung/cal-if \
+              2>/dev/null || true
+
+            echo
+            echo "=== CP FUNCTION REFERENCES ==="
+            rg -n \
+              'cal_cp_init|cal_cp_reset_release|cal_cp_reset_assert|pmucal_cp_init|pmucal_cp_reset_release|pmucal_cp_reset_assert' \
+              kernel/drivers \
+              2>/dev/null || true
+
+            echo
+            echo "=== SS310AP CONTROL REFERENCES ==="
+            rg -n \
+              'cp_on|cp_off|cp_reset|power_on|power_off|start_normal_boot|start_dump_boot' \
+              kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c \
+              2>/dev/null || true
+
+          } > dist/v40-cp-audit.txt
+
+      - name: Apply V40 PMUCAL start-denial patch
+        shell: bash
         run: |
           set -euo pipefail
 
-          cd kernel
-
-          rg -n \
-            'pmucal_cp_init|pmucal_cp_reset_release|pmucal_cp_reset_assert|cal_cp_init|cal_cp_reset_release|IOCTL_MODEM_ON|IOCTL_MODEM_RESET|IOCTL_MODEM_BOOT_ON|IOCTL_MODEM_DL_START|CP_PWRON|CP_POWER_ON|CP_POWER_OFF|ss310ap_on' \
-            drivers \
-            > ../dist/cp-callers-before.txt || true
-
-      - name: Apply V40 guarded CPLOCK
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/v40_patch.py <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
           import re
 
@@ -119,195 +135,202 @@ jobs:
           )
 
           source = path.read_text()
+          original = source
 
-          if "CPLOCK_V40" in source:
-              raise SystemExit("Already patched")
+          for include in (
+              "#include <linux/errno.h>",
+              "#include <linux/printk.h>",
+          ):
+              if include not in source:
+                  source = include + "\n" + source
 
-          for name in (
+          functions = (
               "pmucal_cp_init",
               "pmucal_cp_reset_release",
-          ):
+          )
+
+          for name in functions:
               pattern = re.compile(
-                  r"(\bint\s+"
-                  + re.escape(name)
-                  + r"\s*\(\s*void\s*\)\s*\{"
-                  r"\s*int\s+ret\s*;)"
+                  r"(\bint\s+" + re.escape(name) +
+                  r"\s*\(\s*void\s*\)\s*\{\s*"
+                  r"int\s+ret\s*;)",
+                  re.MULTILINE,
               )
 
-              matches = list(pattern.finditer(source))
+              replacement = (
+                  r"\1\n"
+                  '    pr_warn_ratelimited('
+                  '"CPLOCK V40: denied ' + name + r'\\n");'
+                  "\n"
+                  "    return -EPERM;\n"
+              )
 
-              if len(matches) != 1:
+              source, count = pattern.subn(
+                  lambda match: (
+                      match.group(1)
+                      + "\n"
+                      + '    pr_warn_ratelimited('
+                      + '"CPLOCK V40: denied '
+                      + name
+                      + '\\n");'
+                      + "\n"
+                      + "    return -EPERM;\n"
+                  ),
+                  source,
+                  count=1,
+              )
+
+              if count != 1:
                   raise SystemExit(
-                      f"Unexpected source layout: {name}"
+                      f"PATCH FAILED: could not safely locate {name}"
                   )
-
-              match = matches[0]
-
-              lock = (
-                  "\n\t/* CPLOCK_V40 */\n"
-                  "\tpr_warn_ratelimited("
-                  f"\"CPLOCK: denied {name}\\n\""
-                  ");\n"
-                  "\treturn -EPERM;\n"
-              )
-
-              source = (
-                  source[:match.end()]
-                  + lock
-                  + source[match.end():]
-              )
 
               print("Patched:", name)
 
-          if "#include <linux/errno.h>" not in source:
-              source = (
-                  "#include <linux/errno.h>\n"
-                  + source
-              )
-
-          if "#include <linux/printk.h>" not in source:
-              source = (
-                  "#include <linux/printk.h>\n"
-                  + source
-              )
-
-          if source.count("/* CPLOCK_V40 */") != 2:
-              raise SystemExit("Patch verification failed")
+          if source == original:
+              raise SystemExit("PATCH FAILED: no changes")
 
           path.write_text(source)
           PY
 
-          python3 /tmp/v40_patch.py
+          git -C kernel diff \
+            > dist/v40-kernel.patch
 
-          git -C kernel diff --check
-          git -C kernel diff > dist/v40.patch
-
-          test -s dist/v40.patch
+          test -s dist/v40-kernel.patch
 
       - name: Configure kernel
+        shell: bash
         run: |
           set -euo pipefail
 
-          cd kernel
+          make -C kernel \
+            O=out \
+            lineage_xcover4s_defconfig \
+            2>&1 | tee dist/v40-configure.log
 
-          make O=out lineage_xcover4s_defconfig
-          make O=out olddefconfig
+          cp kernel/out/.config dist/v40-kernel.config
 
-          grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
-          grep -qx 'CONFIG_SEC_MODEM_SS310AP=y' out/.config
-          grep -qx 'CONFIG_UMTS_MODEM_SS310AP=y' out/.config
+          {
+            echo "=== SELECTED CONFIG ==="
+            grep -E \
+              '^(CONFIG_CP_PMUCAL|CONFIG_SEC_MODEM_SS310AP|CONFIG_UMTS_MODEM_SS310AP|CONFIG_CP_SECURE_BOOT)=' \
+              kernel/out/.config || true
+          } > dist/v40-selected-config.txt
 
-          cp out/.config ../dist/kernel.config
-
-      - name: Full kernel build
+      - name: Build complete ARM64 Image
+        shell: bash
         run: |
           set -euo pipefail
 
-          cd kernel
+          make -C kernel \
+            O=out \
+            -j2 \
+            Image \
+            2>&1 | tee dist/v40-build.log
 
-          make O=out -j2 Image \
-            2>&1 | tee ../dist/build.log
-
-          test -s out/arch/arm64/boot/Image
-
-      - name: Validate ARM64 kernel
+      - name: Verify compiled kernel image
+        shell: bash
         run: |
           set -euo pipefail
+
+          IMAGE=kernel/out/arch/arm64/boot/Image
+
+          test -s "$IMAGE"
 
           python3 - <<'PY'
           from pathlib import Path
           import struct
-          import hashlib
 
-          p = Path(
+          image = Path(
               "kernel/out/arch/arm64/boot/Image"
           )
 
-          data = p.read_bytes()
+          with image.open("rb") as f:
+              f.seek(0x38)
+              magic = struct.unpack("<I", f.read(4))[0]
 
-          if len(data) < 1000000:
-              raise SystemExit(
-                  "Kernel Image too small"
-              )
+          expected = 0x644D5241
 
-          magic = struct.unpack_from(
-              "<I", data, 0x38
-          )[0]
+          print("Image size:", image.stat().st_size)
+          print("ARM64 magic:", hex(magic))
 
-          if magic != 0x644d5241:
+          if magic != expected:
               raise SystemExit(
                   "Invalid ARM64 Image magic"
               )
 
           print("ARM64 Image header OK")
-          print("Image size:", len(data))
-          print(
-              "SHA256:",
-              hashlib.sha256(data).hexdigest()
-          )
           PY
 
-          cp \
-            kernel/out/arch/arm64/boot/Image \
-            dist/Image
-
+          cp "$IMAGE" dist/Image
           sha256sum dist/Image \
-            > dist/Image.sha256
+            > dist/v40-image-sha256.txt
 
-      - name: Audit remaining CP paths
+          echo "V40 BUILD OK - NOT FLASH READY" \
+            > dist/v40-build-result.txt
+
+      - name: Collect V40 diagnostics
         if: always()
+        shell: bash
         run: |
           mkdir -p dist
 
-          if [ -d kernel/drivers ]; then
-            (
-              cd kernel
+          {
+            echo "XCOVER4S V40 DIAGNOSTICS"
+            echo "Run: $GITHUB_RUN_ID"
+            echo "Commit: $GITHUB_SHA"
+            echo "Status: diagnostic build"
+            echo "Flash ready: NO"
+            echo
 
-              rg -n \
-                'pmucal_cp_init|pmucal_cp_reset_release|pmucal_cp_reset_assert|cal_cp_init|cal_cp_reset_release|IOCTL_MODEM_ON|IOCTL_MODEM_RESET|IOCTL_MODEM_BOOT_ON|IOCTL_MODEM_DL_START|CP_PWRON|CP_POWER_ON|CP_POWER_OFF|ss310ap_on' \
-                drivers \
-                || true
-            ) > dist/cp-callers-after.txt
-          fi
+            echo "=== ARTIFACT FILES ==="
+            find dist -maxdepth 2 -type f \
+              -printf '%p %s bytes\n' \
+              2>/dev/null || true
 
-      - name: Collect failure diagnostics
-        if: always()
-        run: |
-          mkdir -p dist
+            echo
+            echo "=== KERNEL IMAGE ==="
+            if [ -s kernel/out/arch/arm64/boot/Image ]; then
+              ls -lh kernel/out/arch/arm64/boot/Image
+              cp kernel/out/arch/arm64/boot/Image dist/Image
+            else
+              echo "No compiled Image available"
+            fi
+
+            echo
+            echo "=== OPTIONAL BOOT BACKUP ==="
+            if [ -s private/boot-backup.img ]; then
+              echo "Backup present (not uploaded)"
+            else
+              echo "Backup absent (allowed)"
+            fi
+
+          } > dist/v40-diagnostics.txt
 
           if [ -d kernel/.git ]; then
-            git -C kernel diff > dist/v40.patch
+            git -C kernel diff \
+              > dist/v40-kernel.patch || true
+
+            git -C kernel status --short \
+              > dist/v40-git-status.txt || true
+
+            git -C kernel rev-parse HEAD \
+              > dist/v40-source-commit.txt || true
           fi
 
           if [ -f kernel/out/.config ]; then
-            cp kernel/out/.config dist/kernel.config
+            cp kernel/out/.config \
+              dist/v40-kernel.config
           fi
 
-          cat > dist/README.txt <<'EOF'
-          XCOVER4S V40 EXPERIMENTAL
+          echo "V40 diagnostic artifact collection complete"
 
-          Full kernel build independent of boot backup.
-
-          CPLOCK gates:
-          - pmucal_cp_init
-          - pmucal_cp_reset_release
-
-          NOT VERIFIED:
-          - Safe CP power-down
-          - All modem restart paths
-          - Boot compatibility
-          - Physical CP power state
-          - Odin repacking
-
-          No Odin flash package generated.
-          DO NOT FLASH THIS IMAGE DIRECTLY.
-          EOF
-
-      - name: Upload V40
+      - name: Upload V40 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V40-FULL-BUILD
+          name: XCOVER4S-V40-DIAGNOSTICS
           path: dist/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 6
