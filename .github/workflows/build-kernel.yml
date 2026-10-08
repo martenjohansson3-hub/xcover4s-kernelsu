@@ -1,72 +1,55 @@
-name: XCOVER4S V34 CP POWER INVESTIGATION
-
-on:
-  workflow_dispatch:
-
-jobs:
-  investigate:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 25
-    steps:
-      - name: Install analysis tools
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y git python3
-
-      - name: Fetch exact V33.1 kernel source
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-          mkdir -p diagnostics
-          git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
-
-      - name: Trace CP power supply and shutdown paths
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          root = Path('kernel')
-          patterns = {
-            'cp_api': re.compile(r'\b(?:cal_cp_|pmucal_cp_|exynos_cp_|cp_power_|cp_on|cp_off|cp_reset|modem_power)\w*\b', re.I),
-            'pmu_sequences': re.compile(r'\b(?:CP_PWR|CP_POWER|CP_CTRL|CP_STATUS|CP_RESET|CP_START|CP_ACTIVE|CP2AP|AP2CP|PMU_CP|PMUCAL_CP)\w*\b', re.I),
-            'regulators': re.compile(r'\b(?:regulator_(?:get|enable|disable|is_enabled)|vdd_cp|vdd_modem|vdd_mif|vdd_mdm|ldo_cp)\w*\b', re.I),
-          }
-          exts = {'.c', '.h', '.dts', '.dtsi'}
-          results = {key: [] for key in patterns}
-          for path in root.rglob('*'):
-            if not path.is_file() or path.suffix not in exts:
-              continue
-            if any(part in {'.git', 'out'} for part in path.parts):
-              continue
-            try:
-              lines = path.read_text(errors='replace').splitlines()
-            except OSError:
-              continue
-            for i, line in enumerate(lines, 1):
-              for key, regex in patterns.items():
-                if regex.search(line):
-                  results[key].append(f'{path.relative_to(root)}:{i}: {line[:350]}')
-          for key, matches in results.items():
-            Path(f'diagnostics/{key}.txt').write_text('\n'.join(matches) + '\n')
-            print(key, len(matches), 'matches')
-          targets = [
-            'drivers/soc/samsung/cal-if/cal-if.c',
-            'drivers/soc/samsung/cal-if/pmucal',
-          ]
-          for target in targets:
-            path = root / target
-            if path.is_file():
-              Path('diagnostics/' + path.name + '.source.txt').write_text(path.read_text(errors='replace'))
-          report = '''V34 DIAGNOSTIC ONLY.\nV33.1 was the last successful kernel baseline.\nThis workflow does NOT patch CP power, build a kernel, or make an Odin TAR.\nReset asserted is NOT equivalent to CP power removed.\nReview pmucal sequences, modem control, and regulator/device tree evidence before attempting a power-off patch.\nEven a software power-off call is not proof of zero voltage: hardware measurement is required.\n'''
-          Path('diagnostics/README.txt').write_text(report)
+          print('V35 patched modem_v1 SS310AP power-on request to CP_POWER_OFF')
           PY
-
-      - name: Upload complete CP investigation
+          git -C kernel diff > diagnostics/v35.patch
+          grep -n -C 12 'V35 experimental' kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c > diagnostics/power-off-context.txt
+          grep -R -n 'CONFIG_.*MODEM\|CONFIG_.*SS310' kernel/arch/arm64/configs/lineage_xcover4s_defconfig > diagnostics/modem-config-hints.txt || true
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make O=out lineage_xcover4s_defconfig
+          scripts/config --file out/.config -d DEBUG_INFO -d DEBUG_INFO_BTF -d KALLSYMS_ALL -e SECURITY_SELINUX -e SECURITY_SELINUX_DEVELOP -e SECURITY_SELINUX_BOOTPARAM --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+          make O=out olddefconfig
+          cp out/.config ../diagnostics/final.config
+          grep -Ei 'MODEM|SS310|CP_PMUCAL' out/.config > ../diagnostics/modem-config.txt || true
+      - name: Targeted compile first
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+          make O=out -j2 drivers/misc/modem_v1/modem_ctrl_ss310ap.o drivers/soc/samsung/cal-if/cal-if.o drivers/video/fbdev/exynos/dpu_7885/decon_abd.o drivers/video/fbdev/exynos/dpu_7885/decon_reg.o drivers/video/fbdev/exynos/dpu_7885/decon_core.o drivers/video/fbdev/exynos/dpu_7885/helper.o 2>&1 | tee ../diagnostics/targeted-build.log
+      - name: Full Image build
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+          make O=out -j2 Image 2>&1 | tee ../diagnostics/full-build.log
+      - name: Package kernel and warnings
+        run: |
+          set -euo pipefail
+          cp kernel/out/arch/arm64/boot/Image artifact/Image
+          cp diagnostics/v35.patch artifact/v35.patch
+          cp diagnostics/final.config artifact/final.config
+          sha256sum artifact/Image > artifact/SHA256SUMS
+          cat > artifact/READ-ME-FIRST.txt <<'EOF'
+          V35 IS EXPERIMENTAL AND NOT ODIN FLASHABLE.
+          V35 replaces one SS310AP modem_v1 CP_POWER_ON call with CP_POWER_OFF.
+          This may not be the active driver on XCover4s. Bootloop risk is substantial.
+          CP_POWER_OFF does NOT prove zero voltage on modem rails.
+          This build has NOT been boot-tested or hardware-verified.
+          Do not flash until active driver and hardware sequence are confirmed.
+          EOF
+      - name: Upload kernel
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V35-EXPERIMENTAL-KERNEL
+          path: artifact/
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V34-CP-POWER-DIAGNOSTICS
+          name: XCOVER4S-V35-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
