@@ -1,5 +1,4 @@
-
-name: XCover4s CP Power OFF v7
+name: XCover4s CP POWER OFF v8 - Flashable
 
 on:
   workflow_dispatch:
@@ -17,102 +16,366 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
+
+      # ============================================================
+      # 1. BUILD TOOLS
+      # ============================================================
+
       - name: Install dependencies
         run: |
           set -eux
-          sudo apt-get update
-          sudo apt-get install -y \
-            git python3 make bc bison flex \
-            libssl-dev libelf-dev libncurses-dev \
-            device-tree-compiler gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            clang lld llvm cpio rsync
 
-      - name: Clone kernel
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            python3 \
+            make \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            device-tree-compiler \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            clang \
+            lld \
+            llvm \
+            cpio \
+            rsync \
+            unzip \
+            wget \
+            curl \
+            file
+
+      # ============================================================
+      # 2. CHECKOUT USER REPOSITORY
+      # ============================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 3. GET SAMSUNG KERNEL
+      # ============================================================
+
+      - name: Clone Samsung kernel
         run: |
           set -eux
-          git clone --depth 1 --branch lineage-18.1 \
+
+          git clone \
+            --depth 1 \
+            --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
+
+          echo "SOURCE COMMIT:"
           git -C kernel rev-parse HEAD
 
-      - name: Patch CP power control and SELinux
+      # ============================================================
+      # 4. PATCH CP POWER CONTROL
+      # ============================================================
+
+      - name: Patch CP power control
         working-directory: kernel
+        shell: bash
         run: |
           set -eux
+
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           p = Path("drivers/soc/samsung/pmu-cp.c")
           s = p.read_text()
 
-          needle = "int exynos_set_cp_power_onoff(enum cp_mode mode)\n{"
-          if s.count(needle) != 1:
-              raise SystemExit("CP function mismatch")
+          # --------------------------------------------------------
+          # RESET
+          #
+          # Original code asserts:
+          #
+          # CP_RESET_SET | CP_PWRON
+          #
+          # That can power the modem back on.
+          #
+          # Replace the entire reset function with a CP-OFF request.
+          # --------------------------------------------------------
 
-          patch = (
-              "int exynos_set_cp_power_onoff(enum cp_mode mode)\n"
-              "{\n"
-              "\t/* XCOVER4S_V7_CP_OFF */\n"
-              "\tif (mode == CP_POWER_ON) {\n"
-              "\t\tpr_info(\"XCOVER4S_V7: redirect CP ON to OFF\\n\");\n"
-              "\t\tmode = CP_POWER_OFF;\n"
-              "\t}\n"
+          start = s.index("int exynos_cp_reset(void)")
+          end = s.index("\n/* release cp */", start)
+
+          reset = r'''int exynos_cp_reset(void)
+          {
+              /*
+               * XCOVER4S_V8_CP_OFF
+               *
+               * Never power the cellular CP on.
+               * Use Samsung's normal CP_POWER_OFF path.
+               */
+              pr_info("XCOVER4S_V8: CP reset blocked, forcing CP OFF\n");
+
+              return exynos_set_cp_power_onoff(CP_POWER_OFF);
+          }
+          '''
+
+          s = s[:start] + reset + s[end:]
+
+          # --------------------------------------------------------
+          # RELEASE
+          #
+          # Original code writes:
+          #
+          # CP_START | CP_POWER_ON
+          #
+          # That is another direct modem start path.
+          # Replace it with CP OFF.
+          # --------------------------------------------------------
+
+          start = s.index("int exynos_cp_release(void)")
+          end = s.index("\n/*", start + 10)
+
+          release = r'''int exynos_cp_release(void)
+          {
+              /*
+               * XCOVER4S_V8_CP_OFF
+               *
+               * Never release/start the cellular CP.
+               * Keep the CP powered down.
+               */
+              pr_info("XCOVER4S_V8: CP release blocked, forcing CP OFF\n");
+
+              return exynos_set_cp_power_onoff(CP_POWER_OFF);
+          }
+          '''
+
+          s = s[:start] + release + s[end:]
+
+          # --------------------------------------------------------
+          # CENTRAL POWER FUNCTION
+          #
+          # Any CP_POWER_ON request is converted into CP_POWER_OFF.
+          # --------------------------------------------------------
+
+          needle = "int exynos_set_cp_power_onoff(enum cp_mode mode)\n{"
+
+          if s.count(needle) != 1:
+              raise SystemExit(
+                  "exynos_set_cp_power_onoff function mismatch"
+              )
+
+          patch = r'''int exynos_set_cp_power_onoff(enum cp_mode mode)
+          {
+              /*
+               * XCOVER4S_V8_CP_OFF
+               *
+               * Cellular CP must never be powered on.
+               */
+              if (mode == CP_POWER_ON) {
+                  pr_info(
+                      "XCOVER4S_V8: CP POWER_ON blocked, forcing POWER_OFF\n"
+                  );
+
+                  mode = CP_POWER_OFF;
+              }
+
+              u32 cp_ctrl;
+              u32 __maybe_unused cp_ctrl2;
+              int ret = 0;
+              int wait_count = 0;
+          '''
+
+          # Replace function header AND declarations.
+          body_start = s.index(needle)
+          decl_start = body_start
+          decl_end = s.index(
+              "\n\tpr_info(\"%s: mode[%d]\\n\", __func__, mode);",
+              body_start
           )
 
-          p.write_text(s.replace(needle, patch, 1))
+          s = (
+              s[:decl_start]
+              + patch.rstrip("\n")
+              + s[decl_end:]
+          )
+
+          p.write_text(s)
+
+          print("CP v8 patch applied")
+          PY
+
+          echo
+          echo "===== PATCHED CP FUNCTIONS ====="
+
+          grep -n -A18 \
+            "int exynos_cp_reset" \
+            drivers/soc/samsung/pmu-cp.c
+
+          grep -n -A18 \
+            "int exynos_cp_release" \
+            drivers/soc/samsung/pmu-cp.c
+
+          grep -n -A22 \
+            "int exynos_set_cp_power_onoff" \
+            drivers/soc/samsung/pmu-cp.c
+
+      # ============================================================
+      # 5. PATCH SELINUX
+      # ============================================================
+
+      - name: Patch SELinux permissive
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
 
           changed = []
-          for f in Path("security/selinux").rglob("*.c"):
-              old = f.read_text()
+
+          for p in Path("security/selinux").rglob("*.c"):
+              old = p.read_text()
+
               new = re.sub(
                   r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
                   r'\g<1>0\g<2>',
                   old
               )
+
               if new != old:
-                  f.write_text(new)
-                  changed.append(str(f))
+                  p.write_text(new)
+                  changed.append(str(p))
+
+          print("SELinux patched:")
+          for x in changed:
+              print(" ", x)
 
           if not changed:
-              raise SystemExit("SELinux patch not applied")
-
-          print("SELinux files:", changed)
+              raise SystemExit(
+                  "SELinux patch was not applied"
+              )
           PY
 
-      - name: Verify CP patch
+      # ============================================================
+      # 6. HARD VERIFICATION OF CP START PATHS
+      # ============================================================
+
+      - name: Verify no direct CP start paths remain
         working-directory: kernel
+        shell: bash
         run: |
           set -eux
+
           python3 <<'PY'
           from pathlib import Path
 
-          s = Path("drivers/soc/samsung/pmu-cp.c").read_text()
+          s = Path(
+              "drivers/soc/samsung/pmu-cp.c"
+          ).read_text()
 
-          checks = [
-              "XCOVER4S_V7_CP_OFF",
-              "mode = CP_POWER_OFF;",
-              "exynos_sys_powerdown_conf_cp();",
-              "cp_ctrl & ~CP_PWRON"
-          ]
+          # --------------------------------------------------------
+          # Verify reset function
+          # --------------------------------------------------------
 
-          for item in checks:
-              if item not in s:
-                  raise SystemExit("Missing: " + item)
+          a = s.index("int exynos_cp_reset(void)")
+          b = s.index("/* release cp */", a)
 
-          print("CP source verification passed")
+          reset = s[a:b]
+
+          if "CP_PWRON" in reset:
+              raise SystemExit(
+                  "FAIL: CP_PWRON remains in exynos_cp_reset()"
+              )
+
+          if "CP_POWER_OFF" not in reset:
+              raise SystemExit(
+                  "FAIL: CP_POWER_OFF missing from reset"
+              )
+
+          # --------------------------------------------------------
+          # Verify release function
+          # --------------------------------------------------------
+
+          a = s.index("int exynos_cp_release(void)")
+          b = s.index("int exynos_cp_start(void)", a)
+
+          release = s[a:b]
+
+          if "CP_POWER_ON" in release:
+              raise SystemExit(
+                  "FAIL: CP_POWER_ON remains in release"
+              )
+
+          if "CP_START" in release:
+              raise SystemExit(
+                  "FAIL: CP_START remains in release"
+              )
+
+          if "CP_POWER_OFF" not in release:
+              raise SystemExit(
+                  "FAIL: CP_POWER_OFF missing from release"
+              )
+
+          # --------------------------------------------------------
+          # Verify central power function
+          # --------------------------------------------------------
+
+          a = s.index(
+              "int exynos_set_cp_power_onoff"
+          )
+
+          b = s.index(
+              "\n}",
+              a
+          )
+
+          # Don't use simplistic block parsing here.
+          # Check the complete source for the v8 marker.
+          if "XCOVER4S_V8_CP_OFF" not in s:
+              raise SystemExit(
+                  "FAIL: v8 marker missing"
+              )
+
+          if "mode = CP_POWER_OFF;" not in s:
+              raise SystemExit(
+                  "FAIL: POWER_ON redirect missing"
+              )
+
+          print(
+              "CP START PATH VERIFICATION PASSED"
+          )
           PY
+
+      # ============================================================
+      # 7. SHOW DIFF
+      # ============================================================
+
+      - name: Show kernel patch
+        working-directory: kernel
+        run: |
+          set -eux
+
+          git diff -- \
+            drivers/soc/samsung/pmu-cp.c \
+            security/selinux
+
+      # ============================================================
+      # 8. CONFIGURE
+      # ============================================================
 
       - name: Configure kernel
         working-directory: kernel
         run: |
           set -eux
 
-          make O="$PWD/out" ARCH=arm64 \
+          make \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
             lineage_xcover4s_defconfig
 
           python3 <<'PY'
@@ -120,23 +383,38 @@ jobs:
 
           p = Path("out/.config")
           s = p.read_text()
+
           key = "CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE="
 
           lines = [
-              x for x in s.splitlines()
+              x
+              for x in s.splitlines()
               if not x.startswith(key)
           ]
-          lines.append(key + "0")
-          p.write_text("\n".join(lines) + "\n")
+
+          lines.append(
+              key + "0"
+          )
+
+          p.write_text(
+              "\n".join(lines) + "\n"
+          )
           PY
 
-          make O="$PWD/out" ARCH=arm64 olddefconfig
+          make \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            olddefconfig
 
           grep \
             '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0$' \
             out/.config
 
-      - name: Targeted CP compile
+      # ============================================================
+      # 9. TARGETED PMU BUILD
+      # ============================================================
+
+      - name: Targeted PMU compile
         working-directory: kernel
         shell: bash
         timeout-minutes: 5
@@ -151,18 +429,27 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             KCFLAGS="$KCFLAGS" \
             drivers/soc/samsung/pmu-cp.o \
-            2>&1 | tee targeted-build.log
+            2>&1 \
+          | tee targeted-build.log
 
-          echo "TARGETED CP COMPILE PASSED"
+          echo
+          echo "TARGETED PMU COMPILE PASSED"
 
-      - name: Full kernel build LIVE
+      # ============================================================
+      # 10. FULL KERNEL BUILD
+      # ============================================================
+
+      - name: Full kernel build
         working-directory: kernel
         shell: bash
         timeout-minutes: 25
         run: |
           set -o pipefail
 
-          echo "STARTING FULL KERNEL BUILD"
+          echo "========================================"
+          echo "FULL KERNEL BUILD"
+          echo "========================================"
+
           date -u
 
           make -j"$(nproc)" \
@@ -176,83 +463,359 @@ jobs:
             2>&1 \
           | tee build.log \
           | awk '
-              /aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/ { next }
+              /aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/ {
+                  next
+              }
+
+              /aarch64-linux-gnu-objdump: Warning: Bogus end-of-siblings marker/ {
+                  next
+              }
+
+              /aarch64-linux-gnu-objdump: Warning: Further warnings about bogus end-of-sibling markers suppressed/ {
+                  next
+              }
+
+              /aarch64-linux-gnu-objdump: Warning: DIE at offset/ {
+                  next
+              }
+
               {
-                print
-                fflush()
+                  print
+                  fflush()
               }
             '
 
+          echo
+          echo "========================================"
           echo "FULL KERNEL BUILD PASSED"
+          echo "========================================"
+
           date -u
 
-      - name: Package successful kernel
-        if: success()
+      # ============================================================
+      # 11. VERIFY IMAGE
+      # ============================================================
+
+      - name: Verify kernel Image
         working-directory: kernel
         run: |
           set -eux
-          mkdir -p ../artifacts
 
-          test -s out/arch/arm64/boot/Image
+          IMAGE="out/arch/arm64/boot/Image"
 
-          cp out/arch/arm64/boot/Image \
-            ../artifacts/Image-CP-POWER-OFF-v7
+          test -s "$IMAGE"
 
-          cp out/.config \
-            ../artifacts/kernel-config
+          file "$IMAGE"
 
-          cp build.log \
-            ../artifacts/build.log
+          SIZE="$(stat -c%s "$IMAGE")"
 
-          cp targeted-build.log \
-            ../artifacts/targeted-build.log
+          echo "Image size: $SIZE"
 
-          cp drivers/soc/samsung/pmu-cp.c \
-            ../artifacts/pmu-cp-patched.c
+          if [ "$SIZE" -lt 20000000 ]; then
+              echo "ERROR: Image unexpectedly small"
+              exit 1
+          fi
 
-          git diff > ../artifacts/kernel.patch
-          git rev-parse HEAD > ../artifacts/source-commit.txt
+          sha256sum "$IMAGE"
+
+      # ============================================================
+      # 12. DOWNLOAD MAGISKBOOT
+      #
+      # Used ONLY to unpack/repack the existing boot image.
+      # It does not root the resulting image.
+      # ============================================================
+
+      - name: Download magiskboot
+        run: |
+          set -eux
+
+          API="https://api.github.com/repos/topjohnwu/Magisk/releases/latest"
+
+          TAG="$(
+            curl -fsSL "$API" \
+            | python3 -c '
+          import json,sys
+          print(json.load(sys.stdin)["tag_name"])
+          '
+          )"
+
+          echo "Magisk release: $TAG"
+
+          URL="$(
+            curl -fsSL "$API" \
+            | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          for x in d["assets"]:
+              if x["name"].endswith(".apk"):
+                  print(x["browser_download_url"])
+                  break
+          '
+          )"
+
+          test -n "$URL"
+
+          wget -q \
+            "$URL" \
+            -O Magisk.apk
+
+          unzip -j -o \
+            Magisk.apk \
+            'lib/x86_64/libmagiskboot.so' \
+            -d .
+
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+
+          file magiskboot
+
+      # ============================================================
+      # 13. REQUIRE ORIGINAL BOOT IMAGE
+      # ============================================================
+
+      - name: Check original boot image
+        run: |
+          set -eux
+
+          if [ ! -f boot-original.img ]; then
+            echo
+            echo "ERROR:"
+            echo "boot-original.img is missing from repository root."
+            echo
+            echo "Upload the known-good original boot image"
+            echo "before running the flashable build."
+            exit 1
+          fi
+
+          SIZE="$(stat -c%s boot-original.img)"
+
+          echo "Original boot size: $SIZE"
+
+          if [ "$SIZE" -ne 37748736 ]; then
+            echo "WARNING: unexpected boot image size"
+          fi
+
+          sha256sum boot-original.img
+
+      # ============================================================
+      # 14. UNPACK ORIGINAL BOOT
+      # ============================================================
+
+      - name: Unpack original boot
+        run: |
+          set -eux
+
+          mkdir -p boot-unpack
+
+          cd boot-unpack
+
+          ../magiskboot unpack \
+            ../boot-original.img
+
+          echo
+          echo "===== UNPACKED BOOT ====="
+          ls -lh
+
+      # ============================================================
+      # 15. REPLACE ONLY KERNEL IMAGE
+      # ============================================================
+
+      - name: Replace kernel in boot image
+        run: |
+          set -eux
+
+          cp \
+            kernel/out/arch/arm64/boot/Image \
+            boot-unpack/kernel
+
+          echo
+          echo "===== NEW KERNEL ====="
 
           sha256sum \
-            ../artifacts/Image-CP-POWER-OFF-v7 \
-            > ../artifacts/SHA256SUMS
+            boot-unpack/kernel
 
-      - name: Upload successful kernel
-        if: success()
+      # ============================================================
+      # 16. REPACK BOOT
+      # ============================================================
+
+      - name: Repack flashable boot image
+        run: |
+          set -eux
+
+          cd boot-unpack
+
+          ../magiskboot repack \
+            ../boot-original.img \
+            ../boot-CP-OFF-v8.img
+
+          cd ..
+
+          test -s boot-CP-OFF-v8.img
+
+          echo
+          echo "===== FLASHABLE BOOT ====="
+
+          ls -lh boot-CP-OFF-v8.img
+
+          file boot-CP-OFF-v8.img
+
+          sha256sum boot-CP-OFF-v8.img
+
+      # ============================================================
+      # 17. FINAL SOURCE CHECK
+      # ============================================================
+
+      - name: Final verification
+        working-directory: kernel
+        run: |
+          set -eux
+
+          echo "===== FINAL CHECK ====="
+
+          grep -n \
+            "XCOVER4S_V8_CP_OFF" \
+            drivers/soc/samsung/pmu-cp.c
+
+          echo
+          echo "No direct CP_POWER_ON in reset/release:"
+
+          sed -n \
+            '/int exynos_cp_reset/,/\/\* release cp \*\//p' \
+            drivers/soc/samsung/pmu-cp.c \
+            | grep -E \
+              'CP_POWER_ON|CP_PWRON|CP_START' \
+              && {
+                echo "ERROR: direct CP start remains in reset"
+                exit 1
+              } || true
+
+          sed -n \
+            '/int exynos_cp_release/,/int exynos_cp_start/p' \
+            drivers/soc/samsung/pmu-cp.c \
+            | grep -E \
+              'CP_POWER_ON|CP_PWRON|CP_START' \
+              && {
+                echo "ERROR: direct CP start remains in release"
+                exit 1
+              } || true
+
+          echo
+          echo "FINAL SOURCE CHECK PASSED"
+
+      # ============================================================
+      # 18. PACKAGE
+      # ============================================================
+
+      - name: Package artifacts
+        run: |
+          set -eux
+
+          mkdir -p artifacts
+
+          cp \
+            kernel/out/arch/arm64/boot/Image \
+            artifacts/Image-CP-POWER-OFF-v8
+
+          cp \
+            boot-CP-OFF-v8.img \
+            artifacts/boot-CP-OFF-v8.img
+
+          cp \
+            boot-original.img \
+            artifacts/boot-original.img
+
+          cp \
+            kernel/out/.config \
+            artifacts/kernel-config
+
+          cp \
+            kernel/build.log \
+            artifacts/build.log
+
+          cp \
+            kernel/targeted-build.log \
+            artifacts/targeted-build.log
+
+          cp \
+            kernel/drivers/soc/samsung/pmu-cp.c \
+            artifacts/pmu-cp-v8.c
+
+          git -C kernel diff \
+            -- drivers/soc/samsung/pmu-cp.c \
+               security/selinux \
+            > artifacts/kernel.patch
+
+          git -C kernel rev-parse HEAD \
+            > artifacts/source-commit.txt
+
+          sha256sum \
+            artifacts/boot-CP-OFF-v8.img \
+            artifacts/Image-CP-POWER-OFF-v8 \
+            artifacts/boot-original.img \
+            > artifacts/SHA256SUMS
+
+          echo
+          echo "========================================"
+          echo "FLASHABLE ARTIFACT CREATED"
+          echo "========================================"
+
+          ls -lh artifacts/
+
+      # ============================================================
+      # 19. UPLOAD
+      # ============================================================
+
+      - name: Upload flashable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-CP-POWER-OFF-v7
+          name: XCOVER4S-CP-POWER-OFF-v8-FLASHABLE
           path: artifacts/
           if-no-files-found: error
 
+      # ============================================================
+      # 20. FAILURE DIAGNOSTICS
+      # ============================================================
+
       - name: Collect failure diagnostics
         if: failure()
-        working-directory: kernel
-        shell: bash
         run: |
-          mkdir -p ../failure-diagnostics
+          mkdir -p failure-diagnostics
 
-          for f in targeted-build.log build.log; do
-            if [ -f "$f" ]; then
-              cp "$f" ../failure-diagnostics/
-            fi
-          done
+          if [ -f kernel/build.log ]; then
+            cp kernel/build.log \
+              failure-diagnostics/
+          fi
 
-          git diff > ../failure-diagnostics/kernel.patch
+          if [ -f kernel/targeted-build.log ]; then
+            cp kernel/targeted-build.log \
+              failure-diagnostics/
+          fi
 
-          echo "=== RELEVANT ERRORS ==="
-          for f in targeted-build.log build.log; do
-            if [ -f "$f" ]; then
-              grep -Ei \
-                'fatal error:|error:|undefined reference|No rule to make target|make.*Error' \
-                "$f" | tail -80 || true
-            fi
-          done
+          if [ -f kernel/drivers/soc/samsung/pmu-cp.c ]; then
+            cp kernel/drivers/soc/samsung/pmu-cp.c \
+              failure-diagnostics/
+          fi
+
+          if [ -d kernel ]; then
+            git -C kernel diff \
+              > failure-diagnostics/kernel.patch \
+              || true
+          fi
+
+          echo "===== RELEVANT ERRORS ====="
+
+          if [ -f kernel/build.log ]; then
+            grep -Ei \
+              'fatal error:|error:|undefined reference|No rule to make target|make.*Error' \
+              kernel/build.log \
+              | tail -100 \
+              || true
+          fi
 
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-v7-FAILURE-DIAGNOSTICS
+          name: XCOVER4S-v8-FAILURE-DIAGNOSTICS
           path: failure-diagnostics/
           if-no-files-found: ignore
