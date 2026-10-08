@@ -1,199 +1,116 @@
 
-name: XCOVER4S V22 CP HARD OFF TEST
+name: XCOVER4S V22 FINAL PREFLIGHT
 
 on:
   workflow_dispatch:
 
 jobs:
-  hard-off-test:
+  preflight:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            clang-14 lld-14 \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            bc bison flex \
-            libssl-dev libelf-dev
-
-      - name: Get kernel source
+      - name: Download kernel
         run: |
           set -euo pipefail
-
           git clone --depth 1 \
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
-
           mkdir -p diagnostics
           git -C kernel rev-parse HEAD \
-            > diagnostics/source-commit.txt
+            > diagnostics/commit.txt
 
-      - name: Create HARD OFF experiment
+      - name: Audit every CP power path
         run: |
           set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          p = Path(
-              "kernel/drivers/soc/samsung/cal-if/cal-if.c"
-          )
-
-          original = p.read_text()
-          modified = original
-
-          replacements = {
-              "cal_cp_init":
-                  'pr_warn("V22: CP hard off requested\\n");'
-                  '\n\tpmucal_cp_reset_assert();',
-
-              "cal_cp_reset_release":
-                  'pr_warn("V22: CP restart blocked\\n");'
-                  '\n\tpmucal_cp_reset_assert();',
-          }
-
-          for name, body in replacements.items():
-              pattern = (
-                  r'(void\s+' + name +
-                  r'\s*\(\s*void\s*\)\s*\{)'
-                  r'([^{}]*)'
-                  r'(\})'
-              )
-
-              matches = list(
-                  re.finditer(pattern, modified)
-              )
-
-              if len(matches) != 1:
-                  raise SystemExit(
-                      "Cannot safely patch " + name
-                  )
-
-              modified, count = re.subn(
-                  pattern,
-                  lambda m: (
-                      m.group(1) +
-                      "\n\t/* V22 CP HARD OFF TEST */\n\t" +
-                      body + "\n" +
-                      m.group(3)
-                  ),
-                  modified,
-                  count=1
-              )
-
-              assert count == 1
-
-          p.write_text(modified)
-
-          assert modified != original
-          print("V22 CP HARD OFF patch prepared")
-          PY
-
-          git -C kernel diff \
-            > diagnostics/v22-hard-off.patch
-
-      - name: Validate shutdown sequence
-        run: |
-          set -euo pipefail
-
-          FILE=kernel/drivers/soc/samsung/cal-if/exynos7885/pmucal_cp_exynos7885.h
-
-          test -f "$FILE"
-
-          grep -q 'struct pmucal_seq cp_reset_assert' \
-            "$FILE"
-
-          grep -q 'CP_CTRL_NS__CP_PWRON' "$FILE"
-
-          grep -q 'CENTRAL_SEQ_CP_STATUS__STATES' \
-            "$FILE"
 
           {
-            echo "CP shutdown sequence found"
-            echo
-            grep -nE \
-              'cp_reset_assert|CP_PWRON|CENTRAL_SEQ_CP_STATUS' \
-              "$FILE"
-          } > diagnostics/power-sequence.txt
+            echo "=== CP POWER CALLS ==="
+            grep -RnE \
+              'cal_cp_|pmucal_cp_|exynos_cp_|exynos_set_cp_power_onoff' \
+              kernel/drivers/misc/modem_if \
+              kernel/drivers/misc/modem_v1 \
+              kernel/drivers/soc/samsung \
+              || true
 
-      - name: Verify GNSS and WiFi untouched
+            echo "=== CP PMUCAL IMPLEMENTATION ==="
+            grep -RnE \
+              'pmucal_cp_(init|reset_assert|reset_release)|cp_reset_assert|CP_PWRON' \
+              kernel/drivers/soc/samsung/cal-if \
+              || true
+
+          } > diagnostics/cp-power-paths.txt
+
+      - name: Audit GNSS dependencies
         run: |
           set -euo pipefail
 
-          git -C kernel diff --name-only \
-            > diagnostics/changed-files.txt
+          {
+            echo "=== GNSS PMU REFERENCES ==="
+            grep -RnE \
+              'pmu|power|reset|clock|regulator|CP_|cp_' \
+              kernel/drivers/misc/gnss_if \
+              || true
 
-          if grep -Ei \
-            'gnss|gps|wifi|wlan|dts' \
-            diagnostics/changed-files.txt; then
-            echo "ERROR: protected sources changed"
-            exit 1
-          fi
+            echo "=== GNSS CONFIG ==="
+            grep -E \
+              'CONFIG_.*(GNSS|GPS|CP_PMUCAL)' \
+              kernel/arch/arm64/configs/lineage_xcover4s_defconfig \
+              || true
 
-          echo "Protected sources unchanged" \
-            > diagnostics/protected-sources.txt
+          } > diagnostics/gnss-check.txt
 
-      - name: Prepare kernel
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make O=out lineage_xcover4s_defconfig
-
-          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
-
-          make O=out -j2 prepare scripts
-
-      - name: Compile modified CP object
-        run: |
-          set -o pipefail
-          cd kernel
-
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS=-Wno-error
-
-          make O=out -j2 \
-            drivers/soc/samsung/cal-if/cal-if.o \
-            2>&1 | tee ../diagnostics/compile.log
-
-      - name: Inspect compiled symbols
+      - name: Audit SELinux permissive options
         run: |
           set -euo pipefail
 
-          OBJ=kernel/out/drivers/soc/samsung/cal-if/cal-if.o
+          {
+            echo "=== SELINUX CONFIG ==="
+            grep -E \
+              '^CONFIG_SECURITY_SELINUX|^CONFIG_LSM' \
+              kernel/arch/arm64/configs/lineage_xcover4s_defconfig \
+              || true
 
-          test -s "$OBJ"
+            echo "=== SELINUX ENFORCING DEFAULT ==="
+            grep -Rn \
+              'CONFIG_SECURITY_SELINUX_DEVELOP' \
+              kernel/security/selinux \
+              kernel/arch/arm64/configs \
+              || true
 
-          aarch64-linux-gnu-nm "$OBJ" \
-            > diagnostics/symbols.txt
+            echo "=== SELINUX BOOT PARAMETERS ==="
+            grep -RnE \
+              'enforcing=|selinux=|selinux_enforcing' \
+              kernel/security/selinux \
+              | head -100 || true
 
-          grep -q 'cal_cp_init' diagnostics/symbols.txt
-          grep -q 'cal_cp_reset_release' \
-            diagnostics/symbols.txt
+          } > diagnostics/selinux-check.txt
 
-          echo "TARGETED COMPILE PASSED" \
-            > diagnostics/result.txt
+      - name: Record V22 build requirements
+        run: |
+          cat > diagnostics/next-build.txt <<'EOF'
+          TARGET:
+          Samsung XCover 4s /e/OS
 
-          echo "Runtime power-off NOT verified" \
-            >> diagnostics/result.txt
+          REQUIRED:
+          1. CP shutdown sequence must complete.
+          2. CP must not restart.
+          3. GNSS startup must remain functional.
+          4. Wi-Fi must remain functional.
+          5. SELinux permissive in the same final build.
+          6. Original boot image must remain untouched.
 
-          echo "DO NOT FLASH THIS TEST" \
-            >> diagnostics/result.txt
+          STATUS:
+          Source audit only.
+          No flashable boot image produced.
+          Hardware power-off not yet verified.
+          EOF
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V22-HARD-OFF-TEST
+          name: XCOVER4S-V22-FINAL-PREFLIGHT
           path: diagnostics/
           if-no-files-found: warn
