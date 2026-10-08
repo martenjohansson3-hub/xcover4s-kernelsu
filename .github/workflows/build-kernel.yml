@@ -23,7 +23,7 @@ jobs:
 
     steps:
 
-      - name: Checkout build repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -68,35 +68,13 @@ jobs:
           test -f "$KERNEL_DIR/Makefile"
           test -f "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
 
-          echo
-          echo "=========================================="
-          echo "KERNEL"
-          echo "=========================================="
+          echo "========================================"
+          echo "KERNEL SOURCE OK"
+          echo "========================================"
 
           git -C "$KERNEL_DIR" rev-parse HEAD
 
-          echo
-          echo "DEFCONFIG:"
-          ls -lh \
-            "$KERNEL_DIR/arch/arm64/configs/$KERNEL_DEFCONFIG"
-
-      - name: Inspect SELinux
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -eux
-
-          echo
-          echo "=========================================="
-          echo "SELINUX REFERENCES"
-          echo "=========================================="
-
-          grep -RInE \
-            "selinux_enforcing|security_setenforce" \
-            security/selinux security \
-            2>/dev/null \
-            | head -200 || true
-
-      - name: Force SELinux permissive in kernel
+      - name: Force SELinux permissive
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -eux
@@ -111,14 +89,6 @@ jobs:
               text = p.read_text(errors="ignore")
               original = text
 
-              # Change literal kernel defaults:
-              #
-              # selinux_enforcing = 1;
-              #
-              # to:
-              #
-              # selinux_enforcing = 0;
-
               text = re.sub(
                   r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
                   r'\g<1>0\g<2>',
@@ -129,25 +99,21 @@ jobs:
                   p.write_text(text)
                   changed.append(str(p))
 
-          print()
-          print("Changed SELinux source files:")
+          print("Changed SELinux files:")
 
-          for item in changed:
-              print("  " + item)
+          for p in changed:
+              print("  " + p)
 
           if not changed:
               raise SystemExit(
-                  "ERROR: No selinux_enforcing = 1 assignment found."
+                  "ERROR: No SELinux enforcing assignment changed"
               )
-
-          print()
-          print("SELinux modification completed.")
           PY
 
           echo
-          echo "=========================================="
-          echo "SELINUX ASSIGNMENTS AFTER PATCH"
-          echo "=========================================="
+          echo "========================================"
+          echo "SELINUX RESULT"
+          echo "========================================"
 
           grep -RInE \
             "selinux_enforcing[[:space:]]*=" \
@@ -155,85 +121,60 @@ jobs:
             2>/dev/null || true
 
           echo
-          echo "=========================================="
+          echo "========================================"
           echo "SELINUX DIFF"
-          echo "=========================================="
+          echo "========================================"
 
           git diff -- security/selinux
 
-      - name: Inspect modem RF power paths
+      - name: Find modem RF power control
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set +e
 
-          echo
-          echo "=========================================="
-          echo "MODEM / CP / RF"
-          echo "=========================================="
+          {
+            echo "========================================"
+            echo "MODEM / CP / RF"
+            echo "========================================"
 
-          grep -RInE \
-            "modem|cpif|cp_power|cp.*power|modap|link_pm|mif|radio" \
-            arch/arm64 drivers include \
-            2>/dev/null \
-            | head -500
+            grep -RInE \
+              "modem|cpif|cp_power|cp.*power|modap|link_pm|mif|radio" \
+              arch/arm64 drivers include \
+              2>/dev/null | head -500
 
-          echo
-          echo "=========================================="
-          echo "REGULATOR CONTROL"
-          echo "=========================================="
+            echo
+            echo "========================================"
+            echo "REGULATORS"
+            echo "========================================"
 
-          grep -RInE \
-            "regulator_(enable|disable)|regulator_get|regulator_bulk|regulator.*disable|regulator.*enable" \
-            drivers arch/arm64 \
-            2>/dev/null \
-            | head -500
+            grep -RInE \
+              "regulator_(enable|disable)|regulator_get|regulator_bulk" \
+              drivers arch/arm64 \
+              2>/dev/null | head -500
 
-          echo
-          echo "=========================================="
-          echo "MODEM / RF DEVICE TREE"
-          echo "=========================================="
+            echo
+            echo "========================================"
+            echo "MODEM DEVICE TREE"
+            echo "========================================"
 
-          grep -RInE \
-            "modem|cpif|cp_power|vdd.*cp|vdd.*modem|regulator.*cp|regulator.*modem|modap|mif" \
-            arch/arm64/boot/dts \
-            2>/dev/null \
-            | head -500
+            grep -RInE \
+              "modem|cpif|cp_power|vdd.*cp|vdd.*modem|regulator.*cp|regulator.*modem|modap|mif" \
+              arch/arm64/boot/dts \
+              2>/dev/null | head -500
 
-          echo
-          echo "=========================================="
-          echo "RADIO CONFIG"
-          echo "=========================================="
+            echo
+            echo "========================================"
+            echo "RADIO CONFIG"
+            echo "========================================"
 
-          grep -RInE \
-            "CONFIG_.*(MODEM|CPIF|RADIO|RF|MIF|MODAP)" \
-            arch/arm64/configs \
-            2>/dev/null \
-            | head -300
+            grep -RInE \
+              "CONFIG_.*(MODEM|CPIF|RADIO|RF|MIF|MODAP)" \
+              arch/arm64/configs \
+              2>/dev/null | head -300
 
-          echo
-          echo "NO RF REGULATOR IS DISABLED IN THIS BUILD."
-          echo "THIS STEP ONLY IDENTIFIES THE CORRECT POWER PATH."
+          } | tee modem-analysis.log
 
           true
-
-      - name: Verify WiFi and GNSS are untouched
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -eux
-
-          echo
-          echo "=========================================="
-          echo "WIFI / GNSS SAFETY CHECK"
-          echo "=========================================="
-
-          echo "No WiFi source files are modified."
-          echo "No GNSS/GPS source files are modified."
-          echo "No modem regulator is disabled."
-
-          git diff --name-only
-
-          echo
-          echo "SELinux-only source modification is expected."
 
       - name: Prepare kernel configuration
         working-directory: ${{ env.KERNEL_DIR }}
@@ -253,21 +194,24 @@ jobs:
             olddefconfig
 
           echo
-          echo "=========================================="
-          echo "FINAL CONFIG"
-          echo "=========================================="
+          echo "========================================"
+          echo "SELINUX CONFIG"
+          echo "========================================"
 
           grep -E \
             "CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM" \
-            out/.config \
-            || true
+            out/.config || true
 
       - name: Build full kernel
         working-directory: ${{ env.KERNEL_DIR }}
         env:
           KCFLAGS: -Wno-error
         run: |
-          set -eux
+          set -o pipefail
+
+          echo "========================================"
+          echo "BUILD START"
+          echo "========================================"
 
           make -j"$(nproc)" \
             O="$PWD/out" \
@@ -277,7 +221,46 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             KCFLAGS="$KCFLAGS" \
             Image dtbs \
-            2>&1 | tee build.log
+            > >(tee build-full.log \
+              | grep -v -E \
+              'aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x22|Unrecognized form: 0x23|Corrupt attribute|Corrupt attribute block length|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)') \
+            2> >(tee -a build-full.log >&2 \
+              | grep -v -E \
+              'aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x22|Unrecognized form: 0x23|Corrupt attribute|Corrupt attribute block length|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)' >&2)
+
+          BUILD_STATUS=$?
+
+          echo
+          echo "========================================"
+          echo "BUILD EXIT CODE: $BUILD_STATUS"
+          echo "========================================"
+
+          exit "$BUILD_STATUS"
+
+      - name: Create clean build log
+        if: always()
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          if [ -f build-full.log ]; then
+
+            grep -v -E \
+              'aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x22|Unrecognized form: 0x23|Corrupt attribute|Corrupt attribute block length|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)' \
+              build-full.log \
+              > build-clean.log || true
+
+          else
+            touch build-clean.log
+          fi
+
+          echo
+          echo "========================================"
+          echo "IMPORTANT BUILD MESSAGES"
+          echo "========================================"
+
+          grep -iE \
+            "error:|fatal error:|undefined reference|warning:|FAILED|Error [0-9]+" \
+            build-clean.log \
+            | tail -200 || true
 
       - name: Verify kernel
         working-directory: ${{ env.KERNEL_DIR }}
@@ -287,55 +270,55 @@ jobs:
           test -f out/arch/arm64/boot/Image
 
           echo
-          echo "=========================================="
+          echo "========================================"
           echo "BUILD SUCCESS"
-          echo "=========================================="
+          echo "========================================"
 
-          ls -lh \
-            out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/Image
 
           echo
           echo "SHA256:"
+          sha256sum out/arch/arm64/boot/Image
 
-          sha256sum \
-            out/arch/arm64/boot/Image
-
-          echo
-          echo "SELINUX CONFIG:"
-
-          grep -E \
-            "CONFIG_SECURITY_SELINUX|CONFIG_SECURITY_SELINUX_DEVELOP|CONFIG_SECURITY_SELINUX_BOOTPARAM" \
-            out/.config \
-            || true
-
-      - name: Package artifacts
+      - name: Package results
+        if: always()
         run: |
-          set -eux
-
           mkdir -p artifacts
 
-          cp \
-            "${KERNEL_DIR}/out/arch/arm64/boot/Image" \
-            artifacts/Image-selinux-permissive
+          if [ -f "${KERNEL_DIR}/out/arch/arm64/boot/Image" ]; then
+            cp \
+              "${KERNEL_DIR}/out/arch/arm64/boot/Image" \
+              artifacts/Image-selinux-permissive
+          fi
 
-          cp \
-            "${KERNEL_DIR}/out/.config" \
-            artifacts/kernel-config
+          if [ -f "${KERNEL_DIR}/out/.config" ]; then
+            cp \
+              "${KERNEL_DIR}/out/.config" \
+              artifacts/kernel-config
+          fi
 
-          cp \
-            "${KERNEL_DIR}/build.log" \
-            artifacts/build.log
+          if [ -f "${KERNEL_DIR}/build-clean.log" ]; then
+            cp \
+              "${KERNEL_DIR}/build-clean.log" \
+              artifacts/build-clean.log
+          fi
 
-          tar -czf \
-            artifacts/xcover4s-selinux-permissive.tar.gz \
-            -C artifacts \
-            Image-selinux-permissive \
-            kernel-config \
-            build.log
+          if [ -f "${KERNEL_DIR}/build-full.log" ]; then
+            cp \
+              "${KERNEL_DIR}/build-full.log" \
+              artifacts/build-full.log
+          fi
 
-      - name: Upload artifacts
+          if [ -f "${KERNEL_DIR}/modem-analysis.log" ]; then
+            cp \
+              "${KERNEL_DIR}/modem-analysis.log" \
+              artifacts/modem-analysis.log
+          fi
+
+      - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-selinux-permissive
+          name: xcover4s-build-results
           path: artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn
