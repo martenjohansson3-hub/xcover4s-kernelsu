@@ -1,5 +1,5 @@
 
-name: XCOVER4S V37 FULL CPLOCK BUILD
+name: XCOVER4S V38 FULL CPLOCK BUILD
 
 on:
   workflow_dispatch:
@@ -26,51 +26,52 @@ jobs:
             git make bc bison flex build-essential \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev python3 zip
+            libssl-dev libelf-dev python3
 
-      - name: Clone exact V36 kernel source
+      - name: Clone V36 source
         run: |
           set -euo pipefail
           git clone \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
-          cd kernel
-          git checkout 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git -C kernel checkout \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply CPLOCK and build fixes
+      - name: Apply V38 patches
         run: |
           set -euo pipefail
-          cat > /tmp/v37_patch.py <<'PY'
+
+          cat > /tmp/patch_v38.py <<'PY'
           from pathlib import Path
+          import re
 
           root = Path("kernel")
 
-          def replace(rel, old, new, count=1):
-              p = root / rel
+          def replace_once(path, old, new):
+              p = root / path
               s = p.read_text()
-              found = s.count(old)
-              if found != count:
-                  raise SystemExit(
-                      f"PATCH FAILED {rel}: "
-                      f"expected {count}, found {found}: {old!r}"
+              if s.count(old) != 1:
+                  raise RuntimeError(
+                      f"Expected one match in {path}: {old!r}; "
+                      f"found {s.count(old)}"
                   )
-              p.write_text(s.replace(old, new))
-              print("PATCHED", rel)
+              p.write_text(s.replace(old, new, 1))
+              print("PATCHED", path)
 
-          # Existing V33 build compatibility fixes.
-          replace(
+          # Previously needed DPU build fixes.
+          replace_once(
               "drivers/video/fbdev/exynos/dpu_7885/decon_reg.c",
               "const double decon_clocks_table",
               "const unsigned long decon_clocks_table"
           )
 
-          replace(
+          replace_once(
               "drivers/video/fbdev/exynos/dpu_7885/decon.h",
               "#define decon_create_debugfs(...) do { } while(0)",
               "#define decon_create_debugfs(...) (0)"
           )
 
-          replace(
+          replace_once(
               "drivers/video/fbdev/exynos/dpu_7885/decon.h",
               "#define decon_destroy_debugfs(..) do { } while(0)",
               "#define decon_destroy_debugfs(...) do { } while(0)"
@@ -81,59 +82,110 @@ jobs:
           )
           h = helper.read_text()
           if "ACQUIRE_FENCE_LEN" not in h:
-              raise SystemExit("Expected ACQUIRE_FENCE_LEN usage missing")
-          helper.write_text(
-              "#ifndef ACQUIRE_FENCE_LEN\n"
-              "#define ACQUIRE_FENCE_LEN 1024\n"
-              "#endif\n\n" + h
+              raise RuntimeError("ACQUIRE_FENCE_LEN not found")
+          if "#define ACQUIRE_FENCE_LEN" not in h:
+              helper.write_text(
+                  "#ifndef ACQUIRE_FENCE_LEN\n"
+                  "#define ACQUIRE_FENCE_LEN 1024\n"
+                  "#endif\n\n" + h
+              )
+
+          # CPLOCK: PMUCAL functions have int ret as
+          # their first declaration. Insert AFTER it.
+          cp = (
+              "drivers/soc/samsung/cal-if/pmucal_cp.c"
           )
 
-          # Central CP start gates in the ACTIVE PMUCAL path.
-          p = root / "drivers/soc/samsung/cal-if/pmucal_cp.c"
+          for func in (
+              "pmucal_cp_init",
+              "pmucal_cp_reset_release",
+          ):
+              old = (
+                  f"int {func}(void)\n"
+                  "{\n"
+                  "\tint ret;\n"
+              )
+              new = (
+                  old
+                  + "\n"
+                  + "\t/* CPLOCK V38 */\n"
+                  + "\tpr_warn_ratelimited("
+                  + f"\"CPLOCK: denied {func}\\n\");\n"
+                  + "\treturn -EPERM;\n"
+              )
+              replace_once(cp, old, new)
+
+          # Reject SS310AP modem_on before any CP
+          # activation code, but after declarations.
+          modem = (
+              "drivers/misc/modem_v1/"
+              "modem_ctrl_ss310ap.c"
+          )
+          p = root / modem
           s = p.read_text()
 
-          if "CPLOCK V37" in s:
-              raise SystemExit("Already patched")
+          pattern = (
+              r"(static int ss310ap_on"
+              r"\(struct modem_ctl \*mc\)\s*\{"
+              r".*?"
+              r"int cp_status = mbox_extract_value"
+              r"\(MCU_CP, mc->mbx_cp_status,"
+              r".*?;\s*)"
+              r"(\s*mif_err\(\"\+\+\+\\n\"\);)"
+          )
+
+          def patch_on(match):
+              return (
+                  match.group(1)
+                  + '\n\t/* CPLOCK V38 */\n'
+                  + '\tmif_err("CPLOCK: modem_on denied\\n");\n'
+                  + '\tmc->phone_state = STATE_OFFLINE;\n'
+                  + '\treturn -EPERM;\n\n'
+                  + match.group(2)
+              )
+
+          s, count = re.subn(
+              pattern,
+              patch_on,
+              s,
+              count=1,
+              flags=re.S
+          )
+
+          if count != 1:
+              raise RuntimeError(
+                  "Could not safely patch ss310ap_on"
+              )
+
+          p.write_text(s)
+          print("PATCHED SS310AP modem_on")
+
+          # Add an explicit, non-panicking OFF attempt.
+          # This is not proof of physical power removal.
+          p = root / cp
+          s = p.read_text()
+
+          if "CPLOCK V38 FORCE OFF" in s:
+              raise RuntimeError("Already patched")
 
           s = (
-              '#include <linux/errno.h>\n'
               '#include <linux/init.h>\n'
-              '#include <linux/kernel.h>\n'
+              '#include <linux/errno.h>\n'
               '#include <linux/printk.h>\n'
               + s
           )
 
-          for name in (
-              "pmucal_cp_init",
-              "pmucal_cp_reset_release",
-          ):
-              needle = f"int {name}(void)\n{{"
-              if s.count(needle) != 1:
-                  raise SystemExit(
-                      f"Cannot locate {name} exactly once"
-                  )
-              replacement = (
-                  needle
-                  + '\n\t/* CPLOCK V37: deny modem activation */'
-                  + '\n\tpr_warn_ratelimited('
-                  + '"CPLOCK: denied ' + name + '\\n");'
-                  + '\n\treturn -EPERM;\n'
-              )
-              s = s.replace(needle, replacement, 1)
-
-          # OFF uses Samsung's actual Exynos7885
-          # reset-assert sequence, without panic-on-error.
           s += r'''
 
-          /* CPLOCK V37: power down CP after PMUCAL setup. */
-          static int __init xcover4s_cp_lock_off(void)
+          /* CPLOCK V38 FORCE OFF */
+          static int __init xcover4s_cp_force_off(void)
           {
               int ret;
 
               pr_info("CPLOCK: force-off requested\n");
 
               if (!pmucal_cp_list.reset_assert) {
-                  pr_err("CPLOCK: reset_assert unavailable\n");
+                  pr_err("CPLOCK: OFF sequence missing\n");
                   return 0;
               }
 
@@ -142,59 +194,41 @@ jobs:
                   pmucal_cp_list.num_reset_assert);
 
               if (ret)
-                  pr_err("CPLOCK: force-off failed: %d\n", ret);
+                  pr_err("CPLOCK: OFF failed: %d\n", ret);
               else
-                  pr_info("CPLOCK: force-off sequence complete\n");
+                  pr_info("CPLOCK: OFF sequence complete\n");
 
               return 0;
           }
-          late_initcall(xcover4s_cp_lock_off);
+          late_initcall(xcover4s_cp_force_off);
           '''
 
           p.write_text(s)
-          print("PATCHED PMUCAL CPLOCK")
+          print("PATCHED CP force-off")
 
-          # Guard the driver-level modem ON entry.
-          p = root / (
-              "drivers/misc/modem_v1/"
-              "modem_ctrl_ss310ap.c"
+          # Archive source references for next revision.
+          pattern = re.compile(
+              r"CP_POWER_ON|CP_POWER_OFF|"
+              r"cal_cp_init|cal_cp_reset_release|"
+              r"pmucal_cp_init|pmucal_cp_reset_release"
           )
-          s = p.read_text()
-          needle = "static int ss310ap_on(struct modem_ctl *mc)\n{"
 
-          if s.count(needle) != 1:
-              raise SystemExit("SS310AP ON entry not found")
-
-          s = s.replace(
-              needle,
-              needle
-              + '\n\t/* CPLOCK V37 */'
-              + '\n\tmif_err("CPLOCK: modem_on denied\\n");'
-              + '\n\tmc->phone_state = STATE_OFFLINE;'
-              + '\n\treturn -EPERM;\n',
-              1
-          )
-          p.write_text(s)
-          print("PATCHED SS310AP ON gate")
-
-          # Record all remaining activation references.
-          import re
-          patterns = re.compile(
-              r"CP_POWER_ON|cal_cp_init|cal_cp_reset_release"
-              r"|pmucal_cp_init|pmucal_cp_reset_release"
-          )
-          with open("/tmp/cp-callers.txt", "w") as out:
-              for p in (root / "drivers").rglob("*.c"):
-                  for i, line in enumerate(
-                      p.read_text(errors="replace").splitlines(), 1
+          with open("/tmp/v38-callers.txt", "w") as out:
+              for file in (root / "drivers").rglob("*.c"):
+                  for number, line in enumerate(
+                      file.read_text(
+                          errors="replace"
+                      ).splitlines(), 1
                   ):
-                      if patterns.search(line):
+                      if pattern.search(line):
                           out.write(
-                              f"{p}:{i}: {line}\n"
+                              f"{file}:{number}: {line}\n"
                           )
+
+          print("V38 patches applied")
           PY
 
-          python3 /tmp/v37_patch.py
+          python3 /tmp/patch_v38.py
 
       - name: Configure kernel
         run: |
@@ -216,13 +250,14 @@ jobs:
           cd kernel
 
           make O=out -j2 Image \
-            2>&1 | tee /tmp/v37-build.log
+            2>&1 | tee /tmp/v38-build.log
 
           test -s out/arch/arm64/boot/Image
 
-      - name: Validate kernel output
+      - name: Validate ARM64 image
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           import struct
@@ -230,68 +265,84 @@ jobs:
           p = Path(
               "kernel/out/arch/arm64/boot/Image"
           )
+
           data = p.read_bytes()
 
           if len(data) < 1000000:
-              raise SystemExit("Kernel too small")
+              raise SystemExit("Kernel unexpectedly small")
 
-          magic = struct.unpack_from("<I", data, 0x38)[0]
+          magic = struct.unpack_from(
+              "<I", data, 0x38
+          )[0]
+
           if magic != 0x644d5241:
-              raise SystemExit("Invalid ARM64 Image magic")
+              raise SystemExit(
+                  "Invalid ARM64 kernel header"
+              )
 
-          print("ARM64 Image header OK")
-          print("Kernel bytes:", len(data))
+          print("ARM64 kernel header OK")
+          print("Image size:", len(data))
           PY
 
-      - name: Package kernel and diagnostics
+      - name: Collect diagnostics
+        if: always()
         run: |
-          set -euo pipefail
           mkdir -p dist
 
-          cp kernel/out/arch/arm64/boot/Image \
-            dist/Image
+          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image \
+              dist/Image
+          fi
 
-          cp kernel/out/.config \
-            dist/final.config
+          if [ -f kernel/out/.config ]; then
+            cp kernel/out/.config dist/final.config
+          fi
 
-          cp /tmp/v37-build.log \
-            dist/build.log
+          if [ -f /tmp/v38-build.log ]; then
+            cp /tmp/v38-build.log dist/build.log
+          fi
 
-          cp /tmp/cp-callers.txt \
-            dist/cp-callers.txt
+          if [ -f /tmp/v38-callers.txt ]; then
+            cp /tmp/v38-callers.txt \
+              dist/cp-callers.txt
+          fi
 
-          git -C kernel diff \
-            > dist/v37.patch
+          if [ -d kernel/.git ]; then
+            git -C kernel diff > dist/v38.patch
+            git -C kernel rev-parse HEAD \
+              > dist/source-commit.txt
+          fi
 
-          git -C kernel rev-parse HEAD \
-            > dist/source-commit.txt
-
-          sha256sum dist/Image \
-            > dist/Image.sha256
+          if [ -f dist/Image ]; then
+            sha256sum dist/Image \
+              > dist/Image.sha256
+          fi
 
           cat > dist/README.txt <<'EOF'
-          XCOVER4S V37 EXPERIMENTAL CPLOCK
+          XCOVER4S V38 EXPERIMENTAL
 
-          Full kernel build only.
-          NOT an Odin-flashable image.
+          Full kernel build.
+          Not an Odin package.
 
-          PMUCAL CP activation gates installed.
-          PMUCAL reset-assert scheduled at late init.
+          C90 declaration issue addressed.
+          PMUCAL CP start gates added.
+          SS310AP modem_on denied.
+          PMUCAL OFF attempted at late init.
 
-          NOT YET VERIFIED:
-          - Boot success
-          - CP physical power-off
-          - All CP reactivation paths
-          - Wi-Fi functionality
+          Remaining risks:
+          - Other CP reactivation paths
+          - Late power-off timing
+          - Kernel boot compatibility
+          - Unknown physical CP power state
 
-          Do not flash Image directly with Odin.
+          DO NOT FLASH IMAGE DIRECTLY.
           EOF
 
-      - name: Upload V37 artifact
+      - name: Upload V38
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V37-FULL-KERNEL
+          name: XCOVER4S-V38-FULL-KERNEL
           path: dist/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
