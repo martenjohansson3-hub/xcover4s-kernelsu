@@ -1,48 +1,244 @@
 
-name: XCover4s CP Power Diagnostics
+name: XCover4s CP Power OFF v5
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  CC: clang
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  CROSS_COMPILE: aarch64-linux-gnu-
+  KCFLAGS: -Wno-error
+
 jobs:
-  inspect:
+  build:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Download Samsung kernel
+      - name: Install build tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3 make bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            clang lld llvm cpio rsync
+
+      - name: Download kernel source
+        run: |
+          set -eux
           git clone --depth 1 \
             --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
-      - name: Inspect CP power control
+          git -C kernel rev-parse HEAD
+
+      - name: Patch Samsung CP power control
+        working-directory: kernel
         run: |
-          mkdir -p results
+          set -eux
 
-          {
-            echo "=== PMU CP CONTROL ==="
-            sed -n '1,460p' kernel/drivers/soc/samsung/pmu-cp.c
+          python3 <<'PY'
+          from pathlib import Path
 
-            echo "=== CP POWER REFERENCES ==="
-            grep -RnE \
-              'CP_POWER_ON|CP_POWER_OFF|cp_power_status|cp_reset|exynos_set_cp_power' \
-              kernel/drivers/soc/samsung \
-              kernel/drivers/misc/modem_v1 \
-              || true
+          p = Path("drivers/soc/samsung/pmu-cp.c")
+          s = p.read_text()
 
-            echo "=== PMU REGISTER REFERENCES ==="
-            grep -RnE \
-              'CP_STATUS|CP_CTRL|CP_CONFIGURATION|CP_RESET|CP_PWR' \
-              kernel/include \
-              kernel/drivers/soc/samsung \
-              | head -300 || true
-          } > results/cp-power-diagnostics.txt
+          needle = (
+              "int exynos_set_cp_power_onoff(enum cp_mode mode)\n"
+              "{"
+          )
 
-          cp kernel/drivers/soc/samsung/pmu-cp.c \
-            results/pmu-cp.c
+          if s.count(needle) != 1:
+              raise SystemExit("CP power function mismatch")
 
-      - name: Upload diagnostics
+          replacement = (
+              "int exynos_set_cp_power_onoff(enum cp_mode mode)\n"
+              "{\n"
+              "\t/* XCOVER4S_V5_CP_POWER_OFF */\n"
+              "\tif (mode == CP_POWER_ON) {\n"
+              "\t\tpr_info(\"XCOVER4S_V5: CP start redirected to OFF\\n\");\n"
+              "\t\tmode = CP_POWER_OFF;\n"
+              "\t}\n"
+          )
+
+          s = s.replace(needle, replacement, 1)
+
+          if s.count("XCOVER4S_V5_CP_POWER_OFF") != 1:
+              raise SystemExit("Patch failed")
+
+          p.write_text(s)
+          print("Samsung CP power patch installed")
+          PY
+
+          git diff -- drivers/soc/samsung/pmu-cp.c
+
+      - name: Patch SELinux permissive
+        working-directory: kernel
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          changed = []
+
+          for p in Path("security/selinux").rglob("*.c"):
+              original = p.read_text()
+              patched = re.sub(
+                  r'(\bselinux_enforcing\s*=\s*)1(\s*;)',
+                  r'\g<1>0\g<2>',
+                  original
+              )
+
+              if patched != original:
+                  p.write_text(patched)
+                  changed.append(str(p))
+
+          print("Patched SELinux files:", changed)
+
+          if not changed:
+              raise SystemExit("SELinux patch not applied")
+          PY
+
+      - name: Verify CP patch
+        working-directory: kernel
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          s = Path(
+              "drivers/soc/samsung/pmu-cp.c"
+          ).read_text()
+
+          checks = [
+              "XCOVER4S_V5_CP_POWER_OFF",
+              "mode = CP_POWER_OFF;",
+              "exynos_sys_powerdown_conf_cp();",
+              "cp_ctrl & ~CP_PWRON",
+              "exynos_set_cp_power_onoff",
+          ]
+
+          for item in checks:
+              if item not in s:
+                  raise SystemExit("Missing: " + item)
+
+          print("CP patch verification passed")
+          PY
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          set -eux
+
+          make \
+            O="$PWD/out" \
+            ARCH=arm64 \
+            lineage_xcover4s_defconfig
+
+          CONFIG="out/.config"
+
+          if grep -q \
+            '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=' \
+            "$CONFIG"
+          then
+            sed -i \
+              's/^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=.*/CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0/' \
+              "$CONFIG"
+          else
+            echo \
+              'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' \
+              >> "$CONFIG"
+          fi
+
+          make \
+            O="$PWD/out" \
+            ARCH=arm64 \
+            olddefconfig
+
+      - name: Targeted PMU compile
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -o pipefail
+
+          make -j"$(nproc)" \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            CC="$CC" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KCFLAGS="$KCFLAGS" \
+            drivers/soc/samsung/pmu-cp.o \
+            2>&1 | tee targeted-build.log
+
+          echo "TARGETED BUILD PASSED"
+
+      - name: Full kernel build
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -o pipefail
+
+          make -j"$(nproc)" \
+            O="$PWD/out" \
+            ARCH="$ARCH" \
+            CC="$CC" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KCFLAGS="$KCFLAGS" \
+            Image dtbs \
+            2>&1 | tee build.log
+
+          echo "FULL BUILD PASSED"
+
+      - name: Prepare diagnostics
+        working-directory: kernel
+        run: |
+          set -eux
+
+          mkdir -p ../artifacts
+
+          cp \
+            out/arch/arm64/boot/Image \
+            ../artifacts/Image-CP-POWER-OFF-v5
+
+          cp out/.config \
+            ../artifacts/kernel-config
+
+          cp build.log \
+            ../artifacts/build.log
+
+          cp targeted-build.log \
+            ../artifacts/targeted-build.log
+
+          cp drivers/soc/samsung/pmu-cp.c \
+            ../artifacts/pmu-cp-patched.c
+
+          git diff > ../artifacts/kernel.patch
+
+          git rev-parse HEAD \
+            > ../artifacts/source-commit.txt
+
+          sha256sum \
+            ../artifacts/Image-CP-POWER-OFF-v5 \
+            > ../artifacts/SHA256SUMS
+
+          ls -lh ../artifacts/
+
+      - name: Upload kernel and diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: xcover4s-cp-power-diagnostics
-          path: results/
+          name: XCOVER4S-CP-POWER-OFF-v5
+          path: artifacts/
+          if-no-files-found: error
