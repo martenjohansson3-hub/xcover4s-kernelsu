@@ -1,4 +1,4 @@
-name: XCover4s CP POWER OFF v9 - Flashable
+name: XCover4s CP POWER OFF v10 - Flashable
 
 on:
   workflow_dispatch:
@@ -20,10 +20,6 @@ jobs:
 
     steps:
 
-      # ==========================================================
-      # 1. TOOLS
-      # ==========================================================
-
       - name: Install dependencies
         run: |
           set -eux
@@ -31,40 +27,18 @@ jobs:
           sudo apt-get update
 
           sudo apt-get install -y \
-            git \
-            python3 \
-            make \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            libncurses-dev \
+            git python3 make bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
             device-tree-compiler \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            clang \
-            lld \
-            llvm \
-            cpio \
-            rsync \
-            unzip \
-            wget \
-            curl \
-            file
-
-      # ==========================================================
-      # 2. CHECKOUT
-      # ==========================================================
+            clang lld llvm \
+            cpio rsync unzip wget curl file
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ==========================================================
-      # 3. KERNEL SOURCE
-      # ==========================================================
-
-      - name: Clone kernel
+      - name: Clone Samsung kernel
         run: |
           set -eux
 
@@ -78,10 +52,10 @@ jobs:
           git -C kernel rev-parse HEAD
 
       # ==========================================================
-      # 4. PATCH CP
+      # PATCH ACTUAL SAMSUNG SOURCE
       # ==========================================================
 
-      - name: Apply CP OFF v9 patch
+      - name: Apply exact CP v10 patch
         working-directory: kernel
         shell: bash
         run: |
@@ -91,149 +65,221 @@ jobs:
           from pathlib import Path
           import re
 
-          p = Path("drivers/soc/samsung/pmu-cp.c")
-          s = p.read_text()
+          path = Path("drivers/soc/samsung/pmu-cp.c")
+          s = path.read_text()
 
-          # ------------------------------------------------------
-          # RESET FUNCTION
-          # ------------------------------------------------------
-
-          pattern_reset = re.compile(
-              r'/\* reset cp \*/\n'
-              r'int exynos_cp_reset\(void\)\n'
-              r'\{.*?\n\}\n',
-              re.S
-          )
-
-          reset = r'''/* reset cp */
-          int exynos_cp_reset(void)
-          {
-              /*
-               * XCOVER4S_V9_CP_OFF
-               *
-               * Do not assert CP_PWRON.
-               * Do not start the cellular CP.
-               * Use Samsung's normal CP_POWER_OFF sequence.
-               */
-              pr_info(
-                  "XCOVER4S_V9: CP reset blocked - forcing OFF\n"
-              );
-
-              return exynos_set_cp_power_onoff(CP_POWER_OFF);
-          }
-          '''
-
-          s2, n = pattern_reset.subn(reset, s, count=1)
-
-          if n != 1:
-              raise SystemExit(
-                  "Could not replace exynos_cp_reset()"
+          def find_function(text, name):
+              """
+              Find:
+                  int name(...)
+              and return the exact [start,end) range
+              of the complete C function using brace matching.
+              """
+              pattern = re.compile(
+                  r'\bint\s+' + re.escape(name) +
+                  r'\s*\([^)]*\)\s*\{'
               )
 
-          s = s2
+              m = pattern.search(text)
+
+              if not m:
+                  raise SystemExit(
+                      f"Could not find function: {name}"
+                  )
+
+              brace = text.find("{", m.start())
+
+              depth = 0
+              in_string = False
+              in_char = False
+              escape = False
+              line_comment = False
+              block_comment = False
+
+              i = brace
+
+              while i < len(text):
+                  c = text[i]
+                  n = text[i + 1] if i + 1 < len(text) else ""
+
+                  if line_comment:
+                      if c == "\n":
+                          line_comment = False
+
+                  elif block_comment:
+                      if c == "*" and n == "/":
+                          block_comment = False
+                          i += 1
+
+                  elif in_string:
+                      if escape:
+                          escape = False
+                      elif c == "\\":
+                          escape = True
+                      elif c == '"':
+                          in_string = False
+
+                  elif in_char:
+                      if escape:
+                          escape = False
+                      elif c == "\\":
+                          escape = True
+                      elif c == "'":
+                          in_char = False
+
+                  else:
+                      if c == "/" and n == "/":
+                          line_comment = True
+                          i += 1
+
+                      elif c == "/" and n == "*":
+                          block_comment = True
+                          i += 1
+
+                      elif c == '"':
+                          in_string = True
+
+                      elif c == "'":
+                          in_char = True
+
+                      elif c == "{":
+                          depth += 1
+
+                      elif c == "}":
+                          depth -= 1
+
+                          if depth == 0:
+                              return m.start(), i + 1
+
+                  i += 1
+
+              raise SystemExit(
+                  f"Unclosed function: {name}"
+              )
 
           # ------------------------------------------------------
-          # RELEASE FUNCTION
+          # RESET
           # ------------------------------------------------------
 
-          pattern_release = re.compile(
-              r'/\* release cp \*/\n'
-              r'int exynos_cp_release\(void\)\n'
-              r'\{.*?\n\}\n'
-              r'\n/\* clear cp active \*/',
-              re.S
-          )
-
-          release = r'''/* release cp */
-          int exynos_cp_release(void)
-          {
-              /*
-               * XCOVER4S_V9_CP_OFF
-               *
-               * Do not write CP_START.
-               * Do not write CP_POWER_ON.
-               */
-              pr_info(
-                  "XCOVER4S_V9: CP release blocked - forcing OFF\n"
-              );
-
-              return exynos_set_cp_power_onoff(CP_POWER_OFF);
-          }
-
-          /* clear cp active */'''
-
-          s2, n = pattern_release.subn(
-              release,
+          start, end = find_function(
               s,
-              count=1
+              "exynos_cp_reset"
           )
 
-          if n != 1:
-              raise SystemExit(
-                  "Could not replace exynos_cp_release()"
-              )
+          reset = r'''int exynos_cp_reset(void)
+          {
+              /*
+               * XCOVER4S_V10_CP_OFF
+               *
+               * Do not power the cellular CP on during reset.
+               */
+              pr_info(
+                  "XCOVER4S_V10: CP reset blocked - forcing OFF\n"
+              );
 
-          s = s2
+              return exynos_set_cp_power_onoff(
+                  CP_POWER_OFF
+              );
+          }'''
+
+          s = s[:start] + reset + s[end:]
+
+          # ------------------------------------------------------
+          # RELEASE
+          # ------------------------------------------------------
+
+          start, end = find_function(
+              s,
+              "exynos_cp_release"
+          )
+
+          release = r'''int exynos_cp_release(void)
+          {
+              /*
+               * XCOVER4S_V10_CP_OFF
+               *
+               * Do not write CP_START or CP_POWER_ON.
+               */
+              pr_info(
+                  "XCOVER4S_V10: CP release blocked - forcing OFF\n"
+              );
+
+              return exynos_set_cp_power_onoff(
+                  CP_POWER_OFF
+              );
+          }'''
+
+          s = s[:start] + release + s[end:]
 
           # ------------------------------------------------------
           # CENTRAL POWER FUNCTION
           #
-          # IMPORTANT:
-          # declarations remain BEFORE executable statements.
-          # This is required for compatibility with this old kernel.
+          # Keep declarations first for old C/kernel compatibility.
           # ------------------------------------------------------
 
-          marker = "int exynos_set_cp_power_onoff(enum cp_mode mode)\n{"
+          marker = (
+              "int exynos_set_cp_power_onoff"
+              "(enum cp_mode mode)\n"
+              "{"
+          )
 
           if s.count(marker) != 1:
               raise SystemExit(
-                  "Could not find unique CP power function"
+                  "Central CP power function not uniquely found"
               )
 
-          old = marker + r'''
+          old_decl = r'''int exynos_set_cp_power_onoff(enum cp_mode mode)
+          {
               u32 cp_ctrl;
               u32 __maybe_unused cp_ctrl2;
               int ret = 0;
               int wait_count = 0;
+
           '''
 
-          new = marker + r'''
+          new_decl = r'''int exynos_set_cp_power_onoff(enum cp_mode mode)
+          {
               u32 cp_ctrl;
               u32 __maybe_unused cp_ctrl2;
               int ret = 0;
               int wait_count = 0;
 
               /*
-               * XCOVER4S_V9_CP_OFF
+               * XCOVER4S_V10_CP_OFF
                *
-               * Any request to power the cellular CP on is converted
-               * into the normal Samsung CP_POWER_OFF sequence.
+               * Never allow CP_POWER_ON to reach the PMU write.
                */
               if (mode == CP_POWER_ON) {
                   pr_info(
-                      "XCOVER4S_V9: CP POWER_ON blocked - forcing OFF\n"
+                      "XCOVER4S_V10: CP POWER_ON blocked - forcing OFF\n"
                   );
 
                   mode = CP_POWER_OFF;
               }
+
           '''
 
-          if old not in s:
+          if old_decl not in s:
               raise SystemExit(
-                  "Expected original CP function declarations not found"
+                  "Expected central function declaration block "
+                  "was not found"
               )
 
-          s = s.replace(old, new, 1)
+          s = s.replace(
+              old_decl,
+              new_decl,
+              1
+          )
 
-          p.write_text(s)
+          path.write_text(s)
 
-          print("========================================")
-          print("XCOVER4S V9 CP PATCH APPLIED")
-          print("========================================")
+          print(
+              "XCOVER4S V10 SOURCE PATCH APPLIED"
+          )
           PY
 
       # ==========================================================
-      # 5. SELINUX PERMISSIVE
+      # SELINUX
       # ==========================================================
 
       - name: Configure SELinux permissive
@@ -272,10 +318,10 @@ jobs:
           PY
 
       # ==========================================================
-      # 6. SOURCE VERIFICATION
+      # VERY STRICT SOURCE VERIFICATION
       # ==========================================================
 
-      - name: Verify CP source
+      - name: Verify all CP start paths
         working-directory: kernel
         shell: bash
         run: |
@@ -283,122 +329,148 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           s = Path(
               "drivers/soc/samsung/pmu-cp.c"
           ).read_text()
 
-          # ------------------------------------------------------
-          # RESET
-          # ------------------------------------------------------
+          def function_body(text, name):
+              m = re.search(
+                  r'\bint\s+' +
+                  re.escape(name) +
+                  r'\s*\([^)]*\)\s*\{',
+                  text
+              )
 
-          a = s.index(
-              "int exynos_cp_reset(void)"
+              if not m:
+                  raise SystemExit(
+                      "Function missing: " + name
+                  )
+
+              brace = text.find("{", m.start())
+              depth = 0
+              i = brace
+
+              while i < len(text):
+                  if text[i] == "{":
+                      depth += 1
+                  elif text[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return text[m.start():i + 1]
+                  i += 1
+
+              raise SystemExit(
+                  "Unclosed function: " + name
+              )
+
+          reset = function_body(
+              s,
+              "exynos_cp_reset"
           )
 
-          b = s.index(
-              "/* release cp */",
-              a
+          release = function_body(
+              s,
+              "exynos_cp_release"
           )
 
-          reset = s[a:b]
+          central = function_body(
+              s,
+              "exynos_set_cp_power_onoff"
+          )
 
+          # Reset must not directly power CP on.
           if "CP_PWRON" in reset:
               raise SystemExit(
-                  "FAIL: CP_PWRON remains in reset"
+                  "FAIL: CP_PWRON remains in exynos_cp_reset"
               )
 
-          if "CP_POWER_OFF" not in reset:
-              raise SystemExit(
-                  "FAIL: CP_POWER_OFF missing from reset"
-              )
-
-          # ------------------------------------------------------
-          # RELEASE
-          # ------------------------------------------------------
-
-          a = s.index(
-              "int exynos_cp_release(void)"
-          )
-
-          b = s.index(
-              "/* clear cp active */",
-              a
-          )
-
-          release = s[a:b]
-
+          # Release must not directly start CP.
           if "CP_START" in release:
               raise SystemExit(
-                  "FAIL: CP_START remains in release"
+                  "FAIL: CP_START remains in exynos_cp_release"
               )
 
           if "CP_POWER_ON" in release:
               raise SystemExit(
-                  "FAIL: CP_POWER_ON remains in release"
+                  "FAIL: CP_POWER_ON remains in exynos_cp_release"
+              )
+
+          # Both must force OFF.
+          if "CP_POWER_OFF" not in reset:
+              raise SystemExit(
+                  "FAIL: reset does not force CP_POWER_OFF"
               )
 
           if "CP_POWER_OFF" not in release:
               raise SystemExit(
-                  "FAIL: CP_POWER_OFF missing from release"
+                  "FAIL: release does not force CP_POWER_OFF"
               )
 
-          # ------------------------------------------------------
-          # CENTRAL FUNCTION
-          # ------------------------------------------------------
-
-          if "XCOVER4S_V9_CP_OFF" not in s:
+          # Central redirect must exist.
+          if "mode = CP_POWER_OFF;" not in central:
               raise SystemExit(
-                  "FAIL: v9 marker missing"
+                  "FAIL: central POWER_ON redirect missing"
               )
 
-          if (
-              "mode = CP_POWER_OFF;"
-              not in s
-          ):
-              raise SystemExit(
-                  "FAIL: CP POWER_ON redirect missing"
-              )
+          # The direct start expressions from the original
+          # source must no longer exist.
+          forbidden = [
+              "CP_RESET_SET | CP_PWRON",
+              "CP_START | CP_POWER_ON",
+              "(CP_START | CP_POWER_ON)",
+          ]
 
-          # ------------------------------------------------------
-          # CHECK THAT SAMSUNG POWER-DOWN SEQUENCE STILL EXISTS
-          # ------------------------------------------------------
+          for item in forbidden:
+              if item in s:
+                  raise SystemExit(
+                      "FAIL: direct CP start expression remains: "
+                      + item
+                  )
 
+          # Samsung's genuine OFF sequence must remain.
           required = [
               "exynos_sys_powerdown_conf_cp();",
-              "CP_PWRON",
-              "EXYNOS_PMU_CENTRAL_SEQ_CP_CONFIGURATION",
-              "EXYNOS_PMU_TCXO_GATE_SYS_PWR_REG",
-              "EXYNOS_PMU_CP_DISABLE_ISO_SYS_PWR_REG",
+              "cp_ctrl & ~CP_PWRON",
+              "cp_ctrl & ~CP_START",
           ]
 
           for item in required:
               if item not in s:
                   raise SystemExit(
-                      "FAIL: missing required Samsung CP code: "
+                      "FAIL: Samsung OFF sequence missing: "
                       + item
                   )
 
+          if "XCOVER4S_V10_CP_OFF" not in s:
+              raise SystemExit(
+                  "FAIL: V10 marker missing"
+              )
+
           print(
-              "CP SOURCE VERIFICATION PASSED"
+              "========================================"
+          )
+          print(
+              "ALL CP START PATH CHECKS PASSED"
+          )
+          print(
+              "========================================"
           )
           PY
 
-      # ==========================================================
-      # 7. SHOW PATCH
-      # ==========================================================
-
-      - name: Show CP diff
+      - name: Show final CP source
         working-directory: kernel
         run: |
           set -eux
 
-          git diff -- \
-            drivers/soc/samsung/pmu-cp.c \
-            security/selinux
+          grep -n \
+            -E \
+            'exynos_cp_reset|exynos_cp_release|exynos_set_cp_power_onoff|XCOVER4S_V10|CP_PWRON|CP_START|CP_POWER_ON|CP_POWER_OFF' \
+            drivers/soc/samsung/pmu-cp.c
 
       # ==========================================================
-      # 8. CONFIG
+      # CONFIG
       # ==========================================================
 
       - name: Configure kernel
@@ -445,7 +517,7 @@ jobs:
             out/.config
 
       # ==========================================================
-      # 9. TARGETED BUILD
+      # TARGETED TEST
       # ==========================================================
 
       - name: Targeted PMU compile
@@ -470,7 +542,7 @@ jobs:
           echo "TARGETED PMU COMPILE PASSED"
 
       # ==========================================================
-      # 10. FULL BUILD
+      # FULL BUILD
       # ==========================================================
 
       - name: Full kernel build
@@ -481,7 +553,7 @@ jobs:
           set -o pipefail
 
           echo "========================================"
-          echo "FULL KERNEL BUILD V9"
+          echo "FULL KERNEL BUILD V10"
           echo "========================================"
 
           date -u
@@ -527,7 +599,7 @@ jobs:
           date -u
 
       # ==========================================================
-      # 11. VERIFY IMAGE
+      # VERIFY IMAGE
       # ==========================================================
 
       - name: Verify kernel Image
@@ -546,57 +618,44 @@ jobs:
           echo "Image size: $SIZE"
 
           if [ "$SIZE" -lt 20000000 ]; then
-              echo "ERROR: Image is unexpectedly small"
+              echo "ERROR: Image unexpectedly small"
               exit 1
           fi
 
           sha256sum "$IMAGE"
 
       # ==========================================================
-      # 12. VERIFY ORIGINAL BOOT
+      # ORIGINAL BOOT
       # ==========================================================
 
-      - name: Verify original boot image
+      - name: Verify original boot
         run: |
           set -eux
 
           if [ ! -f boot-original.img ]; then
-              echo
-              echo "ERROR: boot-original.img is missing."
-              echo
-              echo "Put your known-good original boot image"
-              echo "in the repository root as:"
-              echo
-              echo "boot-original.img"
+              echo "ERROR: boot-original.img missing"
               exit 1
           fi
 
           SHA="$(
-            sha256sum boot-original.img \
-            | awk '{print $1}'
+            sha256sum boot-original.img |
+            awk '{print $1}'
           )"
-
-          echo "Original boot SHA256:"
-          echo "$SHA"
 
           EXPECTED="f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9"
 
+          echo "Original SHA:"
+          echo "$SHA"
+
           if [ "$SHA" != "$EXPECTED" ]; then
-              echo
-              echo "ERROR: ORIGINAL BOOT HASH DOES NOT MATCH"
-              echo
-              echo "Expected:"
-              echo "$EXPECTED"
-              echo
-              echo "Got:"
-              echo "$SHA"
+              echo "ERROR: original boot SHA mismatch"
               exit 1
           fi
 
           echo "ORIGINAL BOOT VERIFIED"
 
       # ==========================================================
-      # 13. GET MAGISKBOOT
+      # MAGISKBOOT
       # ==========================================================
 
       - name: Get magiskboot
@@ -606,8 +665,8 @@ jobs:
           API="https://api.github.com/repos/topjohnwu/Magisk/releases/latest"
 
           URL="$(
-            curl -fsSL "$API" \
-            | python3 -c '
+            curl -fsSL "$API" |
+            python3 -c '
           import json
           import sys
 
@@ -637,14 +696,10 @@ jobs:
 
           chmod +x magiskboot
 
-          ./magiskboot --help \
-            >/dev/null 2>&1 \
-            || true
-
           file magiskboot
 
       # ==========================================================
-      # 14. UNPACK ORIGINAL BOOT
+      # UNPACK ORIGINAL
       # ==========================================================
 
       - name: Unpack original boot
@@ -652,6 +707,7 @@ jobs:
           set -eux
 
           rm -rf boot-unpack
+
           mkdir boot-unpack
 
           cd boot-unpack
@@ -659,113 +715,83 @@ jobs:
           ../magiskboot unpack \
             ../boot-original.img
 
-          echo
-          echo "===== BOOT CONTENTS ====="
-
           ls -lah
 
+          test -f kernel
+
       # ==========================================================
-      # 15. VERIFY ORIGINAL KERNEL
+      # REPLACE KERNEL ONLY
       # ==========================================================
 
-      - name: Verify original boot kernel
+      - name: Replace kernel
         run: |
           set -eux
-
-          test -f boot-unpack/kernel
-
-          echo "Original embedded kernel:"
-          file boot-unpack/kernel
-
-          stat boot-unpack/kernel
-
-      # ==========================================================
-      # 16. INSTALL NEW KERNEL
-      # ==========================================================
-
-      - name: Install v9 kernel into boot image
-        run: |
-          set -eux
-
-          test -s \
-            kernel/out/arch/arm64/boot/Image
 
           cp \
             kernel/out/arch/arm64/boot/Image \
             boot-unpack/kernel
 
-          echo
+          test -s boot-unpack/kernel
+
           echo "New kernel:"
           file boot-unpack/kernel
 
-          sha256sum \
-            boot-unpack/kernel
+          sha256sum boot-unpack/kernel
 
       # ==========================================================
-      # 17. REPACK
+      # REPACK
       # ==========================================================
 
-      - name: Repack boot image
+      - name: Create flashable boot image
         run: |
           set -eux
 
           ./magiskboot repack \
             boot-original.img \
-            boot-CP-OFF-v9.img
+            boot-CP-OFF-v10.img
 
-          test -s \
-            boot-CP-OFF-v9.img
+          test -s boot-CP-OFF-v10.img
 
           echo
           echo "========================================"
-          echo "FLASHABLE BOOT CREATED"
+          echo "FLASHABLE V10 CREATED"
           echo "========================================"
 
-          ls -lh \
-            boot-CP-OFF-v9.img
+          ls -lh boot-CP-OFF-v10.img
 
-          file \
-            boot-CP-OFF-v9.img
+          file boot-CP-OFF-v10.img
 
-          sha256sum \
-            boot-CP-OFF-v9.img
+          sha256sum boot-CP-OFF-v10.img
 
       # ==========================================================
-      # 18. FINAL BOOT CHECK
+      # RE-UNPACK FLASH IMAGE
       # ==========================================================
 
-      - name: Final boot image verification
+      - name: Verify flashable image
         run: |
           set -eux
 
-          test -s \
-            boot-CP-OFF-v9.img
+          rm -rf verify-boot
 
-          SIZE="$(stat -c%s boot-CP-OFF-v9.img)"
+          mkdir verify-boot
 
-          echo "Flashable boot size: $SIZE"
+          cd verify-boot
 
-          if [ "$SIZE" -lt 1000000 ]; then
-              echo "ERROR: flashable boot is suspiciously small"
-              exit 1
-          fi
+          ../magiskboot unpack \
+            ../boot-CP-OFF-v10.img
 
-          ./magiskboot unpack \
-            boot-CP-OFF-v9.img
+          test -s kernel
 
-          test -f kernel
-
-          echo
-          echo "Re-unpacked v9 boot successfully."
-
-          echo
-          echo "v9 embedded kernel:"
+          echo "Re-unpacked flash kernel:"
           file kernel
 
           sha256sum kernel
 
+          echo
+          echo "Flashable boot verification PASSED"
+
       # ==========================================================
-      # 19. PACKAGE
+      # PACKAGE
       # ==========================================================
 
       - name: Package artifacts
@@ -776,11 +802,11 @@ jobs:
 
           cp \
             kernel/out/arch/arm64/boot/Image \
-            artifacts/Image-CP-POWER-OFF-v9
+            artifacts/Image-CP-POWER-OFF-v10
 
           cp \
-            boot-CP-OFF-v9.img \
-            artifacts/boot-CP-OFF-v9.img
+            boot-CP-OFF-v10.img \
+            artifacts/boot-CP-OFF-v10.img
 
           cp \
             boot-original.img \
@@ -800,7 +826,7 @@ jobs:
 
           cp \
             kernel/drivers/soc/samsung/pmu-cp.c \
-            artifacts/pmu-cp-v9.c
+            artifacts/pmu-cp-v10.c
 
           git -C kernel diff \
             -- drivers/soc/samsung/pmu-cp.c \
@@ -811,31 +837,27 @@ jobs:
             > artifacts/source-commit.txt
 
           sha256sum \
-            artifacts/boot-CP-OFF-v9.img \
-            artifacts/Image-CP-POWER-OFF-v9 \
+            artifacts/boot-CP-OFF-v10.img \
+            artifacts/Image-CP-POWER-OFF-v10 \
             artifacts/boot-original.img \
             > artifacts/SHA256SUMS
 
           echo
           echo "========================================"
-          echo "V9 ARTIFACTS"
+          echo "V10 ARTIFACTS"
           echo "========================================"
 
           ls -lh artifacts/
 
-      # ==========================================================
-      # 20. UPLOAD
-      # ==========================================================
-
-      - name: Upload flashable v9
+      - name: Upload flashable v10
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-CP-POWER-OFF-v9-FLASHABLE
+          name: XCOVER4S-CP-POWER-OFF-v10-FLASHABLE
           path: artifacts/
           if-no-files-found: error
 
       # ==========================================================
-      # 21. FAILURE LOG
+      # FAILURE DIAGNOSTICS
       # ==========================================================
 
       - name: Collect failure diagnostics
@@ -884,6 +906,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-v9-FAILURE-DIAGNOSTICS
+          name: XCOVER4S-v10-FAILURE-DIAGNOSTICS
           path: failure-diagnostics/
           if-no-files-found: ignore
