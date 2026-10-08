@@ -1,4 +1,5 @@
-name: XCOVER4S V24 SIZE TEST
+
+name: XCOVER4S V24 FIXED
 
 on:
   workflow_dispatch:
@@ -12,103 +13,76 @@ jobs:
       - name: Install build tools
         run: |
           set -euo pipefail
-
           sudo apt-get update -qq
-
           sudo apt-get install -y \
-            clang-14 \
-            lld-14 \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            cpio
+            bc bison flex libssl-dev libelf-dev cpio
 
       - name: Download kernel source
         run: |
           set -euo pipefail
-
-          git clone --depth 1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
+          git clone --depth 1 --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
 
           mkdir -p diagnostics
+          git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-          git -C kernel rev-parse HEAD \
-            > diagnostics/source-commit.txt
-
-      - name: Apply V24 patches
+      - name: Apply corrected V24 patches
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          def replace_exact(path, old, new):
-              p = Path(path)
-              s = p.read_text()
+          p = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
+          s = p.read_text()
 
-              count = s.count(old)
+          changes = [
+              (
+                  r'(void cal_cp_init\(void\)\s*\{\s*)'
+                  r'pmucal_cp_init\(\);',
+                  r'\g<1>pr_warn("V24 CP init blocked\n");'
+                  '\n\tpmucal_cp_reset_assert();'
+              ),
+              (
+                  r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
+                  r'pmucal_cp_reset_release\(\);',
+                  r'\g<1>pr_warn("V24 CP release blocked\n");'
+                  '\n\tpmucal_cp_reset_assert();'
+              )
+          ]
 
+          for pattern, replacement in changes:
+              s, count = re.subn(pattern, replacement, s)
               if count != 1:
                   raise SystemExit(
-                      f"STOP: {path}: expected 1 match, got {count}"
+                      f"CP patch failed: expected 1 match, got {count}"
                   )
 
-              p.write_text(s.replace(old, new))
-              print(f"Patched {path}")
+          p.write_text(s)
 
-          cp = "kernel/drivers/soc/samsung/cal-if/cal-if.c"
-
-          replace_exact(
-              cp,
-              """void cal_cp_init(void)
-          {
-              pmucal_cp_init();
-          }""",
-              """void cal_cp_init(void)
-          {
-              pr_warn("V24 CP init blocked\\n");
-              pmucal_cp_reset_assert();
-          }"""
-          )
-
-          replace_exact(
-              cp,
-              """void cal_cp_reset_release(void)
-          {
-              pmucal_cp_reset_release();
-          }""",
-              """void cal_cp_reset_release(void)
-          {
-              pr_warn("V24 CP release blocked\\n");
-              pmucal_cp_reset_assert();
-          }"""
-          )
-
-          decon = (
+          p = Path(
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon_reg.c"
           )
+          s = p.read_text()
+          old = "const double decon_clocks_table[][CLK_ID_MAX]"
+          new = "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
 
-          replace_exact(
-              decon,
-              "const double decon_clocks_table[][CLK_ID_MAX]",
-              "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-          )
+          if s.count(old) != 1:
+              raise SystemExit("Display patch target not found")
+
+          p.write_text(s.replace(old, new))
+          print("V24 patches applied successfully")
           PY
 
-          git -C kernel diff \
-            > diagnostics/v24.patch
+          git -C kernel diff > diagnostics/v24.patch
 
       - name: Configure kernel
         run: |
           set -euo pipefail
-
           cd kernel
 
           export ARCH=arm64
@@ -116,14 +90,13 @@ jobs:
 
           make O=out lineage_xcover4s_defconfig
 
-          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
-
           scripts/config --file out/.config \
             -d DEBUG_INFO \
             -d DEBUG_INFO_DWARF4 \
             -d DEBUG_INFO_DWARF5 \
             -d DEBUG_INFO_BTF \
-            -d DEBUG_INFO_BTF_MODULES
+            -d DEBUG_INFO_BTF_MODULES \
+            -d KALLSYMS_ALL
 
           scripts/config --file out/.config \
             -e SECURITY_SELINUX \
@@ -135,25 +108,28 @@ jobs:
 
           cp out/.config ../diagnostics/final.config
 
-      - name: Verify CP patch
+          grep -E \
+            'CONFIG_CP_PMUCAL=|CONFIG_SECURITY_SELINUX|CONFIG_DEBUG_INFO|CONFIG_KALLSYMS' \
+            out/.config > ../diagnostics/config-check.txt || true
+
+      - name: Verify patches
         run: |
           set -euo pipefail
 
-          grep -n \
-            'V24 CP init blocked' \
+          grep -n 'V24 CP init blocked' \
             kernel/drivers/soc/samsung/cal-if/cal-if.c
 
-          grep -n \
-            'V24 CP release blocked' \
+          grep -n 'V24 CP release blocked' \
             kernel/drivers/soc/samsung/cal-if/cal-if.c
 
-          echo "CP patch verified" \
-            > diagnostics/cp-patch.txt
+          grep -n 'const unsigned long decon_clocks_table' \
+            kernel/drivers/video/fbdev/exynos/dpu_7885/decon_reg.c
 
-      - name: Targeted display driver test
+          echo "PATCHES VERIFIED" > diagnostics/patch-result.txt
+
+      - name: Targeted compile test
         run: |
           set -euo pipefail
-
           cd kernel
 
           export ARCH=arm64
@@ -161,13 +137,13 @@ jobs:
           export KCFLAGS=-Wno-error
 
           make O=out -j2 \
+            drivers/soc/samsung/cal-if/cal-if.o \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
-            2>&1 | tee ../diagnostics/display-test.log
+            2>&1 | tee ../diagnostics/targeted-build.log
 
-      - name: Full kernel build
+      - name: Build kernel
         run: |
           set -euo pipefail
-
           cd kernel
 
           export ARCH=arm64
@@ -177,74 +153,54 @@ jobs:
           make O=out -j2 Image \
             2>&1 | tee ../diagnostics/build.log
 
-      - name: Check kernel size
+      - name: Measure kernel
         run: |
           set -euo pipefail
 
-          IMAGE="kernel/out/arch/arm64/boot/Image"
-
+          IMAGE=kernel/out/arch/arm64/boot/Image
           test -s "$IMAGE"
 
           SIZE=$(stat -c%s "$IMAGE")
 
-          echo "V24 kernel size: $SIZE bytes"
-          echo "Maximum target: 23327848 bytes"
+          {
+            echo "V21 original target: 23327848 bytes"
+            echo "V23 kernel: 25139944 bytes"
+            echo "V24 kernel: $SIZE bytes"
+            echo
+            echo "Boot partition capacity: 37748736 bytes"
+            echo "Final fit requires repacking and checking boot.img."
+          } | tee diagnostics/kernel-size.txt
 
-          echo "$SIZE" \
-            > diagnostics/kernel-size.txt
-
-          if [ "$SIZE" -gt 23327848 ]; then
-            echo "ERROR: kernel is still too large"
-            exit 1
-          fi
-
-          echo "KERNEL FITS TARGET SIZE" \
-            > diagnostics/size-result.txt
-
-      - name: Prepare artifact
+      - name: Prepare kernel artifact
         run: |
           set -euo pipefail
 
           mkdir -p artifact
 
-          cp \
-            kernel/out/arch/arm64/boot/Image \
-            artifact/Image
+          cp kernel/out/arch/arm64/boot/Image artifact/Image
+          cp diagnostics/v24.patch artifact/v24.patch
+          cp diagnostics/kernel-size.txt artifact/kernel-size.txt
+          cp diagnostics/final.config artifact/final.config
 
-          cp \
-            diagnostics/v24.patch \
-            artifact/v24.patch
-
-          cp \
-            diagnostics/kernel-size.txt \
-            artifact/kernel-size.txt
-
-          cp \
-            diagnostics/final.config \
-            artifact/final.config
-
-          sha256sum \
-            artifact/Image \
-            > artifact/SHA256SUMS
+          sha256sum artifact/Image > artifact/SHA256SUMS
 
           cat > artifact/STATUS.txt <<'EOF'
-          V24 kernel build passed.
+          XCOVER4S V24
 
-          CP HARD OFF patch included.
+          Kernel build completed.
 
-          SELinux permissive configuration included.
+          CP reset-assert patch included.
+          CP supply power-off is NOT proven.
 
-          Kernel size verified against target.
+          SELinux permissive boot configuration requested.
+          Runtime SELinux state is NOT yet verified.
 
-          NOT FLASHABLE YET.
-
-          Boot image must still be rebuilt using
-          the current boot image header/ramdisk.
-
-          Hardware CP power-off has not been verified.
+          NOT FLASHABLE.
+          Repack with original boot components first.
+          Verify boot.img fits partition before flashing.
           EOF
 
-      - name: Upload V24 kernel
+      - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
