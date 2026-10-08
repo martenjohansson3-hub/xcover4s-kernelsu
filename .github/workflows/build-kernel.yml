@@ -1,5 +1,5 @@
 
-name: XCOVER4S V32 KERNEL BUILD
+name: XCOVER4S V33 ABD FIX AND BUILD
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           git -C kernel rev-parse HEAD > diagnostics/source-commit.txt
 
-      - name: Apply V32 patches
+      - name: Apply V33 patches
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -44,29 +44,27 @@ jobs:
           cp = Path("kernel/drivers/soc/samsung/cal-if/cal-if.c")
           s = cp.read_text()
 
-          patches = [
+          for pattern, body in [
               (
                   r'(void cal_cp_init\(void\)\s*\{\s*)'
                   r'pmucal_cp_init\(\);',
-                  'pr_warn("V32 CP init blocked");\n'
+                  'pr_warn("V33 CP init blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               ),
               (
                   r'(void cal_cp_reset_release\(void\)\s*\{\s*)'
                   r'pmucal_cp_reset_release\(\);',
-                  'pr_warn("V32 CP release blocked");\n'
+                  'pr_warn("V33 CP release blocked");\n'
                   '\tpmucal_cp_reset_assert();'
               )
-          ]
-
-          for pattern, body in patches:
-              s, count = re.subn(
+          ]:
+              s, n = re.subn(
                   pattern,
                   lambda m, b=body: m.group(1) + b,
                   s
               )
-              if count != 1:
-                  raise SystemExit(f"CP patch mismatch: {count}")
+              if n != 1:
+                  raise SystemExit(f"CP patch mismatch: {n}")
 
           cp.write_text(s)
 
@@ -94,7 +92,7 @@ jobs:
           hs = helper.read_text()
 
           if not re.search(r'\bACQUIRE_FENCE_LEN\b', hs):
-              raise SystemExit("Fence reference missing")
+              raise SystemExit("Fence symbol missing")
 
           if not re.search(
               r'^\s*#\s*define\s+ACQUIRE_FENCE_LEN\b',
@@ -106,48 +104,84 @@ jobs:
                   "#endif\n\n" + hs
               )
 
-          # V32: Avoid compiling ABD event-log reader
-          # when its required definitions are unavailable.
+          # ABD event-log reader references definitions
+          # that are unavailable in the current build.
+          # Locate the containing function by braces,
+          # rather than guessing its name.
           abd = Path(base + "decon_abd.c")
-          s = abd.read_text()
+          src = abd.read_text()
 
-          lines = s.splitlines(keepends=True)
-          start = None
+          pos = src.find("event_log_idx")
+          if pos < 0:
+              raise SystemExit("ABD event_log_idx not found")
 
-          for i, line in enumerate(lines):
-              if re.search(
-                  r'^\s*(?:static\s+)?(?:int|void)\s+'
-                  r'\w*event\w*\s*\(',
-                  line
-              ):
-                  if i + 25 < len(lines):
-                      block = "".join(lines[i:i+45])
-                      if "event_log_idx" in block:
-                          start = i
-                          break
+          # Locate nearest enclosing function opening.
+          candidates = list(re.finditer(
+              r'(?m)^[\w\s\*]+\b([A-Za-z_]\w*)'
+              r'\s*\([^;{}]*\)\s*\{',
+              src[:pos]
+          ))
 
-          if start is None:
+          if not candidates:
               raise SystemExit(
-                  "Could not identify ABD event-log function safely"
+                  "Cannot locate ABD function boundary"
               )
 
-          print(
-              "Found ABD event-log function near line",
-              start + 1
+          match = candidates[-1]
+          start = match.start()
+          opening = src.find("{", match.start(), match.end())
+
+          depth = 0
+          end = None
+
+          for i in range(opening, len(src)):
+              if src[i] == "{":
+                  depth += 1
+              elif src[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i + 1
+                      break
+
+          if end is None or not (opening < pos < end):
+              raise SystemExit(
+                  "ABD function boundary validation failed"
+              )
+
+          original = src[start:end]
+          if "event_log_idx" not in original:
+              raise SystemExit("Wrong ABD function selected")
+
+          # Preserve the original source for diagnostics.
+          Path("diagnostics-abd-original.txt").write_text(
+              original
           )
 
-          # Do not automatically alter unknown function
-          # boundaries. Record source for diagnostics.
-          Path("diagnostics-abd-location.txt").write_text(
-              "".join(lines[max(0,start-10):start+100])
+          # Replace only the diagnostic reader with
+          # a minimal no-op body. Do not alter other ABD
+          # logic or any kernel structures.
+          signature = src[start:opening]
+          if not re.search(r'\bvoid\s+\w+\s*\(', signature):
+              raise SystemExit(
+                  "ABD reader is not void; refusing unsafe patch"
+              )
+
+          replacement = (
+              signature + "{\n"
+              "\t/* V33: event-log reader disabled. */\n"
+              "}\n"
           )
 
-          abd.write_text(s)
+          abd.write_text(
+              src[:start] + replacement + src[end:]
+          )
+
+          print("V33 ABD reader patched")
           PY
 
-          git -C kernel diff > diagnostics/v32.patch
-          cp kernel/diagnostics-abd-location.txt \
-            diagnostics/abd-location.txt
+          cp kernel/diagnostics-abd-original.txt \
+            diagnostics/abd-original.txt
+          git -C kernel diff > diagnostics/v33.patch
 
       - name: Configure kernel
         run: |
@@ -175,7 +209,7 @@ jobs:
 
           cp out/.config ../diagnostics/final.config
 
-      - name: Fast targeted test
+      - name: Fast targeted compilation
         run: |
           set -euo pipefail
           cd kernel
@@ -204,51 +238,46 @@ jobs:
           make O=out -j2 Image \
             2>&1 | tee ../diagnostics/full-build.log
 
-      - name: Package kernel
+      - name: Package results
         run: |
           set -euo pipefail
-
           IMAGE=kernel/out/arch/arm64/boot/Image
           test -s "$IMAGE"
 
           cp "$IMAGE" artifact/Image
-          cp diagnostics/v32.patch artifact/v32.patch
+          cp diagnostics/v33.patch artifact/v33.patch
           cp diagnostics/final.config artifact/final.config
 
-          sha256sum artifact/Image \
-            > artifact/SHA256SUMS
-
+          sha256sum artifact/Image > artifact/SHA256SUMS
           stat -c '%s bytes' "$IMAGE" \
             > artifact/kernel-size.txt
 
           cat > artifact/STATUS.txt <<'EOF'
-          XCOVER4S V32
+          XCOVER4S V33
 
-          Kernel compilation completed.
+          Kernel compiled successfully.
 
+          ABD event-log reader disabled.
           CP reset-assert patch included.
+
           Physical modem power-off NOT verified.
+          SELinux runtime mode NOT verified.
 
-          SELinux boot settings requested.
-          Runtime SELinux state NOT verified.
-
-          NOT AN ODIN FLASHABLE IMAGE.
-
-          Requires original boot.img repacking,
-          partition size validation and testing.
+          NOT ODIN FLASHABLE.
+          Original boot image repacking required.
           EOF
 
       - name: Upload kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V32-KERNEL
+          name: XCOVER4S-V33-KERNEL
           path: artifact/
 
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V32-DIAGNOSTICS
+          name: XCOVER4S-V33-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
