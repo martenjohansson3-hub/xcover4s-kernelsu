@@ -1,5 +1,5 @@
 
-name: XCover4s CP Power OFF v6
+name: XCover4s CP Power OFF v7
 
 on:
   workflow_dispatch:
@@ -17,10 +17,12 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 35
 
     steps:
       - name: Install dependencies
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get install -y \
             git python3 make bc bison flex \
@@ -33,7 +35,8 @@ jobs:
         run: |
           set -eux
           git clone --depth 1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
           git -C kernel rev-parse HEAD
 
       - name: Patch CP power control and SELinux
@@ -54,12 +57,13 @@ jobs:
           patch = (
               "int exynos_set_cp_power_onoff(enum cp_mode mode)\n"
               "{\n"
-              "\t/* XCOVER4S_V6_CP_OFF */\n"
+              "\t/* XCOVER4S_V7_CP_OFF */\n"
               "\tif (mode == CP_POWER_ON) {\n"
-              "\t\tpr_info(\"XCOVER4S_V6: redirect CP ON to OFF\\n\");\n"
+              "\t\tpr_info(\"XCOVER4S_V7: redirect CP ON to OFF\\n\");\n"
               "\t\tmode = CP_POWER_OFF;\n"
               "\t}\n"
           )
+
           p.write_text(s.replace(needle, patch, 1))
 
           changed = []
@@ -70,12 +74,13 @@ jobs:
                   r'\g<1>0\g<2>',
                   old
               )
-              if old != new:
+              if new != old:
                   f.write_text(new)
                   changed.append(str(f))
 
           if not changed:
               raise SystemExit("SELinux patch not applied")
+
           print("SELinux files:", changed)
           PY
 
@@ -88,12 +93,14 @@ jobs:
 
           s = Path("drivers/soc/samsung/pmu-cp.c").read_text()
 
-          for item in [
-              "XCOVER4S_V6_CP_OFF",
+          checks = [
+              "XCOVER4S_V7_CP_OFF",
               "mode = CP_POWER_OFF;",
               "exynos_sys_powerdown_conf_cp();",
               "cp_ctrl & ~CP_PWRON"
-          ]:
+          ]
+
+          for item in checks:
               if item not in s:
                   raise SystemExit("Missing: " + item)
 
@@ -104,24 +111,35 @@ jobs:
         working-directory: kernel
         run: |
           set -eux
-          make O="$PWD/out" ARCH=arm64 lineage_xcover4s_defconfig
+
+          make O="$PWD/out" ARCH=arm64 \
+            lineage_xcover4s_defconfig
 
           python3 <<'PY'
           from pathlib import Path
+
           p = Path("out/.config")
           s = p.read_text()
           key = "CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE="
-          lines = [x for x in s.splitlines() if not x.startswith(key)]
+
+          lines = [
+              x for x in s.splitlines()
+              if not x.startswith(key)
+          ]
           lines.append(key + "0")
           p.write_text("\n".join(lines) + "\n")
           PY
 
           make O="$PWD/out" ARCH=arm64 olddefconfig
-          grep '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0$' out/.config
 
-      - name: Targeted CP compile test
+          grep \
+            '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0$' \
+            out/.config
+
+      - name: Targeted CP compile
         working-directory: kernel
         shell: bash
+        timeout-minutes: 5
         run: |
           set -o pipefail
 
@@ -133,19 +151,19 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             KCFLAGS="$KCFLAGS" \
             drivers/soc/samsung/pmu-cp.o \
-            > targeted-build.log 2>&1
-
-          cat targeted-build.log | grep -vE \
-            'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-            || true
+            2>&1 | tee targeted-build.log
 
           echo "TARGETED CP COMPILE PASSED"
 
-      - name: Full kernel build
+      - name: Full kernel build LIVE
         working-directory: kernel
         shell: bash
+        timeout-minutes: 25
         run: |
           set -o pipefail
+
+          echo "STARTING FULL KERNEL BUILD"
+          date -u
 
           make -j"$(nproc)" \
             O="$PWD/out" \
@@ -155,52 +173,86 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             KCFLAGS="$KCFLAGS" \
             Image dtbs \
-            > build.log 2>&1
-
-          grep -vE \
-            'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)' \
-            build.log || true
+            2>&1 \
+          | tee build.log \
+          | awk '
+              /aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/ { next }
+              {
+                print
+                fflush()
+              }
+            '
 
           echo "FULL KERNEL BUILD PASSED"
+          date -u
 
       - name: Package successful kernel
+        if: success()
         working-directory: kernel
         run: |
           set -eux
           mkdir -p ../artifacts
 
-          cp out/arch/arm64/boot/Image \
-            ../artifacts/Image-CP-POWER-OFF-v6
+          test -s out/arch/arm64/boot/Image
 
-          cp out/.config ../artifacts/kernel-config
-          cp build.log ../artifacts/build.log
-          cp targeted-build.log ../artifacts/targeted-build.log
+          cp out/arch/arm64/boot/Image \
+            ../artifacts/Image-CP-POWER-OFF-v7
+
+          cp out/.config \
+            ../artifacts/kernel-config
+
+          cp build.log \
+            ../artifacts/build.log
+
+          cp targeted-build.log \
+            ../artifacts/targeted-build.log
+
           cp drivers/soc/samsung/pmu-cp.c \
             ../artifacts/pmu-cp-patched.c
 
           git diff > ../artifacts/kernel.patch
           git rev-parse HEAD > ../artifacts/source-commit.txt
 
-          sha256sum ../artifacts/Image-CP-POWER-OFF-v6 \
+          sha256sum \
+            ../artifacts/Image-CP-POWER-OFF-v7 \
             > ../artifacts/SHA256SUMS
 
-      - name: Upload successful build
+      - name: Upload successful kernel
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-CP-POWER-OFF-v6
+          name: XCOVER4S-CP-POWER-OFF-v7
           path: artifacts/
           if-no-files-found: error
 
-      - name: Show errors if build failed
+      - name: Collect failure diagnostics
         if: failure()
         working-directory: kernel
+        shell: bash
         run: |
-          echo "=== LAST RELEVANT BUILD ERRORS ==="
+          mkdir -p ../failure-diagnostics
+
+          for f in targeted-build.log build.log; do
+            if [ -f "$f" ]; then
+              cp "$f" ../failure-diagnostics/
+            fi
+          done
+
+          git diff > ../failure-diagnostics/kernel.patch
+
+          echo "=== RELEVANT ERRORS ==="
           for f in targeted-build.log build.log; do
             if [ -f "$f" ]; then
               grep -Ei \
                 'fatal error:|error:|undefined reference|No rule to make target|make.*Error' \
-                "$f" | tail -60 || true
-              tail -30 "$f" || true
+                "$f" | tail -80 || true
             fi
           done
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-v7-FAILURE-DIAGNOSTICS
+          path: failure-diagnostics/
+          if-no-files-found: ignore
