@@ -1,5 +1,5 @@
 
-name: XCOVER4S V41 SINGLE CP TEST
+name: XCOVER4S V42 FULL BUILD CP AUDIT
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  cp-test:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     env:
       ARCH: arm64
@@ -21,32 +21,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare diagnostics
+      - name: Prepare artifacts
+        shell: bash
         run: |
           mkdir -p dist
-          echo "V41 SINGLE CP COMPILE TEST" > dist/README.txt
-          echo "NOT FLASHABLE" >> dist/README.txt
+          cat > dist/README.txt <<'EOF'
+          XCOVER4S V42 FULL BUILD AND CP AUDIT
+          Diagnostic kernel only.
+          NOT FLASHABLE.
+          CP power-off has NOT been implemented.
+          Never flash the raw Image.
+          EOF
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             git make gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev \
-            libelf-dev python3
+            build-essential bc bison flex \
+            libssl-dev libelf-dev \
+            libncurses-dev python3 \
+            cpio rsync file
 
-      - name: Download exact kernel source
+      - name: Clone pinned kernel
+        shell: bash
         run: |
           set -euo pipefail
 
-          git clone --depth 1 \
-            --branch lineage-18.1 \
+          git clone --branch lineage-18.1 \
+            --single-branch \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
-
-          git -C kernel fetch --depth 1 origin \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
           git -C kernel checkout \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
@@ -54,7 +62,8 @@ jobs:
           git -C kernel rev-parse HEAD \
             > dist/source-commit.txt
 
-      - name: Apply V41 compile-test patch
+      - name: Apply verified V41 start-denial patch
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -65,37 +74,36 @@ jobs:
           p = Path(
               "kernel/drivers/soc/samsung/cal-if/pmucal_cp.c"
           )
-
           s = p.read_text()
 
-          if "#include <linux/errno.h>" not in s:
-              s = "#include <linux/errno.h>\n" + s
+          for header in (
+              "#include <linux/errno.h>",
+              "#include <linux/printk.h>",
+          ):
+              if header not in s:
+                  s = header + "\n" + s
 
-          if "#include <linux/printk.h>" not in s:
-              s = "#include <linux/printk.h>\n" + s
-
-          names = [
+          for name in (
               "pmucal_cp_init",
               "pmucal_cp_reset_release",
-          ]
-
-          for name in names:
+          ):
               pattern = (
-                  r"(int\s+" + name +
-                  r"\s*\(\s*void\s*\)\s*\{\s*int\s+ret\s*;)"
+                  r"(int\s+" + re.escape(name)
+                  + r"\s*\(\s*void\s*\)\s*\{\s*"
+                  + r"int\s+ret\s*;)"
               )
 
-              def patch(m):
+              def replacement(m):
                   return (
                       m.group(1)
-                      + "\n\t/* CPLOCK_V41_TEST */\n"
-                      + '\tpr_warn("CPLOCK V41: denied '
+                      + "\n\t/* CPLOCK_V42 */\n"
+                      + '\tpr_warn("CPLOCK V42: denied '
                       + name + '\\n");\n'
                       + "\treturn -EPERM;\n"
                   )
 
               s, count = re.subn(
-                  pattern, patch, s, count=1
+                  pattern, replacement, s, count=1
               )
 
               if count != 1:
@@ -103,15 +111,84 @@ jobs:
                       "Cannot safely patch " + name
                   )
 
-              print("Patched", name)
+              print("Patched:", name)
 
           p.write_text(s)
           PY
 
-          git -C kernel diff > dist/v41.patch
-          test -s dist/v41.patch
+          git -C kernel diff > dist/v42.patch
+          test -s dist/v42.patch
+
+      - name: Audit power control and panic paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("kernel")
+          paths = [
+              "drivers/soc/samsung/cal-if/pmucal_cp.c",
+              "drivers/soc/samsung/cal-if/exynos7885/"
+              "pmucal_cp_exynos7885.h",
+              "drivers/misc/modem_v1/modem_ctrl_ss310ap.c",
+          ]
+
+          patterns = re.compile(
+              r"cal_cp_|pmucal_cp_|cp_on|cp_off|"
+              r"cp_reset|power_on|power_off|"
+              r"panic\s*\(|BUG\s*\(|"
+              r"wait_for_completion|"
+              r"start_normal_boot|start_dump_boot",
+              re.I,
+          )
+
+          with open(
+              "dist/cp-power-audit.txt", "w"
+          ) as output:
+              for rel in paths:
+                  path = root / rel
+                  print(
+                      "\n=== " + rel + " ===",
+                      file=output,
+                  )
+
+                  if not path.exists():
+                      print(
+                          "FILE MISSING",
+                          file=output,
+                      )
+                      continue
+
+                  for number, line in enumerate(
+                      path.read_text(
+                          errors="replace"
+                      ).splitlines(),
+                      1,
+                  ):
+                      if patterns.search(line):
+                          print(
+                              f"{number}: {line}",
+                              file=output,
+                          )
+          PY
+
+          cp \
+            kernel/drivers/soc/samsung/cal-if/pmucal_cp.c \
+            dist/pmucal_cp-v42.c
+
+          cp \
+            kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c \
+            dist/modem_ctrl_ss310ap.c
+
+          cp \
+            kernel/drivers/soc/samsung/cal-if/exynos7885/pmucal_cp_exynos7885.h \
+            dist/pmucal_cp_exynos7885.h
 
       - name: Configure kernel
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -121,48 +198,96 @@ jobs:
 
           cp kernel/out/.config dist/kernel.config
 
-      - name: Single targeted CP compile test
-        id: test
+          grep -E \
+            '^(CONFIG_CP_PMUCAL|CONFIG_SEC_MODEM_SS310AP|CONFIG_UMTS_MODEM_SS310AP|CONFIG_CP_SECURE_BOOT)=' \
+            kernel/out/.config \
+            > dist/selected-config.txt || true
+
+      - name: Build full kernel
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          make -C kernel O=out -j2 \
-            drivers/soc/samsung/cal-if/pmucal_cp.o \
-            > dist/compile.log 2>&1
+          make -C kernel O=out -j2 Image \
+            > dist/build.log 2>&1 || {
+              tail -120 dist/build.log
+              exit 1
+            }
 
-          RESULT=$?
+          echo "FULL BUILD PASSED" \
+            > dist/build-result.txt
 
-          if [ "$RESULT" -eq 0 ] && \
-             [ -s kernel/out/drivers/soc/samsung/cal-if/pmucal_cp.o ]; then
-            echo "PASS" > dist/result.txt
-            echo "CP source compiled successfully"
-          else
-            echo "FAIL" > dist/result.txt
-            echo "CP source compilation failed"
-            tail -100 dist/compile.log
-            exit 1
-          fi
+      - name: Validate ARM64 Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          p = Path(
+              "kernel/out/arch/arm64/boot/Image"
+          )
+
+          if not p.is_file():
+              raise SystemExit("Image missing")
+
+          with p.open("rb") as f:
+              f.seek(0x38)
+              magic = struct.unpack(
+                  "<I", f.read(4)
+              )[0]
+
+          if magic != 0x644D5241:
+              raise SystemExit(
+                  "Invalid ARM64 Image magic"
+              )
+
+          print("ARM64 Image valid")
+          print("Size:", p.stat().st_size)
+          PY
+
+          cp \
+            kernel/out/arch/arm64/boot/Image \
+            dist/Image
+
+          sha256sum dist/Image \
+            > dist/Image.sha256
+
+          cat > dist/flash-status.txt <<'EOF'
+          BUILD VALIDATION ONLY
+
+          FLASH READY: NO
+          ODIN PACKAGE: NO
+          CP START DENIAL: COMPILED
+          CP POWER OFF: NOT IMPLEMENTED
+          CP POWER LOCK: NOT FULLY VERIFIED
+          BOOTLOOP RISK: UNKNOWN
+
+          DO NOT FLASH.
+          EOF
 
       - name: Collect diagnostics
         if: always()
+        shell: bash
         run: |
           mkdir -p dist
 
           {
-            echo "XCOVER4S V41"
-            echo "Run ID: $GITHUB_RUN_ID"
+            echo "XCOVER4S V42"
+            echo "Run: $GITHUB_RUN_ID"
             echo "Commit: $GITHUB_SHA"
             echo "Flash ready: NO"
             echo
-            echo "Files:"
-            find dist -maxdepth 1 -type f \
-              -printf '%f %s bytes\n'
+
+            find dist -maxdepth 1 \
+              -type f -printf '%f %s bytes\n'
           } > dist/diagnostics.txt
 
           if [ -d kernel/.git ]; then
             git -C kernel diff \
-              > dist/v41.patch || true
+              > dist/v42.patch || true
           fi
 
           if [ -f kernel/out/.config ]; then
@@ -170,22 +295,27 @@ jobs:
               dist/kernel.config
           fi
 
-          if [ -f dist/compile.log ]; then
-            grep -n -E \
-              'error:|warning:|Error |FAILED' \
-              dist/compile.log \
-              > dist/errors.txt || true
+          if [ -f dist/build.log ]; then
+            grep -nEi \
+              'error:|fatal error:|warning:|Error |FAILED|undefined reference' \
+              dist/build.log \
+              > dist/build-errors.txt || true
+
+            tail -200 dist/build.log \
+              > dist/build-tail.txt
           fi
 
-          if [ ! -f dist/result.txt ]; then
-            echo "INCOMPLETE" > dist/result.txt
+          if [ ! -f dist/build-result.txt ]; then
+            echo "BUILD NOT COMPLETED" \
+              > dist/build-result.txt
           fi
 
-      - name: Upload V41 test artifacts
+      - name: Upload all V42 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V41-SINGLE-TEST
+          name: XCOVER4S-V42-FULL-BUILD-CP-AUDIT
           path: dist/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 6
