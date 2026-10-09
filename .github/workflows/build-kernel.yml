@@ -1,5 +1,5 @@
 
-name: XCover4s V48 FIXED full kernel test - no flash
+name: XCover4s V48 FIXED 2 filtered objdump test
 
 on:
   workflow_dispatch:
@@ -70,7 +70,7 @@ jobs:
             CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             KCFLAGS=-Wno-error \
             drivers/soc/samsung/cal-if/pmucal_cp.o \
-            2>&1 | tee ../diagnostics/cp-compile.log
+            2>&1 | tee ../diagnostics/cp-compile.log | sed -E "/aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x(22|23)|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)/d"
           test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
           cp out/drivers/soc/samsung/cal-if/pmucal_cp.o ../diagnostics/pmucal_cp.o
 
@@ -82,7 +82,7 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             KCFLAGS=-Wno-error Image \
-            2>&1 | tee ../diagnostics/full-build.log
+            2>&1 | tee ../diagnostics/full-build.log | sed -E "/aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x(22|23)|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)/d"
           test -s out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../diagnostics/Image
           sha256sum ../diagnostics/Image > ../diagnostics/Image.sha256
@@ -93,7 +93,7 @@ jobs:
         run: |
           mkdir -p diagnostics
           cat > diagnostics/READ-ME.txt <<'NOTE'
-          V48 FIXED: This job tests V47 CP patch and builds an ARM64 Image.
+          V48 FIXED 2: This job tests V47 CP patch and builds an ARM64 Image.
           This is NOT a flashable boot.img or Odin .tar.
           Rootbroker auto-start is NOT included in the kernel build.
           RF silence and boot safety are NOT proven by compilation.
@@ -105,6 +105,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V48-FIXED-DIAGNOSTICS
+          name: XCOVER4S-V48-FIXED2-DIAGNOSTICS
           if-no-files-found: warn
           path: diagnostics/
