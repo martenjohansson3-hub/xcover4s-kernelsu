@@ -1,5 +1,4 @@
-
-name: XCOVER4S V55 SELINUX PERMISSIVE AND CP HARD OFF EXPERIMENT
+name: XCOVER4S V58 EARLY CP HARD OFF
 
 on:
   workflow_dispatch:
@@ -10,377 +9,277 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 100
+    timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check known-good backup
+      - name: Install dependencies
         run: |
           set -euo pipefail
-          test -s boot-original.zip || { echo 'Missing boot-original.zip in repository root'; exit 1; }
-          python3 - <<'PYBOOT'
-          import zipfile
-          from pathlib import Path
-          z=zipfile.ZipFile('boot-original.zip')
-          assert z.namelist()==['boot-original.img'], 'ZIP must contain exactly boot-original.img'
-          info=z.getinfo('boot-original.img')
-          assert info.file_size==37748736, 'Unexpected uncompressed boot image size'
-          Path('boot-original.img').write_bytes(z.read(info))
-          PYBOOT
-          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
-          mkdir -p artifacts diagnostics
+          sudo apt-get update
+          sudo apt-get install -y \
+            git make bc bison flex \
+            libssl-dev libelf-dev \
+            clang lld gcc-aarch64-linux-gnu \
+            python3 zip
 
-      - name: Install build tools
+      - name: Download kernel
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends git make gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev clang lld python3 cpio
+          git clone --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
 
-      - name: Clone pinned kernel
-        run: |
-          set -euo pipefail
-          git clone --filter=blob:none --single-branch --branch lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           cd kernel
-          git checkout --detach 6020dfa8315134187f07ca903c9d2ed7ee0256f5
-          test "$(git rev-parse HEAD)" = 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git checkout 6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply unchanged V51 modem restart gates
+      - name: Restore V55 modem protection
+        shell: bash
         run: |
           set -euo pipefail
-          cat > diagnostics/v51.patch.gz.b64 <<'PATCH64'
-          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
-          PATCH64
-          base64 -d diagnostics/v51.patch.gz.b64 | gzip -dc > diagnostics/v51.patch
-          echo '7f0ebd23cea817b2048a9bc9ceb4483827b83112b7710aa496ee959fa36bc0d8  diagnostics/v51.patch' | sha256sum -c -
+
+          cat > /tmp/v55.gz.b64 <<'PATCH'
+          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
+          f1dRUmEYAAA=
+          PATCH
+
+          base64 -d /tmp/v55.gz.b64 | gzip -d > /tmp/v55.patch
+
           cd kernel
-          git apply --check ../diagnostics/v51.patch
-          git apply ../diagnostics/v51.patch
+          git apply --check /tmp/v55.patch
+          git apply /tmp/v55.patch
           git diff --check
-          git diff > ../diagnostics/applied.patch
-          grep -q 'V51: CP-off latch blocks ss310ap_reset' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
-          grep -q 'V51: CP-off latch blocks ss310ap_boot_on' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
 
-      - name: V55 force CP reset assert at PMUCAL init
+      - name: V58 early CP shutdown and permanent latch
+        shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PYCP'
           from pathlib import Path
-          p=Path('kernel/drivers/soc/samsung/cal-if/pmucal_cp.c')
-          s=p.read_text()
-          old='    ret = v46_original_pmucal_cp_init();\n    mutex_unlock(&v46_cp_lock);\n    return ret;'
-          new='''    ret = v46_original_pmucal_cp_init();
-              if (!ret) {
-                  int off_ret = pmucal_cp_reset_assert();
-                  if (!off_ret && pmucal_cp_status() == 0) {
-                      WRITE_ONCE(v46_cp_off_latched, true);
-                      pr_warn("V55 CP HARD OFF latched at PMUCAL init\\n");
-                  } else {
-                      pr_err("V55 CP HARD OFF failed: reset=%d status=%d\\n",
-                             off_ret, pmucal_cp_status());
-                      ret = off_ret ? off_ret : -EIO;
-                  }
-              }
-              mutex_unlock(&v46_cp_lock);
-              return ret;'''
-          assert s.count(old)==1, 'V55: PMUCAL init source mismatch'
-          p.write_text(s.replace(old,new))
-          PYCP
-          git -C kernel diff --check
 
-      - name: V54 SELinux early boot and init enforcement guard
-        run: |
-          set -euo pipefail
-          python3 - <<'PYPATCH'
-          from pathlib import Path
-          import re
+          p = Path(
+              'kernel/drivers/soc/samsung/cal-if/pmucal_cp.c'
+          )
 
-          p = Path('kernel/security/selinux/hooks.c')
           s = p.read_text()
 
-          # On this Android kernel family, enforcing_setup() parses enforcing=.
-          # Force its boot value to 0 at parameter parsing, before SELinux init.
-          pattern = r'(static\s+int\s+__init\s+enforcing_setup\s*\(\s*char\s*\*\s*\w+\s*\)\s*\{)'
-          matches = list(re.finditer(pattern, s))
-          if len(matches) != 1:
-              raise SystemExit('Expected exactly one enforcing_setup(char *) in hooks.c; refusing an unsafe patch')
-          if 'V52_FORCE_PERMISSIVE_EARLY' in s:
-              raise SystemExit('V52 early SELinux patch already appears present')
-          body_start = matches[0].end()
-          ret = re.search(r'\breturn\s+1\s*;', s[body_start:])
-          if not ret:
-              raise SystemExit('Could not find return 1 inside enforcing_setup(); refusing an unsafe patch')
-          pos = body_start + ret.start()
-          line_start = s.rfind('\n', 0, pos) + 1
-          if s[line_start:pos].strip():
-              raise SystemExit('Unexpected code before return 1; refusing unsafe patch')
-          insertion = '\t/* V52_FORCE_PERMISSIVE_EARLY: override parsed enforcing= before SELinux init. */\n\tselinux_enforcing = 0;\n'
-          s = s[:line_start] + insertion + s[line_start:]
-          p.write_text(s)
+          # V55 must already provide the CP-off mechanism.
+          required = [
+              'v46_cp_off_set',
+              'v46_cp_off_latched',
+              'pmucal_cp_reset_assert',
+              'pmucal_cp_reset_release'
+          ]
 
-          # Android init can subsequently request enforcing=1 through selinuxfs.
-          # Guard the actual selinuxfs enforcement write, not merely bootargs.
-          sf = Path('kernel/security/selinux/selinuxfs.c')
-          t = sf.read_text()
+          for symbol in required:
+              if symbol not in s:
+                  raise SystemExit(
+                      'Missing V55 symbol: ' + symbol
+                  )
+
+          if s.count('static int v46_cp_off_set(') != 2:
+              raise SystemExit(
+                  'Unexpected V55 CP-off function layout'
+              )
+
+          if '#include <linux/init.h>' not in s:
+              s = '#include <linux/init.h>\n' + s
+
+          # Request shutdown during kernel initialization.
+          # Latch is activated only if the existing V55
+          # status verification succeeds.
+          code = r'''
+          /*
+           * XCOVER4S V58
+           * Automatic CP shutdown.
+           * Keep the V55 restart protection.
+           */
+          static int __init v58_cp_off_init(void)
+          {
+              int ret;
+
+              pr_info("V58: requesting early CP shutdown\n");
+
+              ret = v46_cp_off_set("1", NULL);
+
+              if (ret) {
+                  pr_err(
+                      "V58: CP shutdown failed: %d\n",
+                      ret
+                  );
+              } else {
+                  pr_info(
+                      "V58: CP shutdown latched\n"
+                  );
+              }
+
+              return 0;
+          }
+
+          late_initcall(v58_cp_off_init);
+          '''
+
+          if 'v58_cp_off_init' in s:
+              raise SystemExit(
+                  'V58 already applied'
+              )
+
+          p.write_text(s + '\n' + code)
+          PYCP
+
+      - name: V58 SELinux permissive at boot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYSEL'
+          from pathlib import Path
           import re
-          # On this kernel the enforcement control is written via the selinuxfs
-          # 'enforce' file. Refuse to guess if its exact code differs.
-          # Match the actual assignment independently of its local variable name.
-          # Limit the search to sel_write_enforce() so unrelated writes are untouched.
-          fn = re.search(r'\bstatic\s+ssize_t\s+sel_write_enforce\s*\(', t)
-          if not fn:
-              raise SystemExit('V54: sel_write_enforce() not found; source differs')
-          brace = t.find('{', fn.end())
-          if brace < 0:
-              raise SystemExit('V54: function body not found')
-          depth = 0
-          end = None
-          for i in range(brace, len(t)):
-              if t[i] == '{': depth += 1
-              elif t[i] == '}':
-                  depth -= 1
-                  if depth == 0:
-                      end = i
-                      break
-          if end is None:
-              raise SystemExit('V54: function closing brace not found')
-          body = t[brace:end]
-          assignments = list(re.finditer(r'\bselinux_enforcing\s*=\s*[^;\n]+;', body))
-          if len(assignments) != 1:
-              raise SystemExit(f'V54: expected one enforcement assignment in sel_write_enforce(), found {len(assignments)}; refusing patch')
-          m = assignments[0]
-          body = body[:m.start()] + 'selinux_enforcing = 0; /* V54: keep permissive */' + body[m.end():]
-          t = t[:brace] + body + t[end:]
-          sf.write_text(t)
-          print('V54 patched sel_write_enforce() assignment')
 
-          check = p.read_text()
-          assert check.count('V52_FORCE_PERMISSIVE_EARLY') == 1
-          assert 'selinux_enforcing = 0;' in check[body_start:body_start+800]
-          print('Patched enforcing_setup() to set the early SELinux boot mode to Permissive.')
-          PYPATCH
-          grep -n -A12 'enforcing_setup' kernel/security/selinux/hooks.c | head -n 24
-          git -C kernel diff --check
-          git -C kernel diff -- security/selinux/hooks.c security/selinux/selinuxfs.c > diagnostics/v53-selinux.patch
-          test -s diagnostics/v53-selinux.patch
+          p = Path(
+              'kernel/security/selinux/hooks.c'
+          )
+
+          s = p.read_text()
+
+          pattern = (
+              r'(?m)^(\s*(?:static\s+)?int\s+'
+              r'selinux_enforcing\s*=\s*)1(\s*;)'
+          )
+
+          matches = list(re.finditer(pattern, s))
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  'SELinux default layout differs; '
+                  'cannot safely patch'
+              )
+
+          m = matches[0]
+
+          s = (
+              s[:m.start()]
+              + m.group(1)
+              + '0'
+              + m.group(2)
+              + s[m.end():]
+          )
+
+          p.write_text(s)
+          PYSEL
 
       - name: Configure kernel
+        shell: bash
         run: |
           set -euo pipefail
+
           cd kernel
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lineage_xcover4s_defconfig 2>&1 | tee ../diagnostics/config.log
-          cp out/.config ../diagnostics/kernel.config
-          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
-          grep -q '^CONFIG_SEC_MODEM_SS310AP=y' out/.config
-          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' out/.config
-          if grep -q '^CONFIG_ALWAYS_ENFORCE=y' out/.config; then echo 'Kernel forces SELinux enforcing: refusing to build'; exit 1; fi
 
-      - name: Targeted compile before full build
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+
+          mkdir -p ../out
+
+          make O=../out lineage_xcover4s_defconfig
+
+          scripts/config \
+            --file ../out/.config \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_DEVELOP \
+            -e SECURITY_SELINUX_BOOTPARAM \
+            -d SECURITY_SELINUX_DISABLE
+
+          scripts/config \
+            --file ../out/.config \
+            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+
+          make O=../out olddefconfig
+
+          grep CONFIG_SECURITY_SELINUX ../out/.config \
+            > ../selinux-config.txt || true
+
+      - name: Compile ARM64 kernel
+        shell: bash
         run: |
           set -euo pipefail
+
           cd kernel
-          make -j2 O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error drivers/soc/samsung/cal-if/pmucal_cp.o drivers/misc/modem_v1/modem_ctrl_ss310ap.o 2>&1 | tee ../diagnostics/targeted.log | sed -E '/aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/d'
-          test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
-          test -s out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o
 
-      - name: Full ARM64 Image build
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export KCFLAGS=-Wno-error
+
+          make O=../out -j2 Image \
+            2>&1 | tee ../build.log
+
+      - name: Collect V58 diagnostics
+        if: always()
+        shell: bash
         run: |
-          set -euo pipefail
-          cd kernel
-          make -j2 O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error Image 2>&1 | tee ../diagnostics/full-build.log | sed -E '/aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/d'
-          test -s out/arch/arm64/boot/Image
-          cp out/arch/arm64/boot/Image ../artifacts/Image
+          mkdir -p deliver
 
-      - name: Repack boot and regenerate unsigned AVB hash and footer
-        run: |
-          set -euo pipefail
-          python3 - <<'PYREPACK'
-          from pathlib import Path
-          import struct,hashlib,json,tarfile
-          base=Path('artifacts'); original=Path('boot-original.img').read_bytes(); kernel=(base/'Image').read_bytes()
-          sha=lambda b:hashlib.sha256(b).hexdigest()
-          assert len(original)==37748736, 'Unexpected original boot partition size'
-          assert sha(original)=='f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9', 'Wrong original boot backup'
-          assert original[:8]==b'ANDROID!' and original[-64:-60]==b'AVBf'
-          u32=lambda off:struct.unpack_from('<I',original,off)[0]
-          ks,rs,ss,pg,dt=u32(8),u32(16),u32(24),u32(36),u32(40)
-          assert (ks,rs,pg)==(23295720,837785,2048), 'Unexpected boot header'
-          assert 20000000<len(kernel)<27000000, 'Unexpected kernel size'
-          align=lambda n:(n+pg-1)//pg*pg
-          ro=pg+align(ks);so=ro+align(rs);dto=so+align(ss)
-          ramdisk=original[ro:ro+rs];second=original[so:so+ss];dtb=original[dto:dto+dt]
-          assert ro+rs<len(original) and dto+dt<len(original)
-          origsize,vbo,vbs=struct.unpack_from('>QQQ',original,len(original)-64+12)
-          assert (origsize,vbo,vbs)==(24137728,24137728,704)
-          vb=bytearray(original[vbo:vbo+vbs]);assert vb[:4]==b'AVB0'
-          assert struct.unpack_from('>I',vb,28)[0]==0, 'AVB must be unsigned algorithm NONE'
-          d=256
-          assert struct.unpack_from('>QQ',vb,d)==(2,184)
-          assert struct.unpack_from('>Q',vb,d+16)[0]==origsize
-          assert vb[d+24:d+30]==b'sha256'
-          assert struct.unpack_from('>III',vb,d+56)==(4,32,32)
-          assert vb[d+132:d+136]==b'boot'
-          salt=bytes(vb[d+136:d+168]);assert hashlib.sha256(salt+original[:origsize]).digest()==bytes(vb[d+168:d+200]),'Original AVB invalid'
-          header=bytearray(original[:pg]);struct.pack_into('<I',header,8,len(kernel))
-          oldcmd=bytes(header[64:576]).split(b'\0',1)[0]
-          # V52 SELinux-only change: request Permissive at boot and force security_setenforce() requests to remain Permissive; runtime must be verified.
-          # Keep the V51 modem patch, ramdisk, Rootbroker and modem trigger unchanged.
-          for arg in (b'enforcing=0', b'androidboot.selinux=permissive'):
-           if arg not in oldcmd.split(): oldcmd+=b' '+arg
-          assert len(oldcmd)<512, 'Boot cmdline too long'
-          header[64:576]=oldcmd+b'\0'*(512-len(oldcmd))
-          assert b'androidboot.selinux=permissive' in oldcmd and b'enforcing=0' in oldcmd
+          cp build.log deliver/ 2>/dev/null || true
+          cp selinux-config.txt deliver/ 2>/dev/null || true
+          cp out/.config deliver/kernel.config \
+            2>/dev/null || true
 
-          h=hashlib.sha1()
-          for data in (kernel,ramdisk,second,dtb):h.update(data);h.update(struct.pack('<I',len(data)))
-          header[576:608]=h.digest()+b'\0'*12
-          payload=bytes(header)+kernel+b'\0'*(align(len(kernel))-len(kernel))+ramdisk+b'\0'*(align(rs)-rs)+second+b'\0'*(align(ss)-ss)+dtb+b'\0'*(align(dt)-dt)
-          assert len(payload)%pg==0
-          struct.pack_into('>Q',vb,d+16,len(payload));vb[d+168:d+200]=hashlib.sha256(salt+payload).digest()
-          new_vbo=(len(payload)+63)//64*64
-          assert new_vbo+vbs<len(original)-64,'New kernel does not fit boot partition'
-          out=bytearray(len(original));out[:len(payload)]=payload;out[new_vbo:new_vbo+vbs]=vb
-          footer=bytearray(original[-64:]);struct.pack_into('>QQQ',footer,12,len(payload),new_vbo,vbs);out[-64:]=footer
-          candidate=base/'boot.img';candidate.write_bytes(out)
-          check=candidate.read_bytes();nro=pg+align(len(kernel));assert check[nro:nro+rs]==ramdisk,'Ramdisk changed'
-          assert check[pg:pg+len(kernel)]==kernel
-          assert check[576:596]==h.digest()
-          assert hashlib.sha256(salt+check[:len(payload)]).digest()==check[new_vbo+d+168:new_vbo+d+200]
-          with tarfile.open(base/'XCOVER4S-V55-SELINUX-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
-          with tarfile.open(base/'XCOVER4S-V55-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
-          with tarfile.open(base/'XCOVER4S-V55-SELINUX-ODIN-UNTESTED.tar') as t:
-           members=t.getmembers();assert len(members)==1 and members[0].name=='boot.img' and t.extractfile(members[0]).read()==check
-          report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False, 'selinux_boot_target':'Permissive requested and selinuxfs runtime assignment patched; device test required'}
-          (base/'verification.json').write_text(json.dumps(report,indent=2))
-          print(json.dumps(report,indent=2))
-          PYREPACK
+          cp out/arch/arm64/boot/Image \
+            deliver/Image 2>/dev/null || true
 
-      - name: Package boot-completed CP-off trigger and installer
-        run: |
-          set -euo pipefail
-          cat > artifacts/v51-cp-off.sh <<'TRIGGER'
-          #!/system/bin/sh
-          [ "$(getprop sys.boot_completed)" = 1 ] || exit 19
-          PATH=/system/bin:/system/xbin:/vendor/bin
-          /system/bin/log -t V51CP 'boot completed: requesting CP off' || true
-          PARAM=''
-          for P in /sys/module/*/parameters/v46_cp_off; do
-            [ -e "$P" ] || continue
-            [ -z "$PARAM" ] || exit 12
-            PARAM="$P"
-          done
-          [ -n "$PARAM" ] || exit 13
-          [ -w "$PARAM" ] || exit 14
-          STATE=$(cat "$PARAM" 2>/dev/null) || exit 15
-          [ "$STATE" = 1 ] && exit 0
-          [ "$STATE" = 0 ] || exit 16
-          printf '1\n' > "$PARAM" || exit 17
-          [ "$(cat "$PARAM")" = 1 ] || exit 18
-          /system/bin/log -t V51CP 'CP-off latch enabled; RF not independently verified' || true
-          TRIGGER
+          if [ -d kernel/.git ]; then
+            git -C kernel diff \
+              > deliver/v58.patch || true
 
-          cat > artifacts/v51-cp-off.rc <<'INITRC'
-          service v51_cp_off /system/bin/sh /data/adb/v51-cp-off.sh
-              class late_start
-              user root
-              group root
-              seclabel u:r:su:s0
-              disabled
-              oneshot
+            git -C kernel rev-parse HEAD \
+              > deliver/source-commit.txt || true
+          fi
 
-          on property:sys.boot_completed=1
-              start v51_cp_off
-          INITRC
+          cat > deliver/READ-ME.txt <<'EOF'
+          XCOVER4S V58
 
-          cat > artifacts/INSTALL-BEFORE-FLASH.ps1 <<'POWERSHELL'
-          $ErrorActionPreference = 'Stop'
-          $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-          $adbCandidates = @(
-            (Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'),
-            (Join-Path $env:USERPROFILE 'Downloads\platform-tools\adb.exe')
-          )
-          $adbCmd = Get-Command adb.exe -ErrorAction SilentlyContinue
-          if ($adbCmd) { $adb = $adbCmd.Source }
-          else { $adb = $adbCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1 }
-          if (-not $adb) { throw 'adb.exe not found. Install Android platform-tools.' }
-          function RunAdb { & $adb @args; if ($LASTEXITCODE -ne 0) { throw "adb failed ($LASTEXITCODE): $args" } }
-          RunAdb root
-          RunAdb wait-for-device
-          $id = (& $adb shell id)
-          if ($LASTEXITCODE -ne 0 -or $id -notmatch 'uid=0\(root\)') { throw 'ADB root required' }
-          $state = (& $adb shell 'getprop sys.boot_completed').Trim()
-          if ($state -ne '1') { throw 'Android has not finished booting' }
-          $original = Join-Path $here 'v51-cp-off.rc'
-          $script = Join-Path $here 'v51-cp-off.sh'
-          if (!(Test-Path $original) -or !(Test-Path $script)) { throw 'Missing generated trigger files' }
-          RunAdb push $script /data/adb/v51-cp-off.sh
-          RunAdb shell 'chown root:root /data/adb/v51-cp-off.sh; chmod 700 /data/adb/v51-cp-off.sh; restorecon /data/adb/v51-cp-off.sh'
-          RunAdb remount
-          RunAdb push $original /system/etc/init/v51-cp-off.rc
-          RunAdb shell 'chown root:root /system/etc/init/v51-cp-off.rc; chmod 644 /system/etc/init/v51-cp-off.rc; restorecon /system/etc/init/v51-cp-off.rc; sync'
-          $check = (& $adb shell 'ls -lZ /system/etc/init/v51-cp-off.rc /data/adb/v51-cp-off.sh')
-          if ($LASTEXITCODE -ne 0) { throw 'Installed files cannot be read' }
-          Write-Host $check
-          Write-Host 'Trigger staged for NEXT boot. Do not reboot until V52 boot image has been reviewed and you are ready to flash.'
-          POWERSHELL
+          CP:
+          Early automatic shutdown requested.
+          V55 latch and restart guards retained.
 
-          python3 - <<'PYCHECK'
-          from pathlib import Path
-          a=Path('artifacts/v51-cp-off.rc').read_text()
-          b=Path('artifacts/v51-cp-off.sh').read_text()
-          assert 'on property:sys.boot_completed=1' in a
-          assert 'oneshot' in a and 'start v51_cp_off' in a
-          assert 'v46_cp_off' in b
-          print('Static trigger and init configuration checks passed; NOT device tested')
-          PYCHECK
+          SELINUX:
+          Boot-time permissive requested.
 
-      - name: Upload verified candidate and restore package
-        if: success()
+          IMPORTANT:
+          Kernel Image is not an Odin-flashable TAR.
+          Successful compilation does not prove CP RF-off.
+          Boot and hardware behavior remain unverified.
+          EOF
+
+      - name: Upload V58 artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V55-SELINUX-CANDIDATE-UNTESTED
-          path: |
-            artifacts/boot.img
-            artifacts/XCOVER4S-V55-SELINUX-ODIN-UNTESTED.tar
-            artifacts/XCOVER4S-V55-ORIGINAL-RESTORE.tar
-            artifacts/verification.json
-            artifacts/v51-cp-off.sh
-            artifacts/v51-cp-off.rc
-            artifacts/INSTALL-BEFORE-FLASH.ps1
-            diagnostics/applied.patch
-            diagnostics/kernel.config
-          retention-days: 7
-
-      - name: Upload diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCOVER4S-V55-FAILED-DIAGNOSTICS
-          path: diagnostics/
-          if-no-files-found: warn
+          name: XCOVER4S-V58-DIAGNOSTICS
+          path: deliver/
+          retention-days: 14
