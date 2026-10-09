@@ -1,31 +1,32 @@
 
-name: XCover4s V47 CP targeted test
+name: XCover4s V48 full kernel build - NO FLASH
 
 on:
   workflow_dispatch:
 
 jobs:
-  cp-test:
+  v48-build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
-      - name: Install dependencies
+      - name: Install kernel build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            git make gcc-aarch64-linux-gnu bc bison flex \
-            libssl-dev libelf-dev clang lld python3
+            git make gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            bc bison flex libssl-dev libelf-dev clang lld python3 cpio
 
-      - name: Checkout known source revision
+      - name: Download exact working kernel source
         run: |
-          git clone --filter=blob:none --branch lineage-18.1 --single-branch \
+          git clone --filter=blob:none --single-branch --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           cd kernel
-          git checkout 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git checkout --detach 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          test "$(git rev-parse HEAD)" = 6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply embedded CP patch
+      - name: Apply previously CP-compiled patch (embedded)
         run: |
-          cat > /tmp/cp.patch.gz.b64 <<'PATCH64'
+          cat > /tmp/v48.patch.gz.b64 <<'PATCH64'
           H4sIAAAAAAAC/9VWbW/bNhD+LP+Kq4cEsiVZfqubl2WN0blFgCQ1sqUrhgECQ1O2YJnUSMpJMfi/70gpfveQYsGA+YNt8o7PvT13ZBAEQMKR
           TOZMqlAJGioyUzkfh5SkQRKH2SzHfxHNGrTieR48vFT58hKClt8Br+W3TuHysuL9kHCa5iMGP6YJz5/CmRjlKcuIJLPG5Kc98lyzp70SJiUX
           VlLxwjp86fbOYEZ4TtL0G6RE0wkbwYdhIOIYSKyZhD4fSZGMQGkidZ41oB5WPFzohMLPg49Xt4Po5v7XwVd33u2h/1Eq6LR2vlR5ECKFUoSg
@@ -37,62 +38,73 @@ jobs:
           o+FoeIez5asPURTnnEYRhhugAcIT6lbRfwsDJUxMkrRqEuI4z0OtTIuR5JLBY6InIkeWGICpcQVJDeqb0mxmRxraXs8kOIuSfKdvbcjtt2XI
           UH/tXikyIlnKiGIvb5p9x7a6xxQk4bEwFTlSbs1kGQ4n2F48rRPTbK3uyQu7ba/3/8e22wzktfuPUMOFiCK6xC5c7oDd+c427JyemPdBt9v2
           Oz1bJOT22apURfUX5SXfB4WET7EJZKIZiBhaoDH+Mb5FIBOPTAYj8cgbSGVKOBcainBti9gybFz6//663uIHjgBsw9H5NmfWazZFLC1Q5lr8
-          Jl6Ly4PrBDKzaIcKKwoWKuU5eHMBrdoe4lzdfulfLx34b2nbXDF2Pf5tmhaDz1134o3RPD7emfluDS4uoLkW6K67aAFrxUo0liq2hNxMECpi
+          Jl6Ly4PrBDKzaIcKKwoWKuU5eHMBrdoe4lzdfulfLx34b2nbXDF2Pf5haDz1134o3RPD7emfluDS4uoLkW6K67aAFrxUo0liq2hNxMECpi
           fj5vJee72uN1XmpLDpUGFOWZRMzYfT4/7H8aRL9c/T7woXqU29G3J/D32AxnYF9Si8rfF1In4dQLAAA=
           PATCH64
-          base64 -d /tmp/cp.patch.gz.b64 | gzip -d > /tmp/cp.patch
+          base64 -d /tmp/v48.patch.gz.b64 | gzip -d > /tmp/v48.patch
           cd kernel
-          git apply --check /tmp/cp.patch
-          git apply /tmp/cp.patch
+          git apply --check /tmp/v48.patch
+          git apply /tmp/v48.patch
           git diff --check
 
-      - name: Configure and compile CP only
+      - name: Prepare kernel configuration
         run: |
           cd kernel
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             lineage_xcover4s_defconfig
+          cp out/.config /tmp/v48-config
+
+      - name: Targeted CP compile before full build
+        run: |
+          set -o pipefail
+          cd kernel
           make -j2 O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             KCFLAGS=-Wno-error \
-            drivers/soc/samsung/cal-if/pmucal_cp.o
+            drivers/soc/samsung/cal-if/pmucal_cp.o \
+            2>&1 | tee /tmp/v48-cp.log
+          test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
 
-      - name: Prepare root trigger for later integration
+      - name: Full kernel build - only if targeted test passes
         run: |
-          mkdir -p integration
-          cat > integration/cp-after-boot.sh <<'SCRIPT'
-          #!/system/bin/sh
-          # For integration into an EXISTING privileged boot service only.
-          # sys.boot_completed is NOT a verified lockscreen event.
-          PATH=/system/bin:/system/xbin
-          PARAM=/sys/module/pmucal_cp/parameters/v46_cp_off
-          while [ "$(getprop sys.boot_completed)" != 1 ]; do
-            sleep 1
-          done
-          [ -w "$PARAM" ] || exit 1
-          printf '1\n' > "$PARAM" || exit 1
-          [ "$(cat "$PARAM")" = 1 ] || exit 1
-          SCRIPT
-          chmod +x integration/cp-after-boot.sh
-          cat > integration/READ-ME.txt <<'TEXT'
-          V47 is a TARGETED COMPILE TEST, NOT A FLASHABLE KERNEL.
-          The CP patch reuses the V46 prototype. Its latching and modem
-          coverage are NOT verified on the physical device.
-          The supplied script is NOT automatically installed to Rootbroker.
-          The trigger uses sys.boot_completed and may be later than the
-          lockscreen. Do NOT assume the 3-second target is met.
-          No guarantee about absence of RF transmissions is possible yet.
-          TEXT
-          sh -n integration/cp-after-boot.sh
+          set -o pipefail
+          cd kernel
+          make -j2 O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            KCFLAGS=-Wno-error Image \
+            2>&1 | tee /tmp/v48-full-build.log
+          test -s out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image
+          sha256sum out/arch/arm64/boot/Image | tee /tmp/v48-image.sha256
 
-      - name: Upload diagnostics and script
+      - name: Create build status and integration notes
+        if: always()
+        run: |
+          mkdir -p release
+          cp /tmp/v48.patch release/v48-source.patch 2>/dev/null || true
+          cp /tmp/v48-config release/kernel.config 2>/dev/null || true
+          cp /tmp/v48-cp.log release/cp-compile.log 2>/dev/null || true
+          cp /tmp/v48-full-build.log release/full-build.log 2>/dev/null || true
+          cp /tmp/v48-image.sha256 release/Image.sha256 2>/dev/null || true
+          if [ -s kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image release/Image
+          fi
+          cat > release/READ-ME.txt <<'NOTE'
+          V48: Full kernel compile, NOT an Odin-flashable boot.img.
+          Uses the previously targeted-compiled V46 CP patch.
+          The CP-off callback still REQUIRES a privileged trigger.
+          Automatic Rootbroker startup is NOT installed by this workflow.
+          Lockscreen timing and RF transmissions are NOT verified.
+          Do NOT flash Image directly.
+          A matching original boot.img is needed for safe repacking.
+          NOTE
+
+      - name: Upload build logs and Image
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V47-CP-TARGETED
+          name: XCOVER4S-V48-FULL-KERNEL-NOT-FLASHABLE
           if-no-files-found: warn
-          path: |
-            /tmp/cp.patch
-            kernel/out/.config
-            kernel/out/drivers/soc/samsung/cal-if/pmucal_cp.o
-            integration/
+          path: release/
