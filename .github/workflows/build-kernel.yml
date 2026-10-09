@@ -1,158 +1,296 @@
-name: XCover4s V50 CP gate safety source audit
+name: XCOVER4S V51 FINAL CP AUDIT
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  v51:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+
     steps:
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            git make gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev libelf-dev clang lld python3 cpio
+          sudo apt-get install -y \
+            git make bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            clang lld python3 cpio file
 
-      - name: Get exact XCover4s kernel revision
+      - name: Get exact kernel source
         run: |
           set -euo pipefail
-          git clone --filter=blob:none --single-branch --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-          cd kernel
-          git checkout --detach 6020dfa8315134187f07ca903c9d2ed7ee0256f5
-          test "$(git rev-parse HEAD)" = 6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Restore and verify exact V47-tested CP patch
+          git clone \
+            --filter=blob:none \
+            --single-branch \
+            --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
+
+          cd kernel
+
+          git checkout --detach \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
+          test "$(git rev-parse HEAD)" = \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
+          mkdir -p ../diagnostics
+
+          git rev-parse HEAD \
+            > ../diagnostics/source-commit.txt
+
+      - name: Restore verified V50 patch
         run: |
           set -euo pipefail
-          mkdir -p diagnostics
-          cat > diagnostics/v48-patch.gz.b64 <<'PATCH64'
-          H4sIAAAAAAAC/9VWbW/bNhD+LP+Kq4cEsiVZfqubl2WN0blFgCQ1sqUrhgECQ1O2YJnUSMpJMfi/70gpfveQYsGA+YNt8o7PvT13
-          ZBAEQMKRTOZMqlAJGioyUzkfh5SkQRKH2SzHfxHNGrTieR48vFT58hKClt8Br+W3TuHysuL9kHCa5iMGP6YJz5/CmRjlKcuIJLPG
-          5Kc98lyzp70SJiUXVlLxwjp86fbOYEZ4TtL0G6RE0wkbwYdhIOIYSKyZhD4fSZGMQGkidZ41oB5WPFzohMLPg49Xt4Po5v7XwVd3
-          3u2h/1Eq6LR2vlR5ECKFUoSgUWnj3DhQqiRcr2sopl0quNJAJ0RCfU5SH4oNpWVONUyZ5CyNbPxQn2Zr5rawxgbLojzkcczky4EO
-          6kUiU+smzPIC/qp4gJ8GOo+rzWj8Ujbelo2tbIFGi4KWBuiDu1Ly4XjTmA+399fXPjR7zabxtwLLGldXLJpU9+xLwqzAMuyd/w68
-          dge/kWFQAagD3DGdS66gCYKDyillSjXgs54w+Zgo5gNnY8zOnAHySEhM0og1zNGwEpjML+1HCU+0O0fe1HZKI2QyTjiq7dXGTIJj
-          VCXT56WrnabfA6/b89tN66wjrZ/QRIUF6niHbZd1WQLalW0PS1T3eIu1VjkGd5extecarxByfhDDfEovg8FwcHdT7i+KH7mkwqFs
-          1DZ8/QdLpZUiuoVpqwqE9XpR0BWoKUKuIADDQppBsbbFc5xnj9lTJhQOAC1g+Nvdh/61SRyTMaFYZlOJk7ZhTavVLmnjmFyh6Zot
-          m5PJCInhVo8UHKmzkiRIpQnhI5w/YzQcSIYtERGlmMT+Yn/mjCP6H7zqGwTHGd7co+FoeIez5asPURTnnEYRhhugAcIT6lbRfwsD
-          JUxMkrRqEuI4z0OtTIuR5JLBY6InIkeWGICpcQVJDeqb0mxmRxraXs8kOIuSfKdvbcjtt2XIUH/tXikyIlnKiGIvb5p9x7a6xxQk
-          4bEwFTlSbs1kGQ4n2F48rRPTbK3uyQu7ba/3/8e22wzktfuPUMOFiCK6xC5c7oDd+c427JyemPdBt9v2Oz1bJOT22apURfUX5SXf
-          B4WET7EJZKIZiBhaoDH+Mb5FIBOPTAYj8cgbSGVKOBcainBti9gybFz6//663uIHjgBsw9H5NmfWazZFLC1Q5lr8Jl6Ly4PrBDKz
-          aIcKKwoWKuU5eHMBrdoe4lzdfulfLx34b2nbXDF2Pf5tmhaDz1134o3RPD7emfluDS4uoLkW6K67aAFrxUo0liq2hNxMECpifj5v
-          Jee72uN1XmpLDpUGFOWZRMzYfT4/7H8aRL9c/T7woXqU29G3J/D32AxnYF9Si8rfF1In4dQLAAA=
-          PATCH64
-          base64 -d diagnostics/v48-patch.gz.b64 | gzip -dc > diagnostics/v48.patch
-          printf '%s  %s\n' '90ef72d276f04d356eb60e53c88e8986965a19af156057581815821d7ae59344' diagnostics/v48.patch | sha256sum -c -
+
+          cat > diagnostics/v50.gz.b64 <<'PATCH'
+          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
+          fF4Tzv8DAD/OticVAAA=
+          PATCH
+
+          base64 -d diagnostics/v50.gz.b64 \
+            | gzip -dc > diagnostics/v50.patch
+
+          echo \
+            "9741c05944d7693ae9ad1141769c26cba788a7695a38b18125d871f31207ef87  diagnostics/v50.patch" \
+            | sha256sum -c -
+
           cd kernel
-          git apply --check ../diagnostics/v48.patch
-          git apply ../diagnostics/v48.patch
+
+          git apply --check ../diagnostics/v50.patch
+          git apply ../diagnostics/v50.patch
           git diff --check
-          echo 'Patch check PASSED'
 
-      - name: V50 targeted safety fixes and modem gate
+      - name: V51 safety and CP path audit
         run: |
           set -euo pipefail
-          python3 - <<'PYCODE'
+
+          python3 - <<'PY'
           from pathlib import Path
-          cp = Path('kernel/drivers/soc/samsung/cal-if/pmucal_cp.c')
-          src = cp.read_text()
-          old = 'panic("cp reset release fail");'
-          assert src.count(old) == 1, 'Unexpected reset-release panic layout'
-          src = src.replace(old, '/* V50: return error rather than reboot on failed release. */')
-          anchor = 'static bool v46_cp_off_latched;'
-          assert src.count(anchor) == 1
-          src = src.replace(anchor, anchor + '\n\nbool pmucal_cp_is_off_latched(void)\n{\n    return READ_ONCE(v46_cp_off_latched);\n}\n')
-          cp.write_text(src)
-          hdr = Path('kernel/drivers/soc/samsung/cal-if/pmucal_cp.h')
-          h = hdr.read_text()
-          anchor = 'extern int pmucal_cp_reset_release(void);'
-          assert h.count(anchor) == 1
-          hdr.write_text(h.replace(anchor, anchor + '\nextern bool pmucal_cp_is_off_latched(void);'))
-          modem = Path('kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c')
-          m = modem.read_text()
-          for sig in ('static int ss310ap_on(struct modem_ctl *mc)', 'static int ss310ap_dump_start(struct modem_ctl *mc)'):
-              anchor = sig + '\n{'
-              assert m.count(anchor) == 1, 'Missing or changed function: ' + sig
-              # Check latch before entering modem controller; no changes to boot-time behavior.
-              gate = ('\n#ifdef CONFIG_CP_PMUCAL\n'
-                      '    if (pmucal_cp_is_off_latched()) {\n'
-                      '        mif_err("V50: CP off latched; rejecting modem restart\\n");\n'
-                      '        mc->phone_state = STATE_OFFLINE;\n'
-                      '        return -EPERM;\n'
-                      '    }\n'
-                      '#endif\n')
-              m = m.replace(anchor, anchor + gate)
-          # A local declaration avoids depending on cross-directory private headers.
-          marker = 'static int ss310ap_on(struct modem_ctl *mc)'
-          assert m.count(marker) == 1
-          m = m.replace(marker, '#ifdef CONFIG_CP_PMUCAL\nextern bool pmucal_cp_is_off_latched(void);\n#endif\n\n' + marker)
-          modem.write_text(m)
-          print('V50: panic fix, read-only latch getter, and 2 modem gates inserted')
-          PYCODE
-          cd kernel
-          git diff --check
-          git diff > ../diagnostics/v50-full.patch
-          grep -q 'pmucal_cp_is_off_latched' ../diagnostics/v50-full.patch
+          import re
 
-      - name: Configure original XCover4s kernel
+          root = Path("kernel")
+          out = Path("diagnostics")
+          cp = root / "drivers/soc/samsung/cal-if/pmucal_cp.c"
+          modem = root / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
+
+          c = cp.read_text()
+          m = modem.read_text()
+
+          required_cp = [
+              "v46_cp_off_latched",
+              "pmucal_cp_reset_assert",
+              "pmucal_cp_reset_release",
+              "pmucal_cp_init",
+              "pmucal_cp_is_off_latched",
+          ]
+
+          required_modem = [
+              "ss310ap_on",
+              "ss310ap_dump_start",
+              "pmucal_cp_is_off_latched",
+              "return -EPERM",
+          ]
+
+          for name in required_cp:
+              assert name in c, "Missing CP feature: " + name
+
+          for name in required_modem:
+              assert name in m, "Missing modem feature: " + name
+
+          assert 'panic("cp reset release fail")' not in c
+
+          # Verify that the latch check is inside the named functions.
+          for name in ("ss310ap_on", "ss310ap_dump_start"):
+              match = re.search(
+                  r"static\s+int\s+" + name +
+                  r"\s*\([^)]*\)\s*\{",
+                  m
+              )
+              assert match, "Missing function: " + name
+              body_start = match.end()
+              body = m[body_start:body_start + 650]
+              assert "pmucal_cp_is_off_latched()" in body
+              assert "return -EPERM" in body
+
+          report = []
+          report.append("V51 CP SOURCE AUDIT")
+          report.append("===================")
+          report.append("PMUCAL latch: PRESENT")
+          report.append("Modem on gate: PRESENT")
+          report.append("Modem dump gate: PRESENT")
+          report.append("Release panic: REMOVED")
+          report.append("")
+          report.append("CP-related references across source tree:")
+          report.append("")
+
+          terms = (
+              "pmucal_cp_init",
+              "pmucal_cp_reset_release",
+              "pmucal_cp_reset_assert",
+              "cal_cp_init",
+              "cal_cp_reset_release",
+              "exynos_set_cp_power_onoff",
+              "cp_power_on",
+              "ss310ap_on",
+              "ss310ap_dump_start",
+          )
+
+          for p in root.rglob("*"):
+              if not p.is_file():
+                  continue
+              if p.suffix not in (".c", ".h"):
+                  continue
+              try:
+                  lines = p.read_text(errors="replace").splitlines()
+              except OSError:
+                  continue
+              for n, line in enumerate(lines, 1):
+                  if any(term in line for term in terms):
+                      report.append(
+                          f"{p.relative_to(root)}:{n}: {line.strip()}"
+                      )
+
+          (out / "cp-path-audit.txt").write_text(
+              "\n".join(report) + "\n"
+          )
+
+          print("CP source checks passed")
+          print("Cross-reference audit saved")
+          PY
+
+      - name: Configure kernel
         run: |
           set -euo pipefail
           cd kernel
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            lineage_xcover4s_defconfig 2>&1 | tee ../diagnostics/config.log
+
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            lineage_xcover4s_defconfig \
+            2>&1 | tee ../diagnostics/config.log
+
           cp out/.config ../diagnostics/kernel.config
 
-      - name: Targeted CP compile FIRST
+          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
+          grep -q '^CONFIG_SEC_MODEM_SS310AP=y' out/.config
+
+      - name: Compile CP components first
         run: |
           set -euo pipefail
           cd kernel
+
           make -j2 O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
             KCFLAGS=-Wno-error \
             drivers/soc/samsung/cal-if/pmucal_cp.o \
             drivers/misc/modem_v1/modem_ctrl_ss310ap.o \
-            2>&1 | tee ../diagnostics/cp-compile.log | sed -E "/aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x(22|23)|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)/d"
-          test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
-          cp out/drivers/soc/samsung/cal-if/pmucal_cp.o ../diagnostics/pmucal_cp.o
-          cp out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o ../diagnostics/modem_ctrl_ss310ap.o
+            2>&1 | tee ../diagnostics/cp-compile.log
 
-      - name: Full kernel build ONLY after CP passes
+          test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
+          test -s out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o
+
+          cp out/drivers/soc/samsung/cal-if/pmucal_cp.o \
+            ../diagnostics/pmucal_cp.o
+
+          cp out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o \
+            ../diagnostics/modem_ctrl_ss310ap.o
+
+      - name: Build complete kernel
         run: |
           set -euo pipefail
           cd kernel
+
           make -j2 O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-            KCFLAGS=-Wno-error Image \
-            2>&1 | tee ../diagnostics/full-build.log | sed -E "/aarch64-linux-gnu-objdump: Warning: (Unrecognized form: 0x(22|23)|Bogus end-of-siblings marker|Further warnings about bogus end-of-sibling markers suppressed)/d"
-          test -s out/arch/arm64/boot/Image
-          cp out/arch/arm64/boot/Image ../diagnostics/Image
-          sha256sum ../diagnostics/Image > ../diagnostics/Image.sha256
-          file ../diagnostics/Image
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            KCFLAGS=-Wno-error \
+            Image \
+            2>&1 | tee ../diagnostics/full-build.log
 
-      - name: Add accurate flash-status notes
+          test -s out/arch/arm64/boot/Image
+
+          cp out/arch/arm64/boot/Image \
+            ../diagnostics/Image
+
+          sha256sum ../diagnostics/Image \
+            > ../diagnostics/Image.sha256
+
+          file ../diagnostics/Image \
+            > ../diagnostics/Image.file.txt
+
+      - name: Save full patch and safety notes
         if: always()
         run: |
           mkdir -p diagnostics
+
+          if [ -d kernel/.git ]; then
+            git -C kernel diff \
+              > diagnostics/v51-full.patch
+          fi
+
           cat > diagnostics/READ-ME.txt <<'NOTE'
-          V50: builds V48 CP latch plus no-release-panic and SS310AP start/dump gates.
-          This is NOT a flashable boot.img or Odin .tar.
-          Rootbroker auto-start is NOT included: first boot test must be manual.
-          Automatic lockscreen trigger needs real device integration/testing.
-          V49 review boot image is NOT safe to flash (AVB/header invalid).
-          RF silence and boot safety are NOT proven by compilation.
-          Do not flash Image directly. Keep the known-good boot backup.
-          If full-build.log is absent, an earlier stage failed.
+          XCOVER4S V51 CP SAFETY AUDIT
+
+          Based on V50 compiled CP patch.
+
+          Includes:
+          - PMUCAL CP-off latch
+          - PMUCAL restart blocking
+          - SS310AP on blocking
+          - SS310AP dump-start blocking
+          - Removal of reset-release panic
+          - Source-wide CP call-site inventory
+          - Targeted compilation
+          - Full ARM64 kernel compilation
+
+          Important limitations:
+          - Source audit does not prove all runtime paths are blocked.
+          - No automatic CP-off trigger is installed.
+          - Rootbroker integration is not installed.
+          - SELinux is not modified.
+          - RF transmission is not measured.
+          - Device boot compatibility is not proven.
+          - This artifact is NOT flashable with Odin.
+
+          Do not flash the raw Image.
+          Keep the original working boot backup.
           NOTE
 
-      - name: Upload results even if build fails
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V50-REVIEW-DIAGNOSTICS
-          if-no-files-found: warn
+          name: XCOVER4S-V51-FINAL-DIAGNOSTICS
           path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 30
