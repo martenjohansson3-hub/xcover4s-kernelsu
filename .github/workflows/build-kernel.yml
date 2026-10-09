@@ -1,5 +1,5 @@
 
-name: XCOVER4S V53 EARLY SELINUX AND CP DIAGNOSTIC BUILD
+name: XCOVER4S V54 EARLY SELINUX AND CP DIAGNOSTIC BUILD
 
 on:
   workflow_dispatch:
@@ -87,7 +87,7 @@ jobs:
           grep -q 'V51: CP-off latch blocks ss310ap_reset' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
           grep -q 'V51: CP-off latch blocks ss310ap_boot_on' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
 
-      - name: V53 SELinux early boot and init enforcement guard
+      - name: V54 SELinux early boot and init enforcement guard
         run: |
           set -euo pipefail
           python3 - <<'PYPATCH'
@@ -121,21 +121,37 @@ jobs:
           # Guard the actual selinuxfs enforcement write, not merely bootargs.
           sf = Path('kernel/security/selinux/selinuxfs.c')
           t = sf.read_text()
+          import re
           # On this kernel the enforcement control is written via the selinuxfs
           # 'enforce' file. Refuse to guess if its exact code differs.
-          candidates = [
-              r'\bselinux_enforcing\s*=\s*new_value\s*;',
-              r'\bselinux_enforcing\s*=\s*newval\s*;',
-              r'\bselinux_enforcing\s*=\s*new_enforcing\s*;',
-          ]
-          found = [(pat, list(re.finditer(pat, t))) for pat in candidates]
-          hits = [(pat, matches[0]) for pat, matches in found if len(matches) == 1]
-          if len(hits) != 1 or sum(len(matches) for _, matches in found) != 1:
-              raise SystemExit('V53: cannot uniquely locate SELinux runtime enforcement assignment; stop instead of creating unsafe image')
-          pat, match = hits[0]
-          t = t[:match.start()] + 'selinux_enforcing = 0; /* V53: prevent init re-enforcing */' + t[match.end():]
+          # Match the actual assignment independently of its local variable name.
+          # Limit the search to sel_write_enforce() so unrelated writes are untouched.
+          fn = re.search(r'\bstatic\s+ssize_t\s+sel_write_enforce\s*\(', t)
+          if not fn:
+              raise SystemExit('V54: sel_write_enforce() not found; source differs')
+          brace = t.find('{', fn.end())
+          if brace < 0:
+              raise SystemExit('V54: function body not found')
+          depth = 0
+          end = None
+          for i in range(brace, len(t)):
+              if t[i] == '{': depth += 1
+              elif t[i] == '}':
+                  depth -= 1
+                  if depth == 0:
+                      end = i
+                      break
+          if end is None:
+              raise SystemExit('V54: function closing brace not found')
+          body = t[brace:end]
+          assignments = list(re.finditer(r'\bselinux_enforcing\s*=\s*[^;\n]+;', body))
+          if len(assignments) != 1:
+              raise SystemExit(f'V54: expected one enforcement assignment in sel_write_enforce(), found {len(assignments)}; refusing patch')
+          m = assignments[0]
+          body = body[:m.start()] + 'selinux_enforcing = 0; /* V54: keep permissive */' + body[m.end():]
+          t = t[:brace] + body + t[end:]
           sf.write_text(t)
-          print('V53 patched runtime SELinux enforcement assignment')
+          print('V54 patched sel_write_enforce() assignment')
 
           check = p.read_text()
           assert check.count('V52_FORCE_PERMISSIVE_EARLY') == 1
@@ -206,6 +222,7 @@ jobs:
           salt=bytes(vb[d+136:d+168]);assert hashlib.sha256(salt+original[:origsize]).digest()==bytes(vb[d+168:d+200]),'Original AVB invalid'
           header=bytearray(original[:pg]);struct.pack_into('<I',header,8,len(kernel))
           oldcmd=bytes(header[64:576]).split(b'\0',1)[0]
+          # V52 SELinux-only change: request Permissive at boot and force security_setenforce() requests to remain Permissive; runtime must be verified.
           # Keep the V51 modem patch, ramdisk, Rootbroker and modem trigger unchanged.
           for arg in (b'enforcing=0', b'androidboot.selinux=permissive'):
            if arg not in oldcmd.split(): oldcmd+=b' '+arg
@@ -228,11 +245,11 @@ jobs:
           assert check[pg:pg+len(kernel)]==kernel
           assert check[576:596]==h.digest()
           assert hashlib.sha256(salt+check[:len(payload)]).digest()==check[new_vbo+d+168:new_vbo+d+200]
-          with tarfile.open(base/'XCOVER4S-V53-SELINUX-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
-          with tarfile.open(base/'XCOVER4S-V53-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
-          with tarfile.open(base/'XCOVER4S-V53-SELINUX-ODIN-UNTESTED.tar') as t:
+          with tarfile.open(base/'XCOVER4S-V54-SELINUX-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
+          with tarfile.open(base/'XCOVER4S-V54-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
+          with tarfile.open(base/'XCOVER4S-V54-SELINUX-ODIN-UNTESTED.tar') as t:
            members=t.getmembers();assert len(members)==1 and members[0].name=='boot.img' and t.extractfile(members[0]).read()==check
-          report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False,'selinux_boot_target':'Permissive requested and selinuxfs runtime assignment patched; device test required'}
+          report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False, 'selinux_boot_target':'Permissive requested and selinuxfs runtime assignment patched; device test required'}
           (base/'verification.json').write_text(json.dumps(report,indent=2))
           print(json.dumps(report,indent=2))
           PYREPACK
@@ -303,7 +320,7 @@ jobs:
           $check = (& $adb shell 'ls -lZ /system/etc/init/v51-cp-off.rc /data/adb/v51-cp-off.sh')
           if ($LASTEXITCODE -ne 0) { throw 'Installed files cannot be read' }
           Write-Host $check
-          Write-Host 'Trigger staged for NEXT boot. Do not reboot until V53 boot image has been reviewed and you are ready to flash.'
+          Write-Host 'Trigger staged for NEXT boot. Do not reboot until V52 boot image has been reviewed and you are ready to flash.'
           POWERSHELL
 
           python3 - <<'PYCHECK'
@@ -320,11 +337,11 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V53-SELINUX-CANDIDATE-UNTESTED
+          name: XCOVER4S-V54-SELINUX-CANDIDATE-UNTESTED
           path: |
             artifacts/boot.img
-            artifacts/XCOVER4S-V53-SELINUX-ODIN-UNTESTED.tar
-            artifacts/XCOVER4S-V53-ORIGINAL-RESTORE.tar
+            artifacts/XCOVER4S-V54-SELINUX-ODIN-UNTESTED.tar
+            artifacts/XCOVER4S-V54-ORIGINAL-RESTORE.tar
             artifacts/verification.json
             artifacts/v51-cp-off.sh
             artifacts/v51-cp-off.rc
@@ -337,6 +354,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V53-FAILED-DIAGNOSTICS
+          name: XCOVER4S-V54-FAILED-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
