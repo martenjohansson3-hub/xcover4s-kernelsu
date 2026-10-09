@@ -1,4 +1,5 @@
-name: XCOVER4S V51 FAST CP AUDIT
+
+name: XCOVER4S V51 CP SELINUX TRIGGER BUILD AND ODIN
 
 on:
   workflow_dispatch:
@@ -7,213 +8,252 @@ permissions:
   contents: read
 
 jobs:
-  cp-audit:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 35
-
-    defaults:
-      run:
-        shell: bash
-
+    timeout-minutes: 100
     steps:
-      - name: Install dependencies
+      - uses: actions/checkout@v4
+      - name: Check known-good backup
         run: |
           set -euo pipefail
-
+          test -s boot-original.img || { echo 'Place your original boot backup at repo root as boot-original.img (PRIVATE repo only)'; exit 1; }
+          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
+          mkdir -p artifacts diagnostics
+      - name: Install build tools
+        run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            git make bc bison flex \
-            libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            clang llvm lld \
-            python3 cpio file ripgrep
-
-          mkdir -p diagnostics
-
-      - name: Download exact XCover 4s kernel
+          sudo apt-get install -y --no-install-recommends git make gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev clang lld python3 cpio
+      - name: Clone pinned kernel
         run: |
           set -euo pipefail
-
-          git clone \
-            --depth=1 \
-            --single-branch \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
+          git clone --filter=blob:none --single-branch --branch lineage-18.1 https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           cd kernel
-
-          git fetch --depth=1 origin \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
-          git checkout --detach \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
-          test "$(git rev-parse HEAD)" = \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
-          git rev-parse HEAD \
-            > ../diagnostics/source-commit.txt
-
-      - name: Configure XCover 4s
+          git checkout --detach 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          test "$(git rev-parse HEAD)" = 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+      - name: Apply verified V50 plus V51 modem restart gates
         run: |
           set -euo pipefail
-
+          cat > diagnostics/v51.patch.gz.b64 <<'PATCH64'
+          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
+          Lv8DRPFCtCoVAAA=
+          PATCH64
+          base64 -d diagnostics/v51.patch.gz.b64 | gzip -dc > diagnostics/v51.patch
+          echo '7f0ebd23cea817b2048a9bc9ceb4483827b83112b7710aa496ee959fa36bc0d8  diagnostics/v51.patch' | sha256sum -c -
           cd kernel
-
-          make O=out ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            lineage_xcover4s_defconfig \
-            2>&1 | tee ../diagnostics/config.log
-
+          git apply --check ../diagnostics/v51.patch
+          git apply ../diagnostics/v51.patch
+          git diff --check
+          git diff > ../diagnostics/applied.patch
+          grep -q 'V51: CP-off latch blocks ss310ap_reset' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+          grep -q 'V51: CP-off latch blocks ss310ap_boot_on' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          cd kernel
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lineage_xcover4s_defconfig 2>&1 | tee ../diagnostics/config.log
           cp out/.config ../diagnostics/kernel.config
-
-          grep -E \
-            '^CONFIG_.*(MODEM|CP_|PMUCAL|EXYNOS)' \
-            out/.config \
-            > ../diagnostics/modem-config.txt || true
-
           grep -q '^CONFIG_CP_PMUCAL=y' out/.config
           grep -q '^CONFIG_SEC_MODEM_SS310AP=y' out/.config
-
-      - name: Fast CP restart audit
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' out/.config
+          if grep -q '^CONFIG_ALWAYS_ENFORCE=y' out/.config; then echo 'Kernel forces SELinux enforcing: refusing to build'; exit 1; fi
+      - name: Targeted compile before full build
         run: |
           set -euo pipefail
-
-          echo "Searching CP restart paths..."
-
-          rg -n -i \
-            --glob '*.[ch]' \
-            'pmucal_cp_|cal_cp_|exynos_cp_|ss310ap_|cp_power|cp_reset|modem_reset|modem_on|modem_boot|boot_on|dump_start|CP_PWRON|CP_START|CP_ACTIVE|IOCTL_MODEM_' \
-            kernel/drivers \
-            kernel/arch/arm64 \
-            kernel/include \
-            > diagnostics/all-cp-references.txt || true
-
-          rg -n \
-            --glob '*.[ch]' \
-            'pmucal_cp_init|pmucal_cp_reset_release|pmucal_cp_reset_assert|exynos_cp_init|exynos_cp_release|exynos_cp_reset|exynos_set_cp_power_onoff|ss310ap_on|ss310ap_reset|ss310ap_boot_on|ss310ap_dump_start|cal_cp_init|cal_cp_reset_release' \
-            kernel/drivers \
-            kernel/arch/arm64 \
-            kernel/include \
-            > diagnostics/restart-call-sites.txt || true
-
-          rg -n \
-            --glob '*.[ch]' \
-            'panic\(|BUG\(|BUG_ON\(|WARN_ON\(' \
-            kernel/drivers/misc/modem_v1 \
-            kernel/drivers/soc/samsung/cal-if \
-            > diagnostics/modem-panic-paths.txt || true
-
-          echo "CP audit complete"
-
-          wc -l \
-            diagnostics/all-cp-references.txt \
-            diagnostics/restart-call-sites.txt \
-            diagnostics/modem-panic-paths.txt
-
-      - name: Save relevant modem sources
-        run: |
-          set -euo pipefail
-
-          tar -czf diagnostics/modem-v1-source.tar.gz \
-            -C kernel \
-            drivers/misc/modem_v1
-
-          tar -czf diagnostics/cal-if-source.tar.gz \
-            -C kernel \
-            drivers/soc/samsung/cal-if
-
-          if [ -f kernel/drivers/soc/samsung/pmu-cp.c ]; then
-            cp kernel/drivers/soc/samsung/pmu-cp.c \
-              diagnostics/pmu-cp.c
-          fi
-
-      - name: Compile CP components
-        id: compile
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-
           cd kernel
-
-          make -j2 O=out ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            KCFLAGS=-Wno-error \
-            drivers/soc/samsung/cal-if/pmucal_cp.o \
-            drivers/misc/modem_v1/modem_ctrl_ss310ap.o \
-            2>&1 | tee ../diagnostics/targeted-compile.log
-
-          test -s \
-            out/drivers/soc/samsung/cal-if/pmucal_cp.o
-
-          test -s \
-            out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o
-
-      - name: Disassemble CP objects without DWARF noise
-        if: steps.compile.outcome == 'success'
+          make -j2 O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error drivers/soc/samsung/cal-if/pmucal_cp.o drivers/misc/modem_v1/modem_ctrl_ss310ap.o 2>&1 | tee ../diagnostics/targeted.log | sed -E '/aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/d'
+          test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
+          test -s out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o
+      - name: Full ARM64 Image build
         run: |
           set -euo pipefail
-
-          mkdir -p diagnostics/disassembly
-
-          for object in \
-            kernel/out/drivers/soc/samsung/cal-if/pmucal_cp.o \
-            kernel/out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o
-          do
-            name="$(basename "$object" .o)"
-
-            aarch64-linux-gnu-objdump \
-              -d "$object" \
-              > "diagnostics/disassembly/${name}.txt" \
-              2> >(
-                grep -vE \
-                  'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)([[:space:]]|$)' \
-                  >&2 || true
-              )
-          done
-
-          echo "Disassembly complete"
-
-      - name: Save status
-        if: always()
+          cd kernel
+          make -j2 O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error Image 2>&1 | tee ../diagnostics/full-build.log | sed -E '/aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/d'
+          test -s out/arch/arm64/boot/Image
+          cp out/arch/arm64/boot/Image ../artifacts/Image
+      - name: Repack boot and regenerate unsigned AVB hash and footer
         run: |
-          mkdir -p diagnostics
+          set -euo pipefail
+          python3 - <<'PYREPACK'
+          from pathlib import Path
+          import struct,hashlib,json,tarfile
+          base=Path('artifacts'); original=Path('boot-original.img').read_bytes(); kernel=(base/'Image').read_bytes()
+          sha=lambda b:hashlib.sha256(b).hexdigest()
+          assert len(original)==37748736, 'Unexpected original boot partition size'
+          assert sha(original)=='f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9', 'Wrong original boot backup'
+          assert original[:8]==b'ANDROID!' and original[-64:-60]==b'AVBf'
+          u32=lambda off:struct.unpack_from('<I',original,off)[0]
+          ks,rs,ss,pg,dt=u32(8),u32(16),u32(24),u32(36),u32(40)
+          assert (ks,rs,pg)==(23295720,837785,2048), 'Unexpected boot header'
+          assert 20000000<len(kernel)<27000000, 'Unexpected kernel size'
+          align=lambda n:(n+pg-1)//pg*pg
+          ro=pg+align(ks);so=ro+align(rs);dto=so+align(ss)
+          ramdisk=original[ro:ro+rs];second=original[so:so+ss];dtb=original[dto:dto+dt]
+          assert ro+rs<len(original) and dto+dt<len(original)
+          origsize,vbo,vbs=struct.unpack_from('>QQQ',original,len(original)-64+12)
+          assert (origsize,vbo,vbs)==(24137728,24137728,704)
+          vb=bytearray(original[vbo:vbo+vbs]);assert vb[:4]==b'AVB0'
+          assert struct.unpack_from('>I',vb,28)[0]==0, 'AVB must be unsigned algorithm NONE'
+          d=256
+          assert struct.unpack_from('>QQ',vb,d)==(2,184)
+          assert struct.unpack_from('>Q',vb,d+16)[0]==origsize
+          assert vb[d+24:d+30]==b'sha256'
+          assert struct.unpack_from('>III',vb,d+56)==(4,32,32)
+          assert vb[d+132:d+136]==b'boot'
+          salt=bytes(vb[d+136:d+168]);assert hashlib.sha256(salt+original[:origsize]).digest()==bytes(vb[d+168:d+200]),'Original AVB invalid'
+          header=bytearray(original[:pg]);struct.pack_into('<I',header,8,len(kernel))
+          # Android boot v0 command line is fixed-size (512 bytes at offset 64).
+          # Set both Linux SELinux boot flag and Android userdebug init flag.
+          # Runtime Permissive is not guaranteed until verified on device.
+          oldcmd=bytes(header[64:576]).split(b'\0',1)[0]
+          for arg in (b'enforcing=0',b'androidboot.selinux=permissive'):
+           if arg not in oldcmd.split(): oldcmd+=b' '+arg
+          assert len(oldcmd)<512, 'Boot cmdline too long'
+          header[64:576]=oldcmd+b'\0'*(512-len(oldcmd))
+          assert b'androidboot.selinux=permissive' in oldcmd and b'enforcing=0' in oldcmd
 
-          {
-            echo "XCOVER4S V51 FAST CP AUDIT"
-            echo
-            echo "Source:"
-            if [ -d kernel/.git ]; then
-              git -C kernel rev-parse HEAD
-            else
-              echo "Unavailable"
-            fi
-            echo
-            echo "CP compilation:"
-            echo "${{ steps.compile.outcome }}"
-            echo
-            echo "Original kernel source only."
-            echo "No V50/V51 CP-off patch applied."
-            echo "No flashable boot.img generated."
-            echo "No Odin TAR generated."
-          } > diagnostics/README.txt
+          h=hashlib.sha1()
+          for data in (kernel,ramdisk,second,dtb):h.update(data);h.update(struct.pack('<I',len(data)))
+          header[576:608]=h.digest()+b'\0'*12
+          payload=bytes(header)+kernel+b'\0'*(align(len(kernel))-len(kernel))+ramdisk+b'\0'*(align(rs)-rs)+second+b'\0'*(align(ss)-ss)+dtb+b'\0'*(align(dt)-dt)
+          assert len(payload)%pg==0
+          struct.pack_into('>Q',vb,d+16,len(payload));vb[d+168:d+200]=hashlib.sha256(salt+payload).digest()
+          new_vbo=(len(payload)+63)//64*64
+          assert new_vbo+vbs<len(original)-64,'New kernel does not fit boot partition'
+          out=bytearray(len(original));out[:len(payload)]=payload;out[new_vbo:new_vbo+vbs]=vb
+          footer=bytearray(original[-64:]);struct.pack_into('>QQQ',footer,12,len(payload),new_vbo,vbs);out[-64:]=footer
+          candidate=base/'boot.img';candidate.write_bytes(out)
+          check=candidate.read_bytes();nro=pg+align(len(kernel));assert check[nro:nro+rs]==ramdisk,'Ramdisk changed'
+          assert check[pg:pg+len(kernel)]==kernel
+          assert check[576:596]==h.digest()
+          assert hashlib.sha256(salt+check[:len(payload)]).digest()==check[new_vbo+d+168:new_vbo+d+200]
+          with tarfile.open(base/'XCOVER4S-V51-PERMISSIVE-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
+          with tarfile.open(base/'XCOVER4S-V51-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
+          with tarfile.open(base/'XCOVER4S-V51-PERMISSIVE-ODIN-UNTESTED.tar') as t:
+           members=t.getmembers();assert len(members)==1 and members[0].name=='boot.img' and t.extractfile(members[0]).read()==check
+          report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False}
+          (base/'verification.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PYREPACK
+      - name: Package boot-completed CP-off trigger and installer
+        run: |
+          set -euo pipefail
+          cat > artifacts/v51-cp-off.sh <<'TRIGGER'
+          #!/system/bin/sh
+          # One-shot CP-off after Android boot complete. Requires patched V51 kernel.
+          [ "$(getprop sys.boot_completed)" = 1 ] || exit 19
+          PATH=/system/bin:/system/xbin:/vendor/bin
+          /system/bin/log -t V51CP 'boot completed: requesting CP off' || true
+          PARAM=''
+          for P in /sys/module/*/parameters/v46_cp_off; do
+            [ -e "$P" ] || continue
+            [ -z "$PARAM" ] || exit 12
+            PARAM="$P"
+          done
+          [ -n "$PARAM" ] || exit 13
+          [ -w "$PARAM" ] || exit 14
+          STATE=$(cat "$PARAM" 2>/dev/null) || exit 15
+          [ "$STATE" = 1 ] && exit 0
+          [ "$STATE" = 0 ] || exit 16
+          printf '1\n' > "$PARAM" || exit 17
+          [ "$(cat "$PARAM")" = 1 ] || exit 18
+          /system/bin/log -t V51CP 'CP-off latch enabled; RF not independently verified' || true
+          TRIGGER
+          cat > artifacts/v51-cp-off.rc <<'INITRC'
+          service v51_cp_off /system/bin/sh /data/adb/v51-cp-off.sh
+              class late_start
+              user root
+              group root
+              seclabel u:r:su:s0
+              disabled
+              oneshot
 
-      - name: Upload diagnostics
-        if: always()
+          on property:sys.boot_completed=1
+              start v51_cp_off
+          INITRC
+          cat > artifacts/INSTALL-BEFORE-FLASH.ps1 <<'POWERSHELL'
+          # Run from extracted artifact directory. Works with adb.exe in Android SDK platform-tools.
+          # Requires adb root, and writable /system; never installs the CP trigger while old kernel is running.
+          $ErrorActionPreference = 'Stop'
+          $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+          $adbCandidates = @(
+            (Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'),
+            (Join-Path $env:USERPROFILE 'Downloads\platform-tools\adb.exe')
+          )
+          $adbCmd = Get-Command adb.exe -ErrorAction SilentlyContinue
+          if ($adbCmd) { $adb = $adbCmd.Source }
+          else { $adb = $adbCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+          if (-not $adb) { throw 'adb.exe not found. Install Android platform-tools.' }
+          function RunAdb { & $adb @args; if ($LASTEXITCODE -ne 0) { throw "adb failed ($LASTEXITCODE): $args" } }
+          RunAdb root
+          RunAdb wait-for-device
+          $id = (& $adb shell id)
+          if ($LASTEXITCODE -ne 0 -or $id -notmatch 'uid=0\(root\)') { throw 'ADB root required' }
+          $state = (& $adb shell 'getprop sys.boot_completed').Trim()
+          if ($state -ne '1') { throw 'Android has not finished booting' }
+          $original = Join-Path $here 'v51-cp-off.rc'
+          $script = Join-Path $here 'v51-cp-off.sh'
+          if (!(Test-Path $original) -or !(Test-Path $script)) { throw 'Missing generated trigger files' }
+          # Prepare trigger, but do not execute it on the currently running kernel.
+          RunAdb push $script /data/adb/v51-cp-off.sh
+          RunAdb shell 'chown root:root /data/adb/v51-cp-off.sh; chmod 700 /data/adb/v51-cp-off.sh; restorecon /data/adb/v51-cp-off.sh'
+          RunAdb remount
+          RunAdb push $original /system/etc/init/v51-cp-off.rc
+          RunAdb shell 'chown root:root /system/etc/init/v51-cp-off.rc; chmod 644 /system/etc/init/v51-cp-off.rc; restorecon /system/etc/init/v51-cp-off.rc; sync'
+          $check = (& $adb shell 'ls -lZ /system/etc/init/v51-cp-off.rc /data/adb/v51-cp-off.sh')
+          if ($LASTEXITCODE -ne 0) { throw 'Installed files cannot be read' }
+          Write-Host $check
+          Write-Host 'Trigger staged for NEXT boot. Do not reboot until V51 boot image has been reviewed and you are ready to flash.'
+          POWERSHELL
+          python3 - <<'PYCHECK'
+          from pathlib import Path
+          a=Path('artifacts/v51-cp-off.rc').read_text()
+          b=Path('artifacts/v51-cp-off.sh').read_text()
+          assert 'on property:sys.boot_completed=1' in a
+          assert 'oneshot' in a and 'start v51_cp_off' in a
+          assert 'v46_cp_off' in b and "printf '1\n'" not in b
+          print('Static trigger and init configuration checks passed; NOT device tested')
+          PYCHECK
+      - name: Upload verified candidate and restore package
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V51-FAST-CP-AUDIT
+          name: XCOVER4S-V51-COMPLETE-CANDIDATE-UNTESTED
+          path: |
+            artifacts/boot.img
+            artifacts/XCOVER4S-V51-PERMISSIVE-ODIN-UNTESTED.tar
+            artifacts/XCOVER4S-V51-ORIGINAL-RESTORE.tar
+            artifacts/verification.json
+            artifacts/v51-cp-off.sh
+            artifacts/v51-cp-off.rc
+            artifacts/INSTALL-BEFORE-FLASH.ps1
+            diagnostics/applied.patch
+            diagnostics/kernel.config
+          retention-days: 7
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V51-FAILED-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
-          retention-days: 30
-
-      - name: Report compilation failure
-        if: steps.compile.outcome == 'failure'
-        run: |
-          echo "CP compilation failed."
-          echo "Check targeted-compile.log in diagnostics."
-          exit 1
