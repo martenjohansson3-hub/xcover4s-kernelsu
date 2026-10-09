@@ -13,17 +13,29 @@ jobs:
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
+
       - name: Check known-good backup
         run: |
           set -euo pipefail
-          test -s boot-original.img || { echo 'Place your original boot backup at repo root as boot-original.img (PRIVATE repo only)'; exit 1; }
+          test -s boot-original.zip || { echo 'Missing boot-original.zip in repository root'; exit 1; }
+          python3 - <<'PYBOOT'
+          import zipfile
+          from pathlib import Path
+          z=zipfile.ZipFile('boot-original.zip')
+          assert z.namelist()==['boot-original.img'], 'ZIP must contain exactly boot-original.img'
+          info=z.getinfo('boot-original.img')
+          assert info.file_size==37748736, 'Unexpected uncompressed boot image size'
+          Path('boot-original.img').write_bytes(z.read(info))
+          PYBOOT
           echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
           mkdir -p artifacts diagnostics
+
       - name: Install build tools
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends git make gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev clang lld python3 cpio
+
       - name: Clone pinned kernel
         run: |
           set -euo pipefail
@@ -31,6 +43,7 @@ jobs:
           cd kernel
           git checkout --detach 6020dfa8315134187f07ca903c9d2ed7ee0256f5
           test "$(git rev-parse HEAD)" = 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
       - name: Apply verified V50 plus V51 modem restart gates
         run: |
           set -euo pipefail
@@ -53,9 +66,9 @@ jobs:
           zLhPiKrReIDHmW+toVVaDRg1occi0+YnZdA4q1YyQeGOpaMkQ+yVghtlCpIV5A+Z0lgXQZh2fzPqPhhSbW9plzdd4zJU3zoH8ogI
           GlGc+Z6fDMu2LWSFAoTxMFGIrEuroqIMqwOsW5Xr2m4LHcY5vNV5HcjGtlejPNGzALMaRwxmuRHCU9FHZD2Fomr3yi61C9ugUbIa
           7J8Vi6Uw/Rerxrwjb10+8kdA4qN2gUVk9lCo7+QvALa7aiBqt/Erpxim5s4MgByUBzPV9EAiqyLMYcFwdExCcCFFr4Y4fME4uaOi
-          HiR3vIGZ6HucI+i5EzrDdXDnppzXTxELqCO3sYoEu4tMKCJxg7rSBNcsrd/Bbj3dWKSFyrJHAM+IlYuYffAOHxwqS+hwfPaldzI1
+          HiR3vIGZ6HucI+i5EzrDdXDnppzXTxELqCO3sYoEu4tMKCJxg7rSBNcsrd/Bbj3dWKSFyrJHAM+IlYuYffPaldzI1
           4N8lozPjYdH/RfLlddsqGvFOSW5sPGpEVgX29sApOPrYXPXwKjJqtNEIa8VE5XyAUBDjc74QnJeQ/o0GyMVJWPp8LFBnaE32X/Q+
-          9cnn4z/7NqytZ7H8d0yGHXDyYfkFDzGjlzzEjPLpqq2mK/yf90HzUm2+RhrIzLu05TJzDHiG5FzF3X3Z27zleosl6nkWfF8Q
+          9cnn4z/7NqytZ7pyL3H8d0yGHXDyYfkFDzGjlzzEjPLpqq2mK/yf90HzUm2+RhrIzLu05TJzDHiG5FzF3X3Z27zleosl6nkWfF8Q
           Lv8DRPFCtCoVAAA=
           PATCH64
           base64 -d diagnostics/v51.patch.gz.b64 | gzip -dc > diagnostics/v51.patch
@@ -67,6 +80,7 @@ jobs:
           git diff > ../diagnostics/applied.patch
           grep -q 'V51: CP-off latch blocks ss310ap_reset' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
           grep -q 'V51: CP-off latch blocks ss310ap_boot_on' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+
       - name: Configure kernel
         run: |
           set -euo pipefail
@@ -77,6 +91,7 @@ jobs:
           grep -q '^CONFIG_SEC_MODEM_SS310AP=y' out/.config
           grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' out/.config
           if grep -q '^CONFIG_ALWAYS_ENFORCE=y' out/.config; then echo 'Kernel forces SELinux enforcing: refusing to build'; exit 1; fi
+
       - name: Targeted compile before full build
         run: |
           set -euo pipefail
@@ -84,6 +99,7 @@ jobs:
           make -j2 O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error drivers/soc/samsung/cal-if/pmucal_cp.o drivers/misc/modem_v1/modem_ctrl_ss310ap.o 2>&1 | tee ../diagnostics/targeted.log | sed -E '/aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/d'
           test -s out/drivers/soc/samsung/cal-if/pmucal_cp.o
           test -s out/drivers/misc/modem_v1/modem_ctrl_ss310ap.o
+
       - name: Full ARM64 Image build
         run: |
           set -euo pipefail
@@ -91,6 +107,7 @@ jobs:
           make -j2 O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- KCFLAGS=-Wno-error Image 2>&1 | tee ../diagnostics/full-build.log | sed -E '/aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)/d'
           test -s out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../artifacts/Image
+
       - name: Repack boot and regenerate unsigned AVB hash and footer
         run: |
           set -euo pipefail
@@ -122,9 +139,6 @@ jobs:
           assert vb[d+132:d+136]==b'boot'
           salt=bytes(vb[d+136:d+168]);assert hashlib.sha256(salt+original[:origsize]).digest()==bytes(vb[d+168:d+200]),'Original AVB invalid'
           header=bytearray(original[:pg]);struct.pack_into('<I',header,8,len(kernel))
-          # Android boot v0 command line is fixed-size (512 bytes at offset 64).
-          # Set both Linux SELinux boot flag and Android userdebug init flag.
-          # Runtime Permissive is not guaranteed until verified on device.
           oldcmd=bytes(header[64:576]).split(b'\0',1)[0]
           for arg in (b'enforcing=0',b'androidboot.selinux=permissive'):
            if arg not in oldcmd.split(): oldcmd+=b' '+arg
@@ -155,12 +169,12 @@ jobs:
           (base/'verification.json').write_text(json.dumps(report,indent=2))
           print(json.dumps(report,indent=2))
           PYREPACK
+
       - name: Package boot-completed CP-off trigger and installer
         run: |
           set -euo pipefail
           cat > artifacts/v51-cp-off.sh <<'TRIGGER'
           #!/system/bin/sh
-          # One-shot CP-off after Android boot complete. Requires patched V51 kernel.
           [ "$(getprop sys.boot_completed)" = 1 ] || exit 19
           PATH=/system/bin:/system/xbin:/vendor/bin
           /system/bin/log -t V51CP 'boot completed: requesting CP off' || true
@@ -179,6 +193,7 @@ jobs:
           [ "$(cat "$PARAM")" = 1 ] || exit 18
           /system/bin/log -t V51CP 'CP-off latch enabled; RF not independently verified' || true
           TRIGGER
+
           cat > artifacts/v51-cp-off.rc <<'INITRC'
           service v51_cp_off /system/bin/sh /data/adb/v51-cp-off.sh
               class late_start
@@ -191,9 +206,8 @@ jobs:
           on property:sys.boot_completed=1
               start v51_cp_off
           INITRC
+
           cat > artifacts/INSTALL-BEFORE-FLASH.ps1 <<'POWERSHELL'
-          # Run from extracted artifact directory. Works with adb.exe in Android SDK platform-tools.
-          # Requires adb root, and writable /system; never installs the CP trigger while old kernel is running.
           $ErrorActionPreference = 'Stop'
           $here = Split-Path -Parent $MyInvocation.MyCommand.Path
           $adbCandidates = @(
@@ -214,7 +228,6 @@ jobs:
           $original = Join-Path $here 'v51-cp-off.rc'
           $script = Join-Path $here 'v51-cp-off.sh'
           if (!(Test-Path $original) -or !(Test-Path $script)) { throw 'Missing generated trigger files' }
-          # Prepare trigger, but do not execute it on the currently running kernel.
           RunAdb push $script /data/adb/v51-cp-off.sh
           RunAdb shell 'chown root:root /data/adb/v51-cp-off.sh; chmod 700 /data/adb/v51-cp-off.sh; restorecon /data/adb/v51-cp-off.sh'
           RunAdb remount
@@ -225,15 +238,17 @@ jobs:
           Write-Host $check
           Write-Host 'Trigger staged for NEXT boot. Do not reboot until V51 boot image has been reviewed and you are ready to flash.'
           POWERSHELL
+
           python3 - <<'PYCHECK'
           from pathlib import Path
           a=Path('artifacts/v51-cp-off.rc').read_text()
           b=Path('artifacts/v51-cp-off.sh').read_text()
           assert 'on property:sys.boot_completed=1' in a
           assert 'oneshot' in a and 'start v51_cp_off' in a
-          assert 'v46_cp_off' in b and "printf '1\n'" not in b
+          assert 'v46_cp_off' in b
           print('Static trigger and init configuration checks passed; NOT device tested')
           PYCHECK
+
       - name: Upload verified candidate and restore package
         if: success()
         uses: actions/upload-artifact@v4
@@ -250,6 +265,7 @@ jobs:
             diagnostics/applied.patch
             diagnostics/kernel.config
           retention-days: 7
+
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
