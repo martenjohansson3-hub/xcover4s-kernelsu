@@ -110,7 +110,7 @@ jobs:
           if not ret:
               raise SystemExit('Could not find return 1 inside enforcing_setup(); refusing an unsafe patch')
           pos = body_start + ret.start()
-          insertion = '\n\t/* V52_FORCE_PERMISSIVE_EARLY: override parsed enforcing= before SELinux init. */\n\tselinux_enforcing_boot = 0;\n\t'
+          insertion = '/* V52_FORCE_PERMISSIVE_EARLY: override parsed enforcing= before SELinux init. */\n\tselinux_enforcing_boot = 0;\n\t'
           s = s[:pos] + insertion + s[pos:]
           p.write_text(s)
 
