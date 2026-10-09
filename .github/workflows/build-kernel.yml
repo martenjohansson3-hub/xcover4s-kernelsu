@@ -1,5 +1,5 @@
 
-name: XCOVER4S V44 FIX AND FULL BUILD
+name: XCOVER4S V45 CP POWER OFF BUILD
 
 on:
   workflow_dispatch:
@@ -18,28 +18,23 @@ jobs:
       KCFLAGS: -Wno-error
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Prepare output
-        run: |
-          mkdir -p dist
-          echo "V44 - NOT FLASH READY" > dist/status.txt
-
-      - name: Install dependencies
+      - name: Dependencies
+        timeout-minutes: 12
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             git make gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            build-essential bc bison flex \
-            libssl-dev libelf-dev \
-            libncurses-dev python3 cpio rsync file
+            binutils-aarch64-linux-gnu build-essential \
+            bc bison flex libssl-dev libelf-dev \
+            libncurses-dev python3 cpio rsync
 
-      - name: Clone pinned kernel
+      - name: Kernel source
         run: |
           set -euo pipefail
+          mkdir -p dist
           git clone --branch lineage-18.1 \
             --single-branch \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
@@ -49,98 +44,163 @@ jobs:
           git -C kernel rev-parse HEAD \
             > dist/source-commit.txt
 
-      - name: Fix display floating point compilation
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(
-              "kernel/drivers/video/fbdev/exynos/"
-              "dpu_7885/decon_reg.c"
-          )
-
-          s = p.read_text()
-          old = "const double decon_clocks_table[][CLK_ID_MAX]"
-          new = "const unsigned long decon_clocks_table[][CLK_ID_MAX]"
-
-          if s.count(old) != 1:
-              raise SystemExit(
-                  "Unexpected display source. Patch aborted."
-              )
-
-          s = s.replace(old, new, 1)
-          p.write_text(s)
-
-          print("Display clock table fixed.")
-          PY
-
-      - name: Apply V42 CP start denial
+      - name: Apply display fix and CP power-off policy
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          p = Path(
-              "kernel/drivers/soc/samsung/cal-if/"
-              "pmucal_cp.c"
+          display = Path(
+              'kernel/drivers/video/fbdev/exynos/'
+              'dpu_7885/decon_reg.c'
           )
-          s = p.read_text()
+          s = display.read_text()
+          old = 'const double decon_clocks_table[][CLK_ID_MAX]'
+          assert s.count(old) == 1, 'display declaration changed'
+          display.write_text(
+              s.replace(
+                  old,
+                  'const unsigned long decon_clocks_table[][CLK_ID_MAX]',
+                  1
+              )
+          )
 
-          for header in (
-              "#include <linux/errno.h>",
-              "#include <linux/printk.h>"
+          pmu = Path(
+              'kernel/drivers/soc/samsung/cal-if/pmucal_cp.c'
+          )
+          s = pmu.read_text()
+
+          for h in (
+              '#include <linux/errno.h>',
+              '#include <linux/printk.h>'
           ):
-              if header not in s:
-                  s = header + "\n" + s
+              if h not in s:
+                  s = h + '\n' + s
+
+          # The original assert sequence requests CP_PWRON=0
+          # and waits for CP OFF.
+          # Never panic if PMU refuses.
+          assert s.count(
+              'panic("cp reset assert fail");'
+          ) == 1
+
+          s = s.replace(
+              'panic("cp reset assert fail");',
+              'pr_err("CPLOCK V45: CP power-off failed\\n");',
+              1
+          )
 
           for name in (
-              "pmucal_cp_init",
-              "pmucal_cp_reset_release"
+              'pmucal_cp_init',
+              'pmucal_cp_reset_release'
           ):
-              pattern = (
-                  r"(int\s+" + re.escape(name) +
-                  r"\s*\(\s*void\s*\)\s*\{\s*"
-                  r"int\s+ret\s*;)"
+              pat = (
+                  r'(int\s+' + name +
+                  r'\s*\(\s*void\s*\)\s*\{\s*int\s+ret\s*;)'
               )
 
-              def patch(match):
-                  return (
-                      match.group(1) +
-                      "\n\t/* CPLOCK_V44 */\n"
-                      '\tpr_warn("CPLOCK V44: denied '
-                      + name + '\\n");\n'
-                      "\treturn -EPERM;\n"
+              def replacement(m):
+                  return m.group(1) + (
+                      '\n\t/* V45: deny CP start */\n'
+                      '\tret = pmucal_cp_status();\n'
+                      '\tif (ret > 0) {\n'
+                      '\t\tret = pmucal_cp_reset_assert();\n'
+                      '\t\tif (ret) pr_err("CPLOCK V45: shutdown failed: %d\\n", ret);\n'
+                      '\t}\n'
+                      '\tpr_warn("CPLOCK V45: denied CP start\\n");\n'
+                      '\treturn -EPERM;\n'
                   )
 
-              s, count = re.subn(
-                  pattern, patch, s, count=1
+              s, n = re.subn(
+                  pat, replacement, s, count=1
+              )
+              assert n == 1, name + ' not found'
+
+          pmu.write_text(s)
+
+          modem = Path(
+              'kernel/drivers/misc/modem_v1/'
+              'modem_ctrl_ss310ap.c'
+          )
+          s = modem.read_text()
+
+          # Keep the driver registered.
+          # Deny CP start/restart/dump.
+          for name in (
+              'ss310ap_on',
+              'ss310ap_reset',
+              'ss310ap_dump_start'
+          ):
+              pat = (
+                  r'(static\s+int\s+' + name +
+                  r'\s*\(\s*struct\s+modem_ctl\s*'
+                  r'\*\s*mc\s*\)\s*\{)'
               )
 
-              if count != 1:
-                  raise SystemExit(
-                      "CP patch failed: " + name
-                  )
+              addition = (
+                  '\n\t/* CPLOCK V45: request CP off */\n'
+                  '\tint cplock_ret = cal_cp_status();\n'
+                  '\tif (cplock_ret > 0) {\n'
+                  '\t\tcplock_ret = cal_cp_reset_assert();\n'
+                  '\t\tif (cplock_ret) mif_err("CPLOCK V45: power-off failed: %d\\n", cplock_ret);\n'
+                  '\t}\n'
+                  '\treturn -EPERM;\n'
+              )
 
-          p.write_text(s)
-          print("CP start denial applied.")
+              s, n = re.subn(
+                  pat,
+                  lambda m: m.group(1) + addition,
+                  s,
+                  count=1
+              )
+              assert n == 1, name + ' not found'
+
+          # Ensure off() requests CP shutdown.
+          pat = (
+              r'(static\s+int\s+ss310ap_off'
+              r'\s*\(\s*struct\s+modem_ctl\s*'
+              r'\*\s*mc\s*\)\s*\{)'
+          )
+
+          addition = (
+              '\n\tint cplock_ret = cal_cp_status();\n'
+              '\tif (cplock_ret > 0) {\n'
+              '\t\tcplock_ret = cal_cp_reset_assert();\n'
+              '\t\tif (cplock_ret) mif_err("CPLOCK V45: power-off failed: %d\\n", cplock_ret);\n'
+              '\t}\n'
+          )
+
+          s, n = re.subn(
+              pat,
+              lambda m: m.group(1) + addition,
+              s,
+              count=1
+          )
+          assert n == 1, 'ss310ap_off not found'
+
+          modem.write_text(s)
+          print('V45 changes applied')
           PY
 
-      - name: Save patch
-        run: |
-          git -C kernel diff > dist/v44.patch
-          test -s dist/v44.patch
+          git -C kernel diff > dist/v45.patch
+          test -s dist/v45.patch
 
-      - name: Configure kernel
+      - name: Configure
         run: |
           set -euo pipefail
           make -C kernel O=out \
             lineage_xcover4s_defconfig \
             2>&1 | tee dist/configure.log
+
           cp kernel/out/.config dist/kernel.config
 
-      - name: Prepare build
+          grep -E \
+            '^CONFIG_(CP_PMUCAL|SEC_MODEM_SS310AP|UMTS_MODEM_SS310AP)=' \
+            dist/kernel.config \
+            | tee dist/selected-config.txt
+
+      - name: Prepare
         run: |
           set -euo pipefail
           make -C kernel O=out -j2 prepare \
@@ -148,57 +208,49 @@ jobs:
           make -C kernel O=out -j2 scripts \
             2>&1 | tee dist/scripts.log
 
-      - name: Fast display compile test
+      - name: Targeted compile tests
         run: |
           set -euo pipefail
+
           make -C kernel O=out -j2 \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
             2>&1 | tee dist/display-test.log
-          echo "DISPLAY PASS" > dist/display-result.txt
 
-      - name: Fast CP compile test
-        run: |
-          set -euo pipefail
           make -C kernel O=out -j2 \
             drivers/soc/samsung/cal-if/pmucal_cp.o \
             2>&1 | tee dist/cp-test.log
-          echo "CP COMPILE PASS" > dist/cp-result.txt
+
+          make -C kernel O=out -j2 \
+            drivers/misc/modem_v1/modem_ctrl_ss310ap.o \
+            2>&1 | tee dist/modem-test.log
 
       - name: Full kernel build
         run: |
           set -euo pipefail
-          echo "Starting full kernel build"
           make -C kernel O=out -j2 Image \
             2>&1 | tee dist/build.log
-          echo "FULL BUILD PASS" > dist/build-result.txt
+          echo 'FULL BUILD PASSED' > dist/result.txt
 
-      - name: Validate kernel Image
+      - name: Verify ARM64 Image
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           import struct
 
           p = Path(
-              "kernel/out/arch/arm64/boot/Image"
+              'kernel/out/arch/arm64/boot/Image'
           )
+          assert p.is_file()
 
-          if not p.is_file():
-              raise SystemExit("Kernel Image missing")
-
-          with p.open("rb") as f:
+          with p.open('rb') as f:
               f.seek(0x38)
-              magic = struct.unpack(
-                  "<I", f.read(4)
-              )[0]
+              assert struct.unpack(
+                  '<I', f.read(4)
+              )[0] == 0x644d5241
 
-          if magic != 0x644D5241:
-              raise SystemExit(
-                  "Invalid ARM64 Image"
-              )
-
-          print("ARM64 kernel Image valid")
-          print("Size:", p.stat().st_size)
+          print('Valid ARM64 Image:', p.stat().st_size)
           PY
 
           cp kernel/out/arch/arm64/boot/Image \
@@ -207,64 +259,39 @@ jobs:
           sha256sum dist/Image \
             > dist/Image.sha256
 
-          cat > dist/status.txt <<'EOF'
-          V44 FULL KERNEL BUILD PASSED
-
-          ARM64 Image: VALID
-          Display compile test: PASSED
-          CP compile test: PASSED
-
-          CP start denial: PATCHED
-          CP physical power off: NOT VERIFIED
-          CP permanent lock: NOT VERIFIED
-          Boot image: NOT CREATED
-          Odin TAR: NOT CREATED
-
-          FLASH READY: NO
-          DO NOT FLASH THE RAW IMAGE.
-          EOF
-
       - name: Collect diagnostics
         if: always()
         run: |
           mkdir -p dist
 
-          for name in \
-            display-test \
-            cp-test \
-            build
-          do
-            if [ -f "dist/$name.log" ]; then
+          for n in display-test cp-test modem-test build; do
+            if [ -f dist/$n.log ]; then
               grep -nEi \
-                'fatal error:|error:|undefined reference|Error [0-9]+' \
-                "dist/$name.log" \
-                > "dist/$name-errors.txt" || true
+                'error:|fatal error:|undefined reference|Error [0-9]+' \
+                dist/$n.log \
+                > dist/$n-errors.txt || true
 
-              tail -100 "dist/$name.log" \
-                > "dist/$name-tail.txt"
+              tail -100 dist/$n.log \
+                > dist/$n-tail.txt
             fi
           done
 
-          if [ -d kernel/.git ]; then
-            git -C kernel diff \
-              > dist/v44.patch || true
-          fi
+          cat > dist/FLASH-STATUS.txt <<'EOF'
+          V45 EXPERIMENTAL CP POWER-OFF KERNEL
 
-          {
-            echo "XCOVER4S V44"
-            echo "Run: $GITHUB_RUN_ID"
-            echo "Flash ready: NO"
-            echo
-            find dist -maxdepth 1 \
-              -type f -printf '%f %s bytes\n'
-          } > dist/diagnostics.txt
+          Compiling successfully does NOT prove CP is off.
+          CP power-off is not verified on hardware.
+          No boot.img or Odin TAR is included.
 
-      - name: Upload V44 results
+          NOT FLASH READY.
+          DO NOT FLASH RAW IMAGE.
+          EOF
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V44-BUILD
+          name: XCOVER4S-V45-CP-POWER-OFF
           path: dist/
-          if-no-files-found: error
           retention-days: 30
-          compression-level: 6
+          if-no-files-found: error
