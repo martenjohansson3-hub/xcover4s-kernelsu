@@ -48,28 +48,34 @@ jobs:
         run: |
           set -euo pipefail
           cat > diagnostics/v51.patch.gz.b64 <<'PATCH64'
-          H4sIAAAAAAAC/+VYbU/bSBD+nPyKKRXISZzEDiENcPTIQaiQeBOFqjqdtHLsdbLFXqe7NlCd+O83u94kTkgoFHTS6SJBYu/s7Mw8
-          z7zY9XodvGYg2C0Vshkz6TfjJKAxuXXNDz8VEZFy03W8ccMv12o1GLxkw/4+1DedTbsLNfXVcmB/vwxleB/QkHEKvYvWwQU5OPpE
-          Ds/P+qXSH8dXllNZtt47PLwslZx7t91tOfgp196zEKXg4Pzs6PgTQbGL0+uD3km5Ru9TKjgMkiSCcZz5XkT8MWGSJGFIIi/1RzSw
-          bhMWVHZRC+UBC8u1MsjUS5kPjKdgHCAJt2QqMj+FiXcRVGMfDfz7ifMBPywEa+XZlYraD+YTs5BQIay1L1vODhxcAIqCEd0FQb9R
-          P2V8mJuA12inSP/ia8r6qQ6//nE8SjglygsKe/D5qnfVJ+dHRyfHZ/2CpKBphsGp9y/6l6fm/kMxDCUVAJTaxZ/GeZaQgN4yn0KV
-          JcGukUG/PLTsVp0WD5J7gnEXeIfcelFGrdODawyKrU2LB/cqDMq2TNqaFe3NLbsDtXb7g+22DSuWIIDu0vRXQCg9A4FSqRB7V8W+
-          Po09DKLEv5Hzhpio476fxrtUWox0aT7MioBACEtiRLU68KTSIkcxGdKUsLGPJw4ZErBSACJi/GYKRRTgBiXsZ0JQnhK1ainLEKTi
-          LjyAzO2M9dY0IQsrVqT2aXS6XYXOltN9Eh1MsfQXk+St8TGmvCVCrwr6ipzBvz1wHScPc2dzW4W503k6CYIs1skj0v9pOUJ7Xp4F
-          ihE5JFOXsH/lltbnOp9M/Kb0YpnxYRNDVGdhcxqsR13vJ8IKVtfehJprt7YUpAgM96MsoPAbmpbdq0aZRXTsCS9ujD4uWc9Ser90
-          BX3giV4p15pV+NLu7EDs8cyLoh8TiCZJ4oXYBKHHA6HqjAYpGzeg2izXDMMO+0eIBTm9vup/tW7bHcUMlVMKSCOiW6hZKjBmVxnw
-          jPZarhleGZQv+71Dcn520Lce61SnPii908MV8AU51Qf8hEtMopEnoIpdxob8huHFDXZ9GhEdWajejAuOLOgaKl1ayyALQyqer2il
-          HEnGsniEutyb5FUDjcereW9sszZcXBvqtQc8NKeKOcAfFMJmw8b8YTacXZ+c2OB0HEfZizPUhD1rM36O1pbcFx7VC5q7H+wPUGtt
-          4/+8HEEV4FLDJ8GBhIPMfJ9K2YDzdETFHZPUBk6Hnp4EkKGJwCAFtKG2Nst1FfkCSzhLJ9xYgCYRbMg4ii2VxkgWJxNtaksXzy13
-          NlZOKjqWV9BkWn26QWaqUl/p1NNJYG0sZMSkii5h7lz11BoyvlLHE0XPLBkyrIpHZc7WJ04yp+TeqWhggJrVag7pTGk+lEFdFVGc
-          6SC/bugId1uKDa7bNXTQTRsVVjQcpbHIy+q6hHW5Y8BHiow8HkSqR/jjup6biCclFZg39HtGuU8bWIVtpaFUyrsUubjEavTVxoEo
-          zLhPiKrReIDHmW+toVVaDRg1occi0+YnZdA4q1YyQeGOpaMkQ+yVghtlCpIV5A+Z0lgXQZh2fzPqPhhSbW9plzdd4zJU3zoH8ogI
-          GlGc+Z6fDMu2LWSFAoTxMFGIrEuroqIMqwOsW5Xr2m4LHcY5vNV5HcjGtlejPNGzALMaRwxmuRHCU9FHZD2Fomr3yi61C9ugUbIa
-          7J8Vi6Uw/Rerxrwjb10+8kdA4qN2gUVk9lCo7+QvALa7aiBqt/Erpxim5s4MgByUBzPV9EAiqyLMYcFwdExCcCFFr4Y4fME4uaOi
-          HiR3vIGZ6HucI+i5EzrDdXDnppzXTxELqCO3sYoEu4tMKCJxg7rSBNcsrd/Bbj3dWKSFyrJHAM+IlYuYffPaldzI1
-          4N8lozPjYdH/RfLlddsqGvFOSW5sPGpEVgX29sApOPrYXPXwKjJqtNEIa8VE5XyAUBDjc74QnJeQ/o0GyMVJWPp8LFBnaE32X/Q+
-          9cnn4z/7NqytZ7pyL3H8d0yGHXDyYfkFDzGjlzzEjPLpqq2mK/yf90HzUm2+RhrIzLu05TJzDHiG5FzF3X3Z27zleosl6nkWfF8Q
-          Lv8DRPFCtCoVAAA=
+          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
           PATCH64
           base64 -d diagnostics/v51.patch.gz.b64 | gzip -dc > diagnostics/v51.patch
           echo '7f0ebd23cea817b2048a9bc9ceb4483827b83112b7710aa496ee959fa36bc0d8  diagnostics/v51.patch' | sha256sum -c -
