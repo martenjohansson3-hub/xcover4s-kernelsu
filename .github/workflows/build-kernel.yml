@@ -1,5 +1,5 @@
 
-name: XCOVER4S V54 EARLY SELINUX AND CP DIAGNOSTIC BUILD
+name: XCOVER4S V55 SELINUX PERMISSIVE AND CP HARD OFF EXPERIMENT
 
 on:
   workflow_dispatch:
@@ -86,6 +86,33 @@ jobs:
           git diff > ../diagnostics/applied.patch
           grep -q 'V51: CP-off latch blocks ss310ap_reset' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
           grep -q 'V51: CP-off latch blocks ss310ap_boot_on' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+
+      - name: V55 force CP reset assert at PMUCAL init
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCP'
+          from pathlib import Path
+          p=Path('kernel/drivers/soc/samsung/cal-if/pmucal_cp.c')
+          s=p.read_text()
+          old='    ret = v46_original_pmucal_cp_init();\n    mutex_unlock(&v46_cp_lock);\n    return ret;'
+          new='''    ret = v46_original_pmucal_cp_init();
+              if (!ret) {
+                  int off_ret = pmucal_cp_reset_assert();
+                  if (!off_ret && pmucal_cp_status() == 0) {
+                      WRITE_ONCE(v46_cp_off_latched, true);
+                      pr_warn("V55 CP HARD OFF latched at PMUCAL init\\n");
+                  } else {
+                      pr_err("V55 CP HARD OFF failed: reset=%d status=%d\\n",
+                             off_ret, pmucal_cp_status());
+                      ret = off_ret ? off_ret : -EIO;
+                  }
+              }
+              mutex_unlock(&v46_cp_lock);
+              return ret;'''
+          assert s.count(old)==1, 'V55: PMUCAL init source mismatch'
+          p.write_text(s.replace(old,new))
+          PYCP
+          git -C kernel diff --check
 
       - name: V54 SELinux early boot and init enforcement guard
         run: |
@@ -245,9 +272,9 @@ jobs:
           assert check[pg:pg+len(kernel)]==kernel
           assert check[576:596]==h.digest()
           assert hashlib.sha256(salt+check[:len(payload)]).digest()==check[new_vbo+d+168:new_vbo+d+200]
-          with tarfile.open(base/'XCOVER4S-V54-SELINUX-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
-          with tarfile.open(base/'XCOVER4S-V54-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
-          with tarfile.open(base/'XCOVER4S-V54-SELINUX-ODIN-UNTESTED.tar') as t:
+          with tarfile.open(base/'XCOVER4S-V55-SELINUX-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
+          with tarfile.open(base/'XCOVER4S-V55-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
+          with tarfile.open(base/'XCOVER4S-V55-SELINUX-ODIN-UNTESTED.tar') as t:
            members=t.getmembers();assert len(members)==1 and members[0].name=='boot.img' and t.extractfile(members[0]).read()==check
           report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False, 'selinux_boot_target':'Permissive requested and selinuxfs runtime assignment patched; device test required'}
           (base/'verification.json').write_text(json.dumps(report,indent=2))
@@ -337,11 +364,11 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V54-SELINUX-CANDIDATE-UNTESTED
+          name: XCOVER4S-V55-SELINUX-CANDIDATE-UNTESTED
           path: |
             artifacts/boot.img
-            artifacts/XCOVER4S-V54-SELINUX-ODIN-UNTESTED.tar
-            artifacts/XCOVER4S-V54-ORIGINAL-RESTORE.tar
+            artifacts/XCOVER4S-V55-SELINUX-ODIN-UNTESTED.tar
+            artifacts/XCOVER4S-V55-ORIGINAL-RESTORE.tar
             artifacts/verification.json
             artifacts/v51-cp-off.sh
             artifacts/v51-cp-off.rc
@@ -354,6 +381,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V54-FAILED-DIAGNOSTICS
+          name: XCOVER4S-V55-FAILED-DIAGNOSTICS
           path: diagnostics/
           if-no-files-found: warn
