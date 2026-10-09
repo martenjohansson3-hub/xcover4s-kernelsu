@@ -110,13 +110,16 @@ jobs:
           if not ret:
               raise SystemExit('Could not find return 1 inside enforcing_setup(); refusing an unsafe patch')
           pos = body_start + ret.start()
-          insertion = '/* V52_FORCE_PERMISSIVE_EARLY: override parsed enforcing= before SELinux init. */\n\tselinux_enforcing_boot = 0;\n\t'
-          s = s[:pos] + insertion + s[pos:]
+          line_start = s.rfind('\n', 0, pos) + 1
+          if s[line_start:pos].strip():
+              raise SystemExit('Unexpected code before return 1; refusing unsafe patch')
+          insertion = '\t/* V52_FORCE_PERMISSIVE_EARLY: override parsed enforcing= before SELinux init. */\n\tselinux_enforcing = 0;\n'
+          s = s[:line_start] + insertion + s[line_start:]
           p.write_text(s)
 
           check = p.read_text()
           assert check.count('V52_FORCE_PERMISSIVE_EARLY') == 1
-          assert 'selinux_enforcing_boot = 0;' in check[body_start:body_start+800]
+          assert 'selinux_enforcing = 0;' in check[body_start:body_start+800]
           print('Patched enforcing_setup() to set the early SELinux boot mode to Permissive.')
           PYPATCH
           grep -n -A12 'enforcing_setup' kernel/security/selinux/hooks.c | head -n 24
