@@ -87,31 +87,41 @@ jobs:
           grep -q 'V51: CP-off latch blocks ss310ap_reset' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
           grep -q 'V51: CP-off latch blocks ss310ap_boot_on' drivers/misc/modem_v1/modem_ctrl_ss310ap.c
 
-      - name: V52 force SELinux Permissive inside kernel
+      - name: V52 force SELinux Permissive at earliest boot parameter parsing
         run: |
           set -euo pipefail
           python3 - <<'PYPATCH'
           from pathlib import Path
           import re
-          p = Path('kernel/security/selinux/ss/services.c')
+
+          p = Path('kernel/security/selinux/hooks.c')
           s = p.read_text()
-          pattern = r'(int\s+security_setenforce\s*\(\s*int\s+enforcing\s*\)\s*\{)'
+
+          # On this Android kernel family, enforcing_setup() parses enforcing=.
+          # Force its boot value to 0 at parameter parsing, before SELinux init.
+          pattern = r'(static\s+int\s+__init\s+enforcing_setup\s*\(\s*char\s*\*\s*\w+\s*\)\s*\{)'
           matches = list(re.finditer(pattern, s))
           if len(matches) != 1:
-              raise SystemExit('Expected exactly one security_setenforce(int enforcing) in services.c; refusing an unsafe patch')
-          pos = matches[0].end()
-          if 'V52_FORCE_PERMISSIVE' in s:
-              raise SystemExit('V52 SELinux patch appears already applied')
-          s = s[:pos] + '\n\t/* V52_FORCE_PERMISSIVE: ignore requests to enable enforcing mode. */\n\tenforcing = 0;\n' + s[pos:]
+              raise SystemExit('Expected exactly one enforcing_setup(char *) in hooks.c; refusing an unsafe patch')
+          if 'V52_FORCE_PERMISSIVE_EARLY' in s:
+              raise SystemExit('V52 early SELinux patch already appears present')
+          body_start = matches[0].end()
+          ret = re.search(r'\breturn\s+1\s*;', s[body_start:])
+          if not ret:
+              raise SystemExit('Could not find return 1 inside enforcing_setup(); refusing an unsafe patch')
+          pos = body_start + ret.start()
+          insertion = '\n\t/* V52_FORCE_PERMISSIVE_EARLY: override parsed enforcing= before SELinux init. */\n\tselinux_enforcing_boot = 0;\n\t'
+          s = s[:pos] + insertion + s[pos:]
           p.write_text(s)
+
           check = p.read_text()
-          assert check.count('V52_FORCE_PERMISSIVE') == 1
-          assert 'enforcing = 0;' in check[matches[0].start():matches[0].start()+500]
-          print('Patched security_setenforce(): requests to enable Enforcing are forced to Permissive.')
+          assert check.count('V52_FORCE_PERMISSIVE_EARLY') == 1
+          assert 'selinux_enforcing_boot = 0;' in check[body_start:body_start+800]
+          print('Patched enforcing_setup() to set the early SELinux boot mode to Permissive.')
           PYPATCH
-          grep -n -A8 'security_setenforce' kernel/security/selinux/ss/services.c | head -n 20
+          grep -n -A12 'enforcing_setup' kernel/security/selinux/hooks.c | head -n 24
           git -C kernel diff --check
-          git -C kernel diff -- security/selinux/ss/services.c > diagnostics/v52-selinux-only.patch
+          git -C kernel diff -- security/selinux/hooks.c > diagnostics/v52-selinux-only.patch
           test -s diagnostics/v52-selinux-only.patch
 
       - name: Configure kernel
@@ -149,7 +159,7 @@ jobs:
           import struct,hashlib,json,tarfile
           base=Path('artifacts'); original=Path('boot-original.img').read_bytes(); kernel=(base/'Image').read_bytes()
           sha=lambda b:hashlib.sha256(b).hexdigest()
-          assert len(original)==37748736, 'Unexpected boot partition size'
+          assert len(original)==37748736, 'Unexpected original boot partition size'
           assert sha(original)=='f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9', 'Wrong original boot backup'
           assert original[:8]==b'ANDROID!' and original[-64:-60]==b'AVBf'
           u32=lambda off:struct.unpack_from('<I',original,off)[0]
@@ -170,38 +180,37 @@ jobs:
           assert vb[d+24:d+30]==b'sha256'
           assert struct.unpack_from('>III',vb,d+56)==(4,32,32)
           assert vb[d+132:d+136]==b'boot'
-          salt=bytes(vb[d+136:d+168])
-          assert hashlib.sha256(salt+original[:origsize]).digest()==bytes(vb[d+168:d+200]), 'Original AVB invalid'
+          salt=bytes(vb[d+136:d+168]);assert hashlib.sha256(salt+original[:origsize]).digest()==bytes(vb[d+168:d+200]),'Original AVB invalid'
           header=bytearray(original[:pg]);struct.pack_into('<I',header,8,len(kernel))
           oldcmd=bytes(header[64:576]).split(b'\0',1)[0]
-          for arg in (b'enforcing=0',b'androidboot.selinux=permissive'):
+          # V52 SELinux-only change: request Permissive at boot and force security_setenforce() requests to remain Permissive; runtime must be verified.
+          # Keep the V51 modem patch, ramdisk, Rootbroker and modem trigger unchanged.
+          for arg in (b'enforcing=0', b'androidboot.selinux=permissive'):
            if arg not in oldcmd.split(): oldcmd+=b' '+arg
           assert len(oldcmd)<512, 'Boot cmdline too long'
           header[64:576]=oldcmd+b'\0'*(512-len(oldcmd))
           assert b'androidboot.selinux=permissive' in oldcmd and b'enforcing=0' in oldcmd
+
           h=hashlib.sha1()
-          for data in (kernel,ramdisk,second,dtb):
-           h.update(data);h.update(struct.pack('<I',len(data)))
+          for data in (kernel,ramdisk,second,dtb):h.update(data);h.update(struct.pack('<I',len(data)))
           header[576:608]=h.digest()+b'\0'*12
           payload=bytes(header)+kernel+b'\0'*(align(len(kernel))-len(kernel))+ramdisk+b'\0'*(align(rs)-rs)+second+b'\0'*(align(ss)-ss)+dtb+b'\0'*(align(dt)-dt)
           assert len(payload)%pg==0
           struct.pack_into('>Q',vb,d+16,len(payload));vb[d+168:d+200]=hashlib.sha256(salt+payload).digest()
           new_vbo=(len(payload)+63)//64*64
-          assert new_vbo+vbs<len(original)-64, 'New kernel does not fit boot partition'
+          assert new_vbo+vbs<len(original)-64,'New kernel does not fit boot partition'
           out=bytearray(len(original));out[:len(payload)]=payload;out[new_vbo:new_vbo+vbs]=vb
           footer=bytearray(original[-64:]);struct.pack_into('>QQQ',footer,12,len(payload),new_vbo,vbs);out[-64:]=footer
           candidate=base/'boot.img';candidate.write_bytes(out)
-          check=candidate.read_bytes();nro=pg+align(len(kernel))
-          assert check[nro:nro+rs]==ramdisk, 'Ramdisk changed'
+          check=candidate.read_bytes();nro=pg+align(len(kernel));assert check[nro:nro+rs]==ramdisk,'Ramdisk changed'
           assert check[pg:pg+len(kernel)]==kernel
           assert check[576:596]==h.digest()
           assert hashlib.sha256(salt+check[:len(payload)]).digest()==check[new_vbo+d+168:new_vbo+d+200]
           with tarfile.open(base/'XCOVER4S-V52-PERMISSIVE-ODIN-UNTESTED.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add(candidate,arcname='boot.img')
           with tarfile.open(base/'XCOVER4S-V52-ORIGINAL-RESTORE.tar','w',format=tarfile.USTAR_FORMAT) as t:t.add('boot-original.img',arcname='boot.img')
           with tarfile.open(base/'XCOVER4S-V52-PERMISSIVE-ODIN-UNTESTED.tar') as t:
-           members=t.getmembers()
-           assert len(members)==1 and members[0].name=='boot.img' and t.extractfile(members[0]).read()==check
-          report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False,'selinux_boot_target':'Permissive requested; device test required'}
+           members=t.getmembers();assert len(members)==1 and members[0].name=='boot.img' and t.extractfile(members[0]).read()==check
+          report={'status':'STRUCTURALLY_VERIFIED_NOT_DEVICE_TESTED','original_sha256':sha(original),'candidate_sha256':sha(check),'kernel_sha256':sha(kernel),'ramdisk_sha256':sha(ramdisk),'avb_algorithm':'NONE','original_avb_hash_valid':True,'candidate_avb_hash_valid':True,'header_sha1_valid':True,'cp_off_manual_only':False,'trigger_installer_in_artifact':True,'trigger_install_required_before_flash':True,'trigger_device_tested':False,'runtime_rf_silence_verified':False,'selinux_boot_cmdline':oldcmd.decode('ascii'),'selinux_permissive_runtime_verified':False, 'selinux_boot_target':'Permissive requested and kernel setter forced; device test required'}
           (base/'verification.json').write_text(json.dumps(report,indent=2))
           print(json.dumps(report,indent=2))
           PYREPACK
@@ -209,11 +218,11 @@ jobs:
       - name: Package boot-completed CP-off trigger and installer
         run: |
           set -euo pipefail
-          cat > artifacts/v52-cp-off.sh <<'TRIGGER'
+          cat > artifacts/v51-cp-off.sh <<'TRIGGER'
           #!/system/bin/sh
           [ "$(getprop sys.boot_completed)" = 1 ] || exit 19
           PATH=/system/bin:/system/xbin:/vendor/bin
-          /system/bin/log -t V52CP 'boot completed: requesting CP off' || true
+          /system/bin/log -t V51CP 'boot completed: requesting CP off' || true
           PARAM=''
           for P in /sys/module/*/parameters/v46_cp_off; do
             [ -e "$P" ] || continue
@@ -227,11 +236,11 @@ jobs:
           [ "$STATE" = 0 ] || exit 16
           printf '1\n' > "$PARAM" || exit 17
           [ "$(cat "$PARAM")" = 1 ] || exit 18
-          /system/bin/log -t V52CP 'CP-off latch enabled; RF not independently verified' || true
+          /system/bin/log -t V51CP 'CP-off latch enabled; RF not independently verified' || true
           TRIGGER
 
-          cat > artifacts/v52-cp-off.rc <<'INITRC'
-          service v52_cp_off /system/bin/sh /data/adb/v52-cp-off.sh
+          cat > artifacts/v51-cp-off.rc <<'INITRC'
+          service v51_cp_off /system/bin/sh /data/adb/v51-cp-off.sh
               class late_start
               user root
               group root
@@ -240,7 +249,7 @@ jobs:
               oneshot
 
           on property:sys.boot_completed=1
-              start v52_cp_off
+              start v51_cp_off
           INITRC
 
           cat > artifacts/INSTALL-BEFORE-FLASH.ps1 <<'POWERSHELL'
@@ -261,15 +270,15 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $id -notmatch 'uid=0\(root\)') { throw 'ADB root required' }
           $state = (& $adb shell 'getprop sys.boot_completed').Trim()
           if ($state -ne '1') { throw 'Android has not finished booting' }
-          $original = Join-Path $here 'v52-cp-off.rc'
-          $script = Join-Path $here 'v52-cp-off.sh'
+          $original = Join-Path $here 'v51-cp-off.rc'
+          $script = Join-Path $here 'v51-cp-off.sh'
           if (!(Test-Path $original) -or !(Test-Path $script)) { throw 'Missing generated trigger files' }
-          RunAdb push $script /data/adb/v52-cp-off.sh
-          RunAdb shell 'chown root:root /data/adb/v52-cp-off.sh; chmod 700 /data/adb/v52-cp-off.sh; restorecon /data/adb/v52-cp-off.sh'
+          RunAdb push $script /data/adb/v51-cp-off.sh
+          RunAdb shell 'chown root:root /data/adb/v51-cp-off.sh; chmod 700 /data/adb/v51-cp-off.sh; restorecon /data/adb/v51-cp-off.sh'
           RunAdb remount
-          RunAdb push $original /system/etc/init/v52-cp-off.rc
-          RunAdb shell 'chown root:root /system/etc/init/v52-cp-off.rc; chmod 644 /system/etc/init/v52-cp-off.rc; restorecon /system/etc/init/v52-cp-off.rc; sync'
-          $check = (& $adb shell 'ls -lZ /system/etc/init/v52-cp-off.rc /data/adb/v52-cp-off.sh')
+          RunAdb push $original /system/etc/init/v51-cp-off.rc
+          RunAdb shell 'chown root:root /system/etc/init/v51-cp-off.rc; chmod 644 /system/etc/init/v51-cp-off.rc; restorecon /system/etc/init/v51-cp-off.rc; sync'
+          $check = (& $adb shell 'ls -lZ /system/etc/init/v51-cp-off.rc /data/adb/v51-cp-off.sh')
           if ($LASTEXITCODE -ne 0) { throw 'Installed files cannot be read' }
           Write-Host $check
           Write-Host 'Trigger staged for NEXT boot. Do not reboot until V52 boot image has been reviewed and you are ready to flash.'
@@ -277,10 +286,10 @@ jobs:
 
           python3 - <<'PYCHECK'
           from pathlib import Path
-          a=Path('artifacts/v52-cp-off.rc').read_text()
-          b=Path('artifacts/v52-cp-off.sh').read_text()
+          a=Path('artifacts/v51-cp-off.rc').read_text()
+          b=Path('artifacts/v51-cp-off.sh').read_text()
           assert 'on property:sys.boot_completed=1' in a
-          assert 'oneshot' in a and 'start v52_cp_off' in a
+          assert 'oneshot' in a and 'start v51_cp_off' in a
           assert 'v46_cp_off' in b
           print('Static trigger and init configuration checks passed; NOT device tested')
           PYCHECK
@@ -295,8 +304,8 @@ jobs:
             artifacts/XCOVER4S-V52-PERMISSIVE-ODIN-UNTESTED.tar
             artifacts/XCOVER4S-V52-ORIGINAL-RESTORE.tar
             artifacts/verification.json
-            artifacts/v52-cp-off.sh
-            artifacts/v52-cp-off.rc
+            artifacts/v51-cp-off.sh
+            artifacts/v51-cp-off.rc
             artifacts/INSTALL-BEFORE-FLASH.ps1
             diagnostics/applied.patch
             diagnostics/kernel.config
