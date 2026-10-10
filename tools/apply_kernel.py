@@ -3,12 +3,14 @@
 """
 XCover4s V64 - experimental CP software latch.
 
-Patches:
-  drivers/soc/samsung/cal-if/pmucal_cp.c
-  drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+Targets:
+  kernel/drivers/soc/samsung/cal-if/pmucal_cp.c
+  kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c
 
-This is an experimental software latch, not a verified
-physical modem power cutoff.
+No KernelSU, Magisk, or SELinux changes.
+
+Experimental only. This does not prove physical modem
+power isolation or complete protection against restart.
 """
 
 from pathlib import Path
@@ -18,28 +20,26 @@ ROOT = Path("kernel")
 CP = ROOT / "drivers/soc/samsung/cal-if/pmucal_cp.c"
 MODEM = ROOT / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
 
+MARKER = "V64_CP_LATCH_PATCH"
+
 
 def fail(message):
     raise SystemExit("V64 PATCH ERROR: " + message)
 
 
-def replace_one(source, old, new, label):
-    count = source.count(old)
-    if count != 1:
-        fail(f"{label}: expected one match, found {count}")
-    return source.replace(old, new, 1)
+def insert_at_entry(source, name, signature, insertion,
+                    static=None):
+    """Insert code immediately after one C function's opening brace."""
 
-
-def wrap_function(source, name, signature, static=False):
-    """
-    Rename the original function and install a wrapper.
-    Only exact function signatures are accepted.
-    """
-
-    storage = r"static\s+" if static else ""
+    if static is True:
+        storage = r"static\s+"
+    elif static is False:
+        storage = r""
+    else:
+        storage = r"(?:static\s+)?"
 
     pattern = re.compile(
-        r"(?m)^"
+        r"(?m)^[ \t]*"
         + storage
         + r"int\s+"
         + re.escape(name)
@@ -52,199 +52,104 @@ def wrap_function(source, name, signature, static=False):
 
     if len(matches) != 1:
         fail(
-            f"{name}: expected one function definition, "
+            f"{name}: expected exactly one definition; "
             f"found {len(matches)}"
         )
 
-    match = matches[0]
-
-    # Find the matching closing brace, ignoring braces
-    # inside comments and string literals.
-    start = match.end() - 1
-    depth = 0
-    end = None
-    state = "normal"
-    i = start
-
-    while i < len(source):
-        c = source[i]
-        nxt = source[i + 1] if i + 1 < len(source) else ""
-
-        if state == "line_comment":
-            if c == "\n":
-                state = "normal"
-
-        elif state == "block_comment":
-            if c == "*" and nxt == "/":
-                state = "normal"
-                i += 1
-
-        elif state == "string":
-            if c == "\\":
-                i += 1
-            elif c == '"':
-                state = "normal"
-
-        elif state == "char":
-            if c == "\\":
-                i += 1
-            elif c == "'":
-                state = "normal"
-
-        else:
-            if c == "/" and nxt == "/":
-                state = "line_comment"
-                i += 1
-            elif c == "/" and nxt == "*":
-                state = "block_comment"
-                i += 1
-            elif c == '"':
-                state = "string"
-            elif c == "'":
-                state = "char"
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-
-        i += 1
-
-    if end is None:
-        fail(f"{name}: closing brace not found")
-
-    original = source[match.start():end]
-
-    renamed = re.sub(
-        r"\b" + re.escape(name) + r"\b",
-        "v64_original_" + name,
-        original,
-        count=1,
-    )
-
-    args = "" if signature == "void" else "mc"
-    qualifier = "static " if static else ""
-
-    wrapper = f"""
-{qualifier}int {name}({signature})
-{{
-    int cookie;
-    int ret;
-
-    cookie = v64_cp_read_enter();
-
-    if (cookie < 0)
-        return cookie;
-
-    ret = v64_original_{name}({args});
-
-    v64_cp_read_leave(cookie);
-
-    return ret;
-}}
-"""
+    position = matches[0].end()
 
     return (
-        source[:match.start()]
-        + renamed
+        source[:position]
         + "\n"
-        + wrapper
-        + source[end:]
+        + insertion
+        + "\n"
+        + source[position:]
     )
 
 
 def main():
     for path in (CP, MODEM):
         if not path.is_file():
-            fail(f"missing kernel source: {path}")
+            fail(f"Missing source: {path}")
 
     cp = CP.read_text()
     modem = MODEM.read_text()
 
-    if "v64_cp_latched" in cp:
-        fail("CP source already patched")
+    if MARKER in cp or MARKER in modem:
+        fail("V64 patch already applied")
 
-    if "v64_cp_read_enter" in modem:
-        fail("modem source already patched")
-
-    # Kernel headers and declarations.
-    cp = """#include <linux/srcu.h>
-#include <linux/mutex.h>
+    # Provide declarations before the existing source.
+    cp = """/* V64_CP_LATCH_PATCH */
+#include <linux/atomic.h>
 #include <linux/errno.h>
+#include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
-#include <linux/init.h>
 
-int v64_cp_read_enter(void);
-void v64_cp_read_leave(int cookie);
+int v64_cp_is_locked(void);
 
 """ + cp
 
-    # Wrap selected low-level CP functions.
+    # The low-level CP start/release functions must refuse
+    # activation once the software latch has been set.
     for name in (
         "pmucal_cp_init",
         "pmucal_cp_reset_release",
     ):
-        cp = wrap_function(
+        cp = insert_at_entry(
             cp,
             name,
             "void",
+            """
+    if (v64_cp_is_locked())
+        return -EPERM;
+""",
+            static=False,
         )
 
-    # Modem controller declarations.
-    modem = """/* V64 CP latch hooks */
-extern int v64_cp_read_enter(void);
-extern void v64_cp_read_leave(int cookie);
+    # Make the lock state available to the modem driver.
+    modem = """/* V64_CP_LATCH_PATCH */
+#include <linux/errno.h>
+
+extern int v64_cp_is_locked(void);
 
 """ + modem
 
-    # Wrap selected Samsung modem controller functions.
+    # Samsung's modem controller functions all have the
+    # signatures confirmed in modem_ctrl_ss310ap.c.
+    #
+    # No renaming or brace matching is required.
     for name in (
         "ss310ap_on",
         "ss310ap_reset",
         "ss310ap_boot_on",
         "ss310ap_dump_start",
     ):
-        modem = wrap_function(
+        modem = insert_at_entry(
             modem,
             name,
             "struct modem_ctl *mc",
+            """
+    if (v64_cp_is_locked())
+        return -EPERM;
+""",
             static=True,
         )
 
-    # Software latch and sysfs interface.
-    # DEFINE_SRCU already expands with static storage
-    # in this kernel. Do NOT prefix it with static.
+    # A one-way software latch. The state can only be
+    # cleared by a fresh kernel boot.
+    #
+    # This is not a hardware-enforced power switch.
     cp += r"""
 
-/* V64 CP software latch */
-DEFINE_SRCU(v64_cp_srcu);
-
-static DEFINE_MUTEX(v64_cp_set_mutex);
-
-static int v64_cp_latched;
+/* V64 CP latch state */
+static atomic_t v64_cp_latched = ATOMIC_INIT(0);
 static int v64_cp_result = -EAGAIN;
 
-int v64_cp_read_enter(void)
+int v64_cp_is_locked(void)
 {
-    int cookie;
-
-    cookie = srcu_read_lock(&v64_cp_srcu);
-
-    if (READ_ONCE(v64_cp_latched)) {
-        srcu_read_unlock(&v64_cp_srcu, cookie);
-        return -EPERM;
-    }
-
-    return cookie;
-}
-
-void v64_cp_read_leave(int cookie)
-{
-    srcu_read_unlock(&v64_cp_srcu, cookie);
+    return atomic_read(&v64_cp_latched) != 0;
 }
 
 static ssize_t v64_hard_off_lock_show(
@@ -256,7 +161,7 @@ static ssize_t v64_hard_off_lock_show(
         buf,
         PAGE_SIZE,
         "%d\n",
-        READ_ONCE(v64_cp_latched)
+        v64_cp_is_locked()
     );
 }
 
@@ -286,22 +191,17 @@ static ssize_t v64_hard_off_lock_store(
         buf[1] != '\n')
         return -EINVAL;
 
-    mutex_lock(&v64_cp_set_mutex);
-
-    if (READ_ONCE(v64_cp_latched)) {
-        mutex_unlock(&v64_cp_set_mutex);
+    if (atomic_cmpxchg(
+            &v64_cp_latched, 0, 1) != 0)
         return -EPERM;
-    }
 
-    WRITE_ONCE(v64_cp_latched, 1);
-
-    synchronize_srcu(&v64_cp_srcu);
-
+    /*
+     * Attempt to assert CP reset.
+     * This does not establish physical power removal.
+     */
     ret = pmucal_cp_reset_assert();
 
     WRITE_ONCE(v64_cp_result, ret);
-
-    mutex_unlock(&v64_cp_set_mutex);
 
     return ret ? ret : count;
 }
@@ -355,22 +255,19 @@ static int __init v64_cp_sysfs_init(void)
 late_initcall(v64_cp_sysfs_init);
 """
 
-    # Validate generated declarations.
-    if re.search(
-        r"\bstatic\s+DEFINE_SRCU\s*\(",
-        cp,
-    ):
-        fail("duplicate static in SRCU declaration")
-
-    if cp.count("DEFINE_SRCU(v64_cp_srcu);") != 1:
-        fail("incorrect SRCU declaration count")
+    # Verify the generated patch before writing either file.
+    if "static DEFINE_SRCU" in cp:
+        fail("Unexpected duplicate-static SRCU declaration")
 
     for name in (
         "pmucal_cp_init",
         "pmucal_cp_reset_release",
     ):
-        if f"v64_original_{name}" not in cp:
-            fail(f"missing CP wrapper: {name}")
+        if not re.search(
+            r"\bint\s+" + name + r"\s*\(",
+            cp,
+        ):
+            fail(f"Missing CP function: {name}")
 
     for name in (
         "ss310ap_on",
@@ -378,16 +275,26 @@ late_initcall(v64_cp_sysfs_init);
         "ss310ap_boot_on",
         "ss310ap_dump_start",
     ):
-        if f"v64_original_{name}" not in modem:
-            fail(f"missing modem wrapper: {name}")
+        if not re.search(
+            r"\bstatic\s+int\s+" + name + r"\s*\(",
+            modem,
+        ):
+            fail(f"Missing modem function: {name}")
 
-    # Write files only after validation.
+    if cp.count(MARKER) != 1:
+        fail("Invalid CP patch marker")
+
+    if modem.count(MARKER) != 1:
+        fail("Invalid modem patch marker")
+
+    # Commit both changes only after all checks pass.
     CP.write_text(cp)
     MODEM.write_text(modem)
 
-    print("PASS: V64 CP patch applied")
-    print("PASS: SRCU declaration verified")
-    print("PASS: modem wrappers generated")
+    print("PASS: V64 CP patch generated")
+    print("PASS: modem entry guards inserted")
+    print("PASS: no function-body brace parsing")
+    print("PASS: no duplicate-static SRCU")
     print("SELinux unchanged")
     print("CP source:", CP)
     print("Modem source:", MODEM)
