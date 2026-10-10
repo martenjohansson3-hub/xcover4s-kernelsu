@@ -1,4 +1,4 @@
-name: XCOVER4S V59 EARLY CP HARD OFF
+name: XCOVER4S V60 - SELinux Permissive + Root CP Control
 
 on:
   workflow_dispatch:
@@ -11,141 +11,406 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
 
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: xcover4s
+      KBUILD_BUILD_HOST: github
+      KCFLAGS: -Wno-error
+
     steps:
-      - name: Install dependencies
-        shell: bash
+      - name: Install build dependencies
         run: |
           set -euo pipefail
 
           sudo apt-get update
-          sudo apt-get install -y \
-            git make bc bison flex \
-            libssl-dev libelf-dev \
-            clang lld gcc-aarch64-linux-gnu \
-            python3 zip gzip
 
-      - name: Download kernel source
-        shell: bash
+          sudo apt-get install -y \
+            git \
+            python3 \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            clang \
+            lld \
+            llvm \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            make \
+            cpio \
+            xz-utils \
+            zip \
+            unzip
+
+      - name: Download original kernel source
         run: |
           set -euo pipefail
 
-          git clone --branch lineage-18.1 \
+          git clone \
+            --depth 1 \
+            --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
           cd kernel
 
-          git checkout \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git rev-parse HEAD
 
-          git rev-parse HEAD > ../source-commit.txt
+          test -f drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+          test -f security/selinux/hooks.c
+          test -f arch/arm64/configs/lineage_xcover4s_defconfig
 
-      - name: Apply embedded V55 modem patch
-        shell: bash
+      - name: Patch SELinux permissive and CP control
         run: |
           set -euo pipefail
 
-          cat > /tmp/v55.gz.b64 <<'PATCH'
-          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
-          f1dRUmEYAAA=
-          PATCH
-
-          base64 -d /tmp/v55.gz.b64 \
-            | gzip -d > /tmp/v55.patch
-
-          cd kernel
-
-          git apply --check /tmp/v55.patch
-          git apply /tmp/v55.patch
-          git diff --check
-
-      - name: V59 early CP shutdown
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PYCP'
+          python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          p = Path(
-              'kernel/drivers/soc/samsung/cal-if/pmucal_cp.c'
+          root = Path("kernel")
+
+          # ------------------------------------------------
+          # SELinux: permissive kernel default
+          # ------------------------------------------------
+
+          hooks = root / "security/selinux/hooks.c"
+          s = hooks.read_text()
+
+          pattern = r'(?m)^int selinux_enforcing;\s*$'
+
+          matches = re.findall(pattern, s)
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "V60: unexpected SELinux layout"
+              )
+
+          s = re.sub(
+              pattern,
+              "int selinux_enforcing = 0;",
+              s,
+              count=1
           )
 
+          hooks.write_text(s)
+
+          # ------------------------------------------------
+          # Samsung SS310AP modem control
+          # ------------------------------------------------
+
+          p = root / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
           s = p.read_text()
 
           required = [
-              'v46_cp_off_set',
-              'v46_cp_off_latched',
-              'pmucal_cp_reset_assert',
-              'pmucal_cp_reset_release'
+              "static struct modem_ctl *g_mc;",
+              "static int ss310ap_on(",
+              "static int ss310ap_off(",
+              "static int ss310ap_boot_on(",
+              "cal_cp_status()",
           ]
 
-          for symbol in required:
-              if symbol not in s:
+          for item in required:
+              if item not in s:
                   raise SystemExit(
-                      'Missing CP symbol: ' + symbol
+                      "V60: missing modem symbol: " + item
                   )
 
-          if '#include <linux/init.h>' not in s:
-              s = '#include <linux/init.h>\n' + s
+          # ------------------------------------------------
+          # New root-only sysfs interface
+          #
+          # /sys/kernel/cp_control/status
+          # /sys/kernel/cp_control/off
+          # /sys/kernel/cp_control/lock
+          #
+          # lock=1 prevents the normal ss310ap_on
+          # and ss310ap_boot_on entry points.
+          #
+          # This is NOT a verified hardware power latch.
+          # ------------------------------------------------
 
-          if 'v59_cp_off_init' in s:
-              raise SystemExit('V59 already applied')
+          anchor = "static struct modem_ctl *g_mc;"
+
+          if s.count(anchor) != 1:
+              raise SystemExit("V60: modem anchor mismatch")
 
           code = r'''
-          /*
-           * XCOVER4S V59
-           * Automatic early CP shutdown.
-           *
-           * Existing V55 restart guards remain active.
-           */
-          static int __init v59_cp_off_init(void)
+          /* V60 root-controlled CP interface */
+          #include <linux/kobject.h>
+          #include <linux/sysfs.h>
+          #include <linux/atomic.h>
+          #include <linux/capability.h>
+          #include <linux/errno.h>
+
+          static atomic_t v60_cp_locked = ATOMIC_INIT(0);
+
+          static int ss310ap_off(struct modem_ctl *mc);
+
+          static ssize_t v60_status_show(
+              struct kobject *kobj,
+              struct kobj_attribute *attr,
+              char *buf)
+          {
+          #ifdef CONFIG_CP_PMUCAL
+              int hw = cal_cp_status();
+          #else
+              int hw = exynos_get_cp_power_status();
+          #endif
+
+              return scnprintf(
+                  buf, PAGE_SIZE,
+                  "cp_status=%d locked=%d modem_ctl=%s\n",
+                  hw,
+                  atomic_read(&v60_cp_locked),
+                  g_mc ? "ready" : "missing"
+              );
+          }
+
+          static ssize_t v60_off_store(
+              struct kobject *kobj,
+              struct kobj_attribute *attr,
+              const char *buf,
+              size_t count)
           {
               int ret;
 
-              pr_info("V59: early CP shutdown requested\n");
+              if (!capable(CAP_SYS_ADMIN))
+                  return -EPERM;
 
-              ret = v46_cp_off_set("1", NULL);
+              if (!sysfs_streq(buf, "1"))
+                  return -EINVAL;
+
+              if (!g_mc)
+                  return -ENODEV;
+
+              ret = ss310ap_off(g_mc);
 
               if (ret)
-                  pr_err("V59: CP shutdown failed: %d\n", ret);
-              else
-                  pr_info("V59: CP-off latch active\n");
+                  return ret;
 
-              return 0;
+              pr_warn(
+                  "V60: CP modem_off requested; "
+                  "physical power removal not verified\n"
+              );
+
+              return count;
           }
 
-          subsys_initcall(v59_cp_off_init);
+          static ssize_t v60_lock_show(
+              struct kobject *kobj,
+              struct kobj_attribute *attr,
+              char *buf)
+          {
+              return scnprintf(
+                  buf, PAGE_SIZE, "%d\n",
+                  atomic_read(&v60_cp_locked)
+              );
+          }
+
+          static ssize_t v60_lock_store(
+              struct kobject *kobj,
+              struct kobj_attribute *attr,
+              const char *buf,
+              size_t count)
+          {
+              if (!capable(CAP_SYS_ADMIN))
+                  return -EPERM;
+
+              if (sysfs_streq(buf, "1"))
+                  atomic_set(&v60_cp_locked, 1);
+              else if (sysfs_streq(buf, "0"))
+                  atomic_set(&v60_cp_locked, 0);
+              else
+                  return -EINVAL;
+
+              return count;
+          }
+
+          static struct kobj_attribute v60_status_attr =
+              __ATTR(status, 0444, v60_status_show, NULL);
+
+          static struct kobj_attribute v60_off_attr =
+              __ATTR(off, 0200, NULL, v60_off_store);
+
+          static struct kobj_attribute v60_lock_attr =
+              __ATTR(lock, 0600,
+                     v60_lock_show, v60_lock_store);
+
+          static struct kobject *v60_cp_kobj;
+
+          static int __init v60_cp_control_init(void)
+          {
+              int ret;
+
+              v60_cp_kobj =
+                  kobject_create_and_add(
+                      "cp_control", kernel_kobj
+                  );
+
+              if (!v60_cp_kobj)
+                  return -ENOMEM;
+
+              ret = sysfs_create_file(
+                  v60_cp_kobj,
+                  &v60_status_attr.attr
+              );
+              if (ret)
+                  goto fail;
+
+              ret = sysfs_create_file(
+                  v60_cp_kobj,
+                  &v60_off_attr.attr
+              );
+              if (ret)
+                  goto fail;
+
+              ret = sysfs_create_file(
+                  v60_cp_kobj,
+                  &v60_lock_attr.attr
+              );
+              if (ret)
+                  goto fail;
+
+              pr_info("V60: CP control ready\n");
+              return 0;
+
+          fail:
+              kobject_put(v60_cp_kobj);
+              return ret;
+          }
+
+          late_initcall(v60_cp_control_init);
+          /* End V60 interface */
           '''
 
-          p.write_text(s + '\n' + code)
-          PYCP
+          s = s.replace(anchor, anchor + "\n" + code, 1)
 
-      - name: V59 configure kernel and SELinux
-        shell: bash
+          # ------------------------------------------------
+          # Guard the normal CP-on entry points
+          # ------------------------------------------------
+
+          on_pattern = (
+              r'(static int ss310ap_on'
+              r'\(struct modem_ctl \*mc\)\s*\{)'
+          )
+
+          boot_pattern = (
+              r'(static int ss310ap_boot_on'
+              r'\(struct modem_ctl \*mc\)\s*\{)'
+          )
+
+          for pattern, name in [
+              (on_pattern, "ss310ap_on"),
+              (boot_pattern, "ss310ap_boot_on"),
+          ]:
+              if len(re.findall(pattern, s)) != 1:
+                  raise SystemExit(
+                      "V60: unexpected " + name
+                  )
+
+          # Insert checks after local declarations, not before
+          # them, to remain compatible with the old C kernel.
+
+          on_marker = (
+              '\tmif_err("+++\\n");'
+          )
+
+          on_start = s.index(
+              "static int ss310ap_on("
+          )
+
+          on_end = s.index(
+              "static int ss310ap_off(",
+              on_start + 30
+          )
+
+          # There is a forward declaration above the
+          # function. Locate the real function definition.
+          actual_on = re.search(
+              on_pattern, s
+          )
+
+          start = actual_on.start()
+          next_function = s.find(
+              "static int ss310ap_off(",
+              actual_on.end()
+          )
+
+          segment = s[start:next_function]
+
+          if segment.count(on_marker) != 1:
+              raise SystemExit(
+                  "V60: cannot locate modem-on body"
+              )
+
+          segment = segment.replace(
+              on_marker,
+              '''\
+              if (atomic_read(&v60_cp_locked)) {
+                  pr_warn("V60: CP start blocked\\n");
+                  return -EPERM;
+              }
+
+              ''' + on_marker,
+              1
+          )
+
+          s = s[:start] + segment + s[next_function:]
+
+          actual_boot = re.search(
+              boot_pattern, s
+          )
+
+          if not actual_boot:
+              raise SystemExit(
+                  "V60: boot-on function missing"
+              )
+
+          start = actual_boot.start()
+
+          next_function = s.find(
+              "static int ss310ap_boot_off(",
+              actual_boot.end()
+          )
+
+          if next_function < 0:
+              raise SystemExit(
+                  "V60: boot-off function missing"
+              )
+
+          segment = s[start:next_function]
+
+          marker = '\tmif_info("+++\\n");'
+
+          if segment.count(marker) != 1:
+              raise SystemExit(
+                  "V60: cannot locate modem boot"
+              )
+
+          segment = segment.replace(
+              marker,
+              '''\
+              if (atomic_read(&v60_cp_locked)) {
+                  pr_warn("V60: CP boot blocked\\n");
+                  return -EPERM;
+              }
+
+              ''' + marker,
+              1
+          )
+
+          s = s[:start] + segment + s[next_function:]
+
+          p.write_text(s)
+
+          print("V60 patches applied")
+          PY
+
+      - name: Configure kernel
         run: |
           set -euo pipefail
 
@@ -153,55 +418,32 @@ jobs:
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CC=clang
 
-          mkdir -p ../out
+          make O=out lineage_xcover4s_defconfig
 
-          make O=../out lineage_xcover4s_defconfig
-
-          scripts/config --file ../out/.config \
+          ./scripts/config --file out/.config \
             -e SECURITY_SELINUX \
             -e SECURITY_SELINUX_DEVELOP \
-            -e SECURITY_SELINUX_BOOTPARAM \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+            -d ALWAYS_ENFORCE \
+            -d RKP_KDP
 
-          make O=../out olddefconfig
+          make O=out olddefconfig
 
-          grep -q '^CONFIG_SECURITY_SELINUX=y$' \
-            ../out/.config
+          grep -q '^CONFIG_SECURITY_SELINUX=y$' out/.config
 
           grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y$' \
-            ../out/.config
+            out/.config
 
-          grep -q '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0$' \
-            ../out/.config
+          if grep -q '^CONFIG_ALWAYS_ENFORCE=y$' out/.config; then
+            echo "ERROR: always-enforce remains enabled"
+            exit 1
+          fi
 
-          echo "V59: SELinux boot configuration verified"
+          grep -E \
+            'CONFIG_SECURITY_SELINUX|CONFIG_ALWAYS_ENFORCE|CONFIG_CP_PMUCAL' \
+            out/.config
 
-          grep CONFIG_SECURITY_SELINUX \
-            ../out/.config > ../selinux-config.txt
-
-      - name: Verify CP source modifications
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          grep -q 'subsys_initcall(v59_cp_off_init)' \
-            kernel/drivers/soc/samsung/cal-if/pmucal_cp.c
-
-          grep -q 'v46_cp_off_latched' \
-            kernel/drivers/soc/samsung/cal-if/pmucal_cp.c
-
-          grep -q 'pmucal_cp_is_off_latched' \
-            kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c
-
-          git -C kernel diff --check
-
-          echo "V59 CP source checks passed"
-
-      - name: Build ARM64 kernel
-        shell: bash
+      - name: Compile XCover 4s kernel
         run: |
           set -euo pipefail
 
@@ -210,59 +452,102 @@ jobs:
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CC=clang
-          export KCFLAGS=-Wno-error
 
-          make O=../out -j2 Image \
-            2>&1 | tee ../build.log
+          make \
+            O=out \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS=-Wno-error \
+            -j2 \
+            Image 2>&1 | tee ../build.log
 
-          test -s ../out/arch/arm64/boot/Image
+      - name: Verify kernel output
+        run: |
+          set -euo pipefail
 
-          echo "V59 kernel Image built successfully"
+          IMAGE="kernel/out/arch/arm64/boot/Image"
 
-      - name: Collect diagnostics
+          test -s "$IMAGE"
+
+          echo "Kernel Image:"
+          ls -lh "$IMAGE"
+
+          sha256sum "$IMAGE"
+
+          grep -q 'v60_cp_control_init' \
+            kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+
+          grep -q 'int selinux_enforcing = 0;' \
+            kernel/security/selinux/hooks.c
+
+          echo "V60 source and build output checks passed"
+
+      - name: Collect V60 artifacts
         if: always()
-        shell: bash
         run: |
           mkdir -p deliver
 
-          cp build.log deliver/ 2>/dev/null || true
-          cp source-commit.txt deliver/ 2>/dev/null || true
-          cp selinux-config.txt deliver/ 2>/dev/null || true
-
-          cp out/.config deliver/kernel.config \
-            2>/dev/null || true
-
-          cp out/arch/arm64/boot/Image \
-            deliver/Image 2>/dev/null || true
-
-          if [ -d kernel/.git ]; then
-            git -C kernel diff \
-              > deliver/v59.patch || true
+          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image \
+              deliver/XCOVER4S-V60-Image
           fi
 
-          cat > deliver/READ-ME.txt <<'EOF'
-          XCOVER4S V59
+          if [ -f kernel/out/.config ]; then
+            cp kernel/out/.config \
+              deliver/V60-kernel-config.txt
+          fi
 
-          CP:
-          Automatic early CP shutdown requested.
-          V55 restart protection retained.
-          subsys_initcall used instead of late_initcall.
+          if [ -f build.log ]; then
+            cp build.log deliver/build.log
+          fi
 
-          SELINUX:
-          Boot permissive requested through kernel config.
-          Runtime state is not yet verified.
+          if [ -d kernel/.git ]; then
+            git -C kernel rev-parse HEAD \
+              > deliver/source-commit.txt
+
+            git -C kernel diff \
+              > deliver/V60-applied.patch
+          fi
+
+          cat > deliver/README.txt <<'EOF'
+          XCOVER4S V60
+
+          Device: Samsung XCover 4s SM-G398F
+          Kernel: Exynos7885 lineage-18.1
+
+          Changes:
+          - SELinux permissive kernel default
+          - Root-controlled modem interface
+          - CP start guard for selected entry points
+          - No automatic CP shutdown during startup
+
+          Proposed sysfs interface after boot:
+
+          /sys/kernel/cp_control/status
+          /sys/kernel/cp_control/off
+          /sys/kernel/cp_control/lock
 
           IMPORTANT:
-          A successful build does not prove RF shutdown.
-          The Image is not an Odin-flashable boot image.
-          Original boot image and repacking are required.
+          The off interface uses Samsung ss310ap_off.
+          On CONFIG_CP_PMUCAL kernels this is NOT proven
+          to physically disconnect modem power.
+
+          The lock is not a complete hardware-enforced
+          prohibition against all CP restart paths.
+
+          This build is experimental.
+          A compiled Image is NOT an Odin-flashable boot image.
+          A known-good matching boot image is required for
+          proper repacking and packaging.
+
+          Do not flash Image directly with Odin.
           EOF
 
-      - name: Upload V59 diagnostics
+      - name: Upload V60 diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V59-DIAGNOSTICS
+          name: XCOVER4S-V60-DIAGNOSTICS
           path: deliver/
-          retention-days: 14
+          if-no-files-found: warn
