@@ -1,4 +1,4 @@
-name: XCOVER4S V61 - GNU Linker and Filtered Objdump
+name: XCOVER4S V62 - CP Fix and Verification
 
 on:
   workflow_dispatch:
@@ -11,43 +11,32 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
 
-    env:
-      ARCH: arm64
-      SUBARCH: arm64
-      CROSS_COMPILE: aarch64-linux-gnu-
-      CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
-      CLANG_TRIPLE: aarch64-linux-gnu-
-      KCFLAGS: -Wno-error
-
     steps:
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
-            git python3 make bc bison flex \
-            build-essential libssl-dev libelf-dev \
-            clang llvm lld \
+            git make python3 bc bison flex \
+            build-essential clang llvm lld \
             gcc-aarch64-linux-gnu \
             gcc-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu \
-            cpio zip unzip xz-utils
+            libssl-dev libelf-dev \
+            libncurses-dev cpio zip unzip
 
-      - name: Download kernel
+      - name: Download kernel source
         run: |
           set -euo pipefail
-
           git clone \
             --depth 1 \
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
-          git -C kernel rev-parse HEAD
+          git -C kernel rev-parse HEAD | tee source-commit.txt
 
-      - name: Apply V61 patches
+      - name: Inspect CP implementation and correct V61 void assignment
         run: |
           set -euo pipefail
 
@@ -55,365 +44,106 @@ jobs:
           from pathlib import Path
           import re
 
-          root = Path("kernel")
+          p = Path("kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c")
+          if not p.exists():
+              raise SystemExit("ERROR: Samsung CP source file missing")
 
-          # -----------------------------------------
-          # SELinux permissive
-          # -----------------------------------------
+          s = p.read_text()
+          original = s
 
-          hooks = root / "security/selinux/hooks.c"
+          print("Checking Samsung CP control source")
 
-          if not hooks.exists():
-              raise SystemExit("Missing SELinux hooks.c")
+          for symbol in (
+              "ss310ap_off",
+              "cal_cp_reset_assert",
+              "cal_cp_reset_release",
+              "cal_cp_power_on",
+          ):
+              print(f"{symbol}: {'FOUND' if symbol in s else 'NOT FOUND'}")
 
-          s = hooks.read_text()
+          # Only correct a clearly identifiable V61-style assignment
+          # of a void-returning reset assertion function.
+          #
+          # Never replace arbitrary assignments or invent return values.
+          pattern = re.compile(
+              r'(?m)^([ \t]*)'
+              r'(?:int\s+)?'
+              r'(ret|result|rc)\s*=\s*'
+              r'cal_cp_reset_assert\s*\(\s*\)\s*;'
+          )
 
-          candidates = [
-              (
-                  r'(?m)^int selinux_enforcing\s*=\s*1\s*;',
-                  'int selinux_enforcing = 0;'
-              ),
-              (
-                  r'(?m)^int selinux_enforcing\s*;',
-                  'int selinux_enforcing = 0;'
-              ),
-          ]
+          matches = list(pattern.finditer(s))
 
-          changed = False
-
-          for pattern, replacement in candidates:
-              if len(re.findall(pattern, s)) == 1:
-                  s = re.sub(
-                      pattern, replacement, s, count=1
-                  )
-                  changed = True
-                  break
-
-          if not changed:
-              print(
-                  "SELinux enforcing variable not in hooks.c; "
-                  "checking other source files"
+          if len(matches) == 1:
+              s = pattern.sub(
+                  lambda m: (
+                      m.group(1) +
+                      "cal_cp_reset_assert();"
+                  ),
+                  s,
+                  count=1
+              )
+              print("Corrected one void assignment")
+          elif len(matches) > 1:
+              raise SystemExit(
+                  "ERROR: Multiple possible void assignments; "
+                  "manual review required"
               )
           else:
-              hooks.write_text(s)
+              print(
+                  "No exact void assignment found in this source. "
+                  "The V61 patch may be generated elsewhere."
+              )
 
-          # -----------------------------------------
-          # CP control interface
-          # -----------------------------------------
+          if s != original:
+              p.write_text(s)
 
-          modem = (
-              root /
-              "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
+          Path("cp-source-inspection.txt").write_text(
+              "\n".join([
+                  f"source={p}",
+                  f"void_assignment_matches={len(matches)}",
+                  f"source_changed={s != original}",
+                  f"ss310ap_off={'ss310ap_off' in s}",
+                  f"cal_cp_reset_assert={'cal_cp_reset_assert' in s}",
+                  f"cal_cp_reset_release={'cal_cp_reset_release' in s}",
+                  f"cal_cp_power_on={'cal_cp_power_on' in s}",
+              ]) + "\n"
           )
-
-          if not modem.exists():
-              raise SystemExit(
-                  "Missing Samsung SS310AP modem driver"
-              )
-
-          s = modem.read_text()
-
-          required = [
-              "ss310ap_off",
-              "cal_cp_status",
-              "cal_cp_reset_assert",
-          ]
-
-          for symbol in required:
-              if symbol not in s:
-                  raise SystemExit(
-                      "Required Samsung function missing: "
-                      + symbol
-                  )
-
-          off_pattern = (
-              r'static\s+int\s+ss310ap_off\s*'
-              r'\(\s*struct\s+modem_ctl\s*\*\s*mc\s*\)'
-              r'\s*\{'
-          )
-
-          if len(re.findall(off_pattern, s)) != 1:
-              raise SystemExit(
-                  "Unexpected ss310ap_off definition"
-              )
-
-          if "static struct modem_ctl *g_mc;" not in s:
-              raise SystemExit(
-                  "Global modem controller g_mc missing; "
-                  "refusing unsafe CP patch"
-              )
-
-          insertion = r'''
-          /* V61 root-controlled modem interface */
-
-          #include <linux/kobject.h>
-          #include <linux/sysfs.h>
-          #include <linux/capability.h>
-          #include <linux/atomic.h>
-          #include <linux/errno.h>
-
-          static atomic_t v61_cp_lock =
-              ATOMIC_INIT(0);
-
-          static int ss310ap_off(
-              struct modem_ctl *mc
-          );
-
-          static ssize_t v61_status_show(
-              struct kobject *kobj,
-              struct kobj_attribute *attr,
-              char *buf)
-          {
-              return scnprintf(
-                  buf,
-                  PAGE_SIZE,
-                  "cp_status=%d lock=%d controller=%d\n",
-                  cal_cp_status(),
-                  atomic_read(&v61_cp_lock),
-                  g_mc != NULL
-              );
-          }
-
-          static ssize_t v61_power_store(
-              struct kobject *kobj,
-              struct kobj_attribute *attr,
-              const char *buf,
-              size_t count)
-          {
-              int ret;
-
-              if (!capable(CAP_SYS_ADMIN))
-                  return -EPERM;
-
-              if (!sysfs_streq(buf, "off"))
-                  return -EINVAL;
-
-              if (!g_mc)
-                  return -ENODEV;
-
-              ret = ss310ap_off(g_mc);
-
-              if (ret)
-                  return ret;
-
-              pr_warn(
-                  "V61: Samsung modem-off requested; "
-                  "physical power-off unverified\n"
-              );
-
-              return count;
-          }
-
-          static ssize_t v61_reset_store(
-              struct kobject *kobj,
-              struct kobj_attribute *attr,
-              const char *buf,
-              size_t count)
-          {
-              int ret;
-
-              if (!capable(CAP_SYS_ADMIN))
-                  return -EPERM;
-
-              if (!sysfs_streq(buf, "assert"))
-                  return -EINVAL;
-
-              ret = cal_cp_reset_assert();
-
-              if (ret)
-                  return ret;
-
-              return count;
-          }
-
-          static ssize_t v61_lock_show(
-              struct kobject *kobj,
-              struct kobj_attribute *attr,
-              char *buf)
-          {
-              return scnprintf(
-                  buf,
-                  PAGE_SIZE,
-                  "%d\n",
-                  atomic_read(&v61_cp_lock)
-              );
-          }
-
-          static ssize_t v61_lock_store(
-              struct kobject *kobj,
-              struct kobj_attribute *attr,
-              const char *buf,
-              size_t count)
-          {
-              if (!capable(CAP_SYS_ADMIN))
-                  return -EPERM;
-
-              if (sysfs_streq(buf, "1"))
-                  atomic_set(&v61_cp_lock, 1);
-              else if (sysfs_streq(buf, "0"))
-                  atomic_set(&v61_cp_lock, 0);
-              else
-                  return -EINVAL;
-
-              /*
-               * Diagnostic software flag only.
-               * Not a hardware restart interlock.
-               */
-              return count;
-          }
-
-          static struct kobj_attribute v61_status_attr =
-              __ATTR(
-                  status, 0444,
-                  v61_status_show, NULL
-              );
-
-          static struct kobj_attribute v61_power_attr =
-              __ATTR(
-                  power, 0200,
-                  NULL, v61_power_store
-              );
-
-          static struct kobj_attribute v61_reset_attr =
-              __ATTR(
-                  reset, 0200,
-                  NULL, v61_reset_store
-              );
-
-          static struct kobj_attribute v61_lock_attr =
-              __ATTR(
-                  lock, 0600,
-                  v61_lock_show, v61_lock_store
-              );
-
-          static int __init v61_cp_init(void)
-          {
-              struct kobject *kobj;
-              int ret;
-
-              kobj = kobject_create_and_add(
-                  "cp_control", kernel_kobj
-              );
-
-              if (!kobj)
-                  return -ENOMEM;
-
-              ret = sysfs_create_file(
-                  kobj, &v61_status_attr.attr
-              );
-              if (ret)
-                  goto fail;
-
-              ret = sysfs_create_file(
-                  kobj, &v61_power_attr.attr
-              );
-              if (ret)
-                  goto fail;
-
-              ret = sysfs_create_file(
-                  kobj, &v61_reset_attr.attr
-              );
-              if (ret)
-                  goto fail;
-
-              ret = sysfs_create_file(
-                  kobj, &v61_lock_attr.attr
-              );
-              if (ret)
-                  goto fail;
-
-              pr_info(
-                  "V61: root CP controls registered\n"
-              );
-
-              return 0;
-
-          fail:
-              kobject_put(kobj);
-              return ret;
-          }
-
-          late_initcall(v61_cp_init);
-
-          /* End V61 */
-          '''
-
-          anchor = "static struct modem_ctl *g_mc;"
-
-          if s.count(anchor) != 1:
-              raise SystemExit(
-                  "Unexpected modem controller layout"
-              )
-
-          s = s.replace(
-              anchor,
-              anchor + "\n" + insertion,
-              1
-          )
-
-          modem.write_text(s)
-
-          print("V61 CP interface patch applied")
           PY
 
       - name: Configure kernel
         run: |
           set -euo pipefail
-
           cd kernel
 
-          make \
-            O=out \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            lineage_xcover4s_defconfig
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
 
-          ./scripts/config \
-            --file out/.config \
-            -e SECURITY_SELINUX \
-            -e SECURITY_SELINUX_DEVELOP \
-            -d SECURITY_SELINUX_BOOTPARAM_VALUE \
-            -d ALWAYS_ENFORCE
+          mkdir -p out
 
-          make \
-            O=out \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            olddefconfig
-
-          grep -E \
-            'CONFIG_SECURITY_SELINUX|CONFIG_CP_PMUCAL|CONFIG_ALWAYS_ENFORCE' \
-            out/.config || true
-
-      - name: Validate SELinux source
-        run: |
-          set -euo pipefail
-
-          cd kernel
-
-          if grep -R -n \
-            'int selinux_enforcing = 0;' \
-            security/selinux; then
-
-            echo "SELinux permissive initialization found"
-
+          if [ -f arch/arm64/configs/lineage_xcover4s_defconfig ]; then
+            make O=out lineage_xcover4s_defconfig
           else
-
-            echo "ERROR: SELinux permissive not verified"
+            echo "ERROR: Expected XCover4s defconfig not found"
+            find arch/arm64/configs -iname '*xcover*' -o -iname '*g398*'
             exit 1
-
           fi
 
-          if grep -q \
-            '^CONFIG_ALWAYS_ENFORCE=y$' \
-            out/.config; then
-
-            echo "ERROR: forced enforcing remains enabled"
-            exit 1
-
+          # Request permissive SELinux at boot through kernel config.
+          # Runtime behavior still requires device verification.
+          if [ -x scripts/config ]; then
+            scripts/config --file out/.config \
+              -e SECURITY_SELINUX \
+              -e SECURITY_SELINUX_BOOTPARAM \
+              --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
           fi
 
-      - name: Build kernel with GNU linker
+          make O=out ARCH=arm64 olddefconfig
+
+          cp out/.config ../kernel-config.txt
+
+      - name: Build kernel with complete diagnostics
+        id: compile
         run: |
           set -euo pipefail
 
@@ -422,7 +152,8 @@ jobs:
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          set +e
 
           make \
             O=out \
@@ -437,93 +168,178 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             KCFLAGS=-Wno-error \
-            -j2 \
-            Image \
-            2>&1 | tee ../build.log | grep --line-buffered -vE 'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)'
+            -j2 Image \
+            > ../build.log 2>&1
 
-      - name: Verify output
+          result=$?
+
+          set -e
+
+          cd ..
+
+          # Keep the complete, unmodified build.log.
+          # Filter known objdump DWARF noise from console only.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          lines = Path("build.log").read_text(
+              errors="replace"
+          ).splitlines()
+
+          noise = (
+              "Unrecognized form: 0x22",
+              "Unrecognized form: 0x23",
+              "Bogus end-of-siblings marker",
+              "Further warnings about bogus end-of-sibling",
+              "refers to abbreviation number",
+              "Corrupt attribute block length",
+              "Corrupt attribute",
+          )
+
+          filtered = []
+
+          for line in lines:
+              if "aarch64-linux-gnu-objdump: Warning:" in line:
+                  if any(n in line for n in noise):
+                      continue
+
+              if line.strip() in (
+                  "Unrecognized form: 0x22",
+                  "Unrecognized form: 0x23",
+              ):
+                  continue
+
+              filtered.append(line)
+
+          Path("build-console.log").write_text(
+              "\n".join(filtered) + "\n"
+          )
+
+          for line in filtered:
+              print(line)
+          PY
+
+          echo "build_exit_code=$result" >> "$GITHUB_OUTPUT"
+
+          if [ "$result" -ne 0 ]; then
+            echo "Kernel build failed with exit code $result"
+            exit "$result"
+          fi
+
+      - name: Check kernel image and CP safety requirements
         run: |
           set -euo pipefail
 
           IMAGE=kernel/out/arch/arm64/boot/Image
 
-          test -s "$IMAGE"
+          if [ ! -s "$IMAGE" ]; then
+            echo "ERROR: Kernel Image missing or empty"
+            exit 1
+          fi
 
-          ls -lh "$IMAGE"
-          sha256sum "$IMAGE"
+          file "$IMAGE"
+          sha256sum "$IMAGE" | tee kernel-image-sha256.txt
 
-          echo "V61 kernel compilation completed"
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Collect diagnostics
+          source = Path(
+              "kernel/drivers/misc/modem_v1/"
+              "modem_ctrl_ss310ap.c"
+          ).read_text()
+
+          required = {
+              "CP power-off implementation": "ss310ap_off",
+              "CP reset assertion": "cal_cp_reset_assert",
+              "CP restart path": "cal_cp_reset_release",
+          }
+
+          failures = []
+
+          for name, symbol in required.items():
+              found = symbol in source
+              print(f"{name}: {'FOUND' if found else 'MISSING'}")
+              if not found:
+                  failures.append(name)
+
+          # A symbol existing is not evidence that all restart
+          # paths are protected or that CP is electrically off.
+          #
+          # V62 must not be labelled flash-ready without a
+          # reviewed irreversible latch implementation.
+          report = [
+              "XCOVER4S V62 SAFETY REPORT",
+              "",
+              "Kernel Image: built",
+              "SELinux boot permissive: requested, untested",
+              "Rootbroker autostart: untested",
+              "Manual CP hard-off: not verified",
+              "Irreversible CP latch: not verified",
+              "All CP restart paths blocked: not verified",
+              "Physical modem shutdown: not verified",
+              "Wi-Fi after CP shutdown: untested",
+              "Odin flash package: NOT GENERATED",
+              "",
+              "This is a diagnostic build, NOT a flash release.",
+          ]
+
+          if failures:
+              report.append(
+                  "Missing symbols: " + ", ".join(failures)
+              )
+
+          Path("V62-SAFETY-REPORT.txt").write_text(
+              "\n".join(report) + "\n"
+          )
+
+          print("\n".join(report))
+          PY
+
+      - name: Collect source patch and diagnostic summary
         if: always()
         run: |
-          mkdir -p deliver
+          set -euo pipefail
 
-          if [ -s kernel/out/arch/arm64/boot/Image ]; then
-            cp kernel/out/arch/arm64/boot/Image \
-              deliver/XCOVER4S-V61-Image
-          fi
-
-          if [ -f kernel/out/.config ]; then
-            cp kernel/out/.config \
-              deliver/V61-config.txt
-          fi
-
-          if [ -f build.log ]; then
-            cp build.log \
-              deliver/V61-build.log
-          fi
+          mkdir -p diagnostics
 
           if [ -d kernel/.git ]; then
-            git -C kernel rev-parse HEAD \
-              > deliver/source-commit.txt
-
-            git -C kernel diff \
-              > deliver/V61.patch
+            git -C kernel diff > diagnostics/kernel-changes.patch
+            git -C kernel status --short \
+              > diagnostics/source-status.txt
           fi
 
-          cat > deliver/README.txt <<'EOF'
-          XCOVER4S V61
+          for f in \
+            build.log \
+            build-console.log \
+            source-commit.txt \
+            kernel-config.txt \
+            kernel-image-sha256.txt \
+            cp-source-inspection.txt \
+            V62-SAFETY-REPORT.txt
+          do
+            if [ -f "$f" ]; then
+              cp "$f" diagnostics/
+            fi
+          done
 
-          Intended features:
-          - SELinux permissive kernel initialization
-          - Existing Rootbroker files left unchanged
-          - Root-writable Samsung modem-off control
-          - Root-writable CP reset-assert control
-          - Readable CP status
-          - Software lock flag (not hardware enforced)
-          - No automatic CP shutdown
-          - GNU linker with Clang compilation
-          - Filtered objdump warnings in GitHub Actions output
+          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image \
+              diagnostics/Image
+          fi
 
-          Interface:
-          /sys/kernel/cp_control/status
-          /sys/kernel/cp_control/power
-          /sys/kernel/cp_control/reset
-          /sys/kernel/cp_control/lock
+          grep -nEi \
+            '(^|[[:space:]])(fatal error:|error:|undefined reference|make: \*\*\*)' \
+            build.log \
+            > diagnostics/build-errors.txt || true
 
-          LIMITATIONS:
+          echo "V62 diagnostic files collected"
 
-          1. The power control calls Samsung ss310ap_off.
-             It does not prove electrical CP power removal.
-
-          2. The lock flag does not block hardware restart.
-
-          3. Android Radio HAL is not modified.
-
-          4. Rootbroker startup is not repaired by this
-             kernel patch alone.
-
-          5. This artifact is a kernel Image, not a
-             flashable Odin TAR.
-
-          Do not flash the Image directly.
-          EOF
-
-      - name: Upload V61 artifacts
+      - name: Upload V62 diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V61-DIAGNOSTICS
-          path: deliver/
+          name: XCOVER4S-V62-DIAGNOSTICS
+          path: diagnostics/
           if-no-files-found: warn
+          retention-days: 30
