@@ -21,7 +21,6 @@ jobs:
           set -euo pipefail
 
           test -s boot-original-for-github.zip
-
           unzip -o boot-original-for-github.zip -d .
 
           test -s boot-original.img
@@ -38,7 +37,6 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update -qq
-
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex git make clang lld \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
@@ -73,88 +71,75 @@ jobs:
           p = Path("tools/apply_kernel.py")
           s = p.read_text()
 
-          # Remove an accidentally pasted standalone Git commit hash.
+          # Remove the accidentally pasted standalone commit hash.
           commit = "6020dfa8315134187f07ca903c9d2ed7ee0256f5"
 
           s, removed = re.subn(
-              r"(?m)^[ \t]*" + re.escape(commit) + r"[ \t]*\n",
+              r"(?m)^[ \t]*" + re.escape(commit) + r"[ \t]*(?:\n|$)",
               "",
               s
           )
 
           print("Removed stray commit lines:", removed)
 
-          # Remove the obsolete SELinux source-text patch.
-          # Match the known V64 section, not arbitrary Python code.
+          # Remove only the obsolete SELinux source patch.
           if "SELinux boot default ambiguous" in s:
               lines = s.splitlines(keepends=True)
 
               starts = [
                   i for i, line in enumerate(lines)
-                  if re.match(
-                      r"^\s*s\s*=\s*sel\.read_text\(\)\s*$",
-                      line
+                  if re.fullmatch(
+                      r"\s*s\s*=\s*sel\.read_text\(\)\s*",
+                      line.strip()
                   )
               ]
 
               ends = [
                   i for i, line in enumerate(lines)
-                  if re.match(
-                      r"^\s*sel\.write_text\(s\)\s*$",
-                      line
+                  if re.fullmatch(
+                      r"\s*sel\.write_text\(s\)\s*",
+                      line.strip()
                   )
               ]
 
               if len(starts) != 1 or len(ends) != 1:
                   raise SystemExit(
-                      "Cannot safely locate obsolete SELinux section"
+                      "Cannot uniquely identify obsolete SELinux patch"
                   )
 
               start = starts[0]
               end = ends[0]
 
               if end <= start:
-                  raise SystemExit(
-                      "SELinux patch boundaries are invalid"
-                  )
+                  raise SystemExit("Invalid SELinux patch boundaries")
 
               section = "".join(lines[start:end + 1])
 
               if "SELinux boot default ambiguous" not in section:
-                  raise SystemExit(
-                      "SELinux error marker not inside expected section"
-                  )
+                  raise SystemExit("Unexpected SELinux patch structure")
 
-              # Remove the old final status print if present.
               if end + 1 < len(lines):
-                  if re.match(
-                      r"^\s*print\(['\"]V64: changed",
-                      lines[end + 1]
-                  ):
+                  if "print('V64: changed'" in lines[end + 1]:
                       end += 1
 
-              replacement = [
-                  'print("V64 CP patch applied:", cp, modem)\n',
-                  'print("SELinux configured by kernel build settings")\n'
-              ]
-
               s = "".join(
-                  lines[:start] + replacement + lines[end + 1:]
+                  lines[:start]
+                  + [
+                      'print("V64 CP patch applied:", cp, modem)\n',
+                      'print("SELinux handled by kernel configuration")\n'
+                  ]
+                  + lines[end + 1:]
               )
 
               print("Removed obsolete SELinux source patch.")
 
           if "SELinux boot default ambiguous" in s:
-              raise SystemExit(
-                  "Obsolete SELinux source patch remains"
-              )
+              raise SystemExit("Old SELinux patch still present")
 
-          # Fail here if any other Python syntax errors remain.
           compile(s, str(p), "exec")
-
           p.write_text(s)
 
-          print("V64 Python syntax OK")
+          print("Python syntax OK")
           PY
 
       - name: Apply CP kernel patch
@@ -165,7 +150,6 @@ jobs:
           python3 tools/apply_kernel.py
 
           git -C kernel diff --check
-
           git -C kernel diff > V64-applied-kernel.patch
 
           test -s V64-applied-kernel.patch
@@ -213,7 +197,6 @@ jobs:
             -j2 Image 2>&1 | tee V64-build.log
 
           test -s out/arch/arm64/boot/Image
-
           file out/arch/arm64/boot/Image
 
       - name: Build custom ARM64 rootbroker and init wrapper
@@ -231,10 +214,7 @@ jobs:
             -o tools/init-wrapper.arm64 \
             tools/init-wrapper.c
 
-          for elf in \
-            tools/rootbroker.arm64 \
-            tools/init-wrapper.arm64
-          do
+          for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
             readelf -h "$elf" | grep -q 'Machine:.*AArch64'
 
             if readelf -l "$elf" | grep -q INTERP; then
@@ -251,7 +231,6 @@ jobs:
           python3 tools/repack_boot.py
 
           test -s deliver/boot.img
-
           test "$(stat -c %s deliver/boot.img)" = 37748736
 
       - name: Create Odin TAR and original restore
@@ -263,7 +242,6 @@ jobs:
             -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
 
           mkdir -p restore
-
           cp boot-original.img restore/boot.img
 
           tar -C restore --format=ustar \
@@ -273,9 +251,7 @@ jobs:
           cp V64-applied-kernel.patch deliver/
           cp out/.config deliver/kernel-config.txt
 
-          sha256sum \
-            deliver/*.tar \
-            deliver/boot.img \
+          sha256sum deliver/*.tar deliver/boot.img \
             > deliver/V64-checksums.txt
 
           cat > deliver/IMPORTANT-READ-FIRST.txt <<'EOF'
