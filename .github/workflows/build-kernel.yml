@@ -1,4 +1,4 @@
-name: XCOVER4S V61 - GNU Linker Fix
+name: XCOVER4S V61 - GNU Linker and Filtered Objdump
 
 on:
   workflow_dispatch:
@@ -439,7 +439,7 @@ jobs:
             KCFLAGS=-Wno-error \
             -j2 \
             Image \
-            2>&1 | tee ../build.log
+            2>&1 | tee ../build.log | grep --line-buffered -vE 'aarch64-linux-gnu-objdump: Warning: Unrecognized form: 0x(22|23)'
 
       - name: Verify output
         run: |
@@ -494,6 +494,7 @@ jobs:
           - Software lock flag (not hardware enforced)
           - No automatic CP shutdown
           - GNU linker with Clang compilation
+          - Filtered objdump warnings in GitHub Actions output
 
           Interface:
           /sys/kernel/cp_control/status
