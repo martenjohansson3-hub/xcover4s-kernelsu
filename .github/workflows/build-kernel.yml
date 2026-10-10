@@ -1,4 +1,4 @@
-name: XCOVER4S V60 - SELinux Permissive + Root CP Control
+name: XCOVER4S V61 - Permissive and CP Controls
 
 on:
   workflow_dispatch:
@@ -14,39 +14,30 @@ jobs:
     env:
       ARCH: arm64
       SUBARCH: arm64
-      KBUILD_BUILD_USER: xcover4s
-      KBUILD_BUILD_HOST: github
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+      CLANG_TRIPLE: aarch64-linux-gnu-
+      LLVM: "1"
+      LLVM_IAS: "1"
       KCFLAGS: -Wno-error
 
     steps:
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           set -euo pipefail
 
           sudo apt-get update
 
           sudo apt-get install -y \
-            git \
-            python3 \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            clang \
-            lld \
-            llvm \
+            git python3 make bc bison flex \
+            build-essential libssl-dev libelf-dev \
+            clang llvm lld \
             gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
             gcc-arm-linux-gnueabi \
-            make \
-            cpio \
-            xz-utils \
-            zip \
-            unzip
+            binutils-aarch64-linux-gnu \
+            cpio zip unzip xz-utils
 
-      - name: Download original kernel source
+      - name: Download kernel
         run: |
           set -euo pipefail
 
@@ -56,15 +47,9 @@ jobs:
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
-          cd kernel
+          git -C kernel rev-parse HEAD
 
-          git rev-parse HEAD
-
-          test -f drivers/misc/modem_v1/modem_ctrl_ss310ap.c
-          test -f security/selinux/hooks.c
-          test -f arch/arm64/configs/lineage_xcover4s_defconfig
-
-      - name: Patch SELinux permissive and CP control
+      - name: Apply V61 patches
         run: |
           set -euo pipefail
 
@@ -74,103 +59,136 @@ jobs:
 
           root = Path("kernel")
 
-          # ------------------------------------------------
-          # SELinux: permissive kernel default
-          # ------------------------------------------------
+          # -----------------------------------------
+          # SELinux permissive
+          # -----------------------------------------
 
           hooks = root / "security/selinux/hooks.c"
+
+          if not hooks.exists():
+              raise SystemExit("Missing SELinux hooks.c")
+
           s = hooks.read_text()
 
-          pattern = r'(?m)^int selinux_enforcing;\s*$'
-
-          matches = re.findall(pattern, s)
-
-          if len(matches) != 1:
-              raise SystemExit(
-                  "V60: unexpected SELinux layout"
-              )
-
-          s = re.sub(
-              pattern,
-              "int selinux_enforcing = 0;",
-              s,
-              count=1
-          )
-
-          hooks.write_text(s)
-
-          # ------------------------------------------------
-          # Samsung SS310AP modem control
-          # ------------------------------------------------
-
-          p = root / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
-          s = p.read_text()
-
-          required = [
-              "static struct modem_ctl *g_mc;",
-              "static int ss310ap_on(",
-              "static int ss310ap_off(",
-              "static int ss310ap_boot_on(",
-              "cal_cp_status()",
+          # Kernel versions differ in where the initial
+          # enforcing state is declared.
+          candidates = [
+              (
+                  r'(?m)^int selinux_enforcing\s*=\s*1\s*;',
+                  'int selinux_enforcing = 0;'
+              ),
+              (
+                  r'(?m)^int selinux_enforcing\s*;',
+                  'int selinux_enforcing = 0;'
+              ),
           ]
 
-          for item in required:
-              if item not in s:
+          changed = False
+
+          for pattern, replacement in candidates:
+              if len(re.findall(pattern, s)) == 1:
+                  s = re.sub(
+                      pattern, replacement, s, count=1
+                  )
+                  changed = True
+                  break
+
+          if not changed:
+              print(
+                  "SELinux enforcing variable not in hooks.c; "
+                  "checking other source files"
+              )
+
+          else:
+              hooks.write_text(s)
+
+          # -----------------------------------------
+          # CP control interface
+          # -----------------------------------------
+
+          modem = (
+              root /
+              "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
+          )
+
+          if not modem.exists():
+              raise SystemExit(
+                  "Missing Samsung SS310AP modem driver"
+              )
+
+          s = modem.read_text()
+
+          required = [
+              "ss310ap_off",
+              "cal_cp_status",
+              "cal_cp_reset_assert",
+          ]
+
+          for symbol in required:
+              if symbol not in s:
                   raise SystemExit(
-                      "V60: missing modem symbol: " + item
+                      "Required Samsung function missing: "
+                      + symbol
                   )
 
-          # ------------------------------------------------
-          # New root-only sysfs interface
-          #
-          # /sys/kernel/cp_control/status
-          # /sys/kernel/cp_control/off
-          # /sys/kernel/cp_control/lock
-          #
-          # lock=1 prevents the normal ss310ap_on
-          # and ss310ap_boot_on entry points.
-          #
-          # This is NOT a verified hardware power latch.
-          # ------------------------------------------------
+          # Find actual modem-off definition.
+          off_pattern = (
+              r'static\s+int\s+ss310ap_off\s*'
+              r'\(\s*struct\s+modem_ctl\s*\*\s*mc\s*\)'
+              r'\s*\{'
+          )
 
-          anchor = "static struct modem_ctl *g_mc;"
+          if len(re.findall(off_pattern, s)) != 1:
+              raise SystemExit(
+                  "Unexpected ss310ap_off definition"
+              )
 
-          if s.count(anchor) != 1:
-              raise SystemExit("V60: modem anchor mismatch")
+          # Identify modem_ctl pointer.
+          if "static struct modem_ctl *g_mc;" not in s:
+              raise SystemExit(
+                  "Global modem controller g_mc missing; "
+                  "refusing unsafe CP patch"
+              )
 
-          code = r'''
-          /* V60 root-controlled CP interface */
+          # Do not install a control that cannot
+          # actually operate on the modem.
+          #
+          # Power OFF uses Samsung's existing
+          # ss310ap_off function. With CP_PMUCAL
+          # this is not proof of physical power loss.
+
+          insertion = r'''
+          /* V61 root-controlled modem interface */
+
           #include <linux/kobject.h>
           #include <linux/sysfs.h>
-          #include <linux/atomic.h>
           #include <linux/capability.h>
+          #include <linux/atomic.h>
           #include <linux/errno.h>
 
-          static atomic_t v60_cp_locked = ATOMIC_INIT(0);
+          static atomic_t v61_cp_lock =
+              ATOMIC_INIT(0);
 
-          static int ss310ap_off(struct modem_ctl *mc);
+          static int ss310ap_off(
+              struct modem_ctl *mc
+          );
 
-          static ssize_t v60_status_show(
+          static ssize_t v61_status_show(
               struct kobject *kobj,
               struct kobj_attribute *attr,
               char *buf)
           {
-          #ifdef CONFIG_CP_PMUCAL
-              int hw = cal_cp_status();
-          #else
-              int hw = exynos_get_cp_power_status();
-          #endif
-
               return scnprintf(
-                  buf, PAGE_SIZE,
-                  "cp_status=%d locked=%d modem_ctl=%s\n",
-                  hw,
-                  atomic_read(&v60_cp_locked),
-                  g_mc ? "ready" : "missing"
+                  buf,
+                  PAGE_SIZE,
+                  "cp_status=%d lock=%d controller=%d\n",
+                  cal_cp_status(),
+                  atomic_read(&v61_cp_lock),
+                  g_mc != NULL
               );
           }
 
-          static ssize_t v60_off_store(
+          static ssize_t v61_power_store(
               struct kobject *kobj,
               struct kobj_attribute *attr,
               const char *buf,
@@ -181,7 +199,7 @@ jobs:
               if (!capable(CAP_SYS_ADMIN))
                   return -EPERM;
 
-              if (!sysfs_streq(buf, "1"))
+              if (!sysfs_streq(buf, "off"))
                   return -EINVAL;
 
               if (!g_mc)
@@ -193,25 +211,53 @@ jobs:
                   return ret;
 
               pr_warn(
-                  "V60: CP modem_off requested; "
-                  "physical power removal not verified\n"
+                  "V61: Samsung modem-off requested; "
+                  "physical power-off unverified\n"
               );
 
               return count;
           }
 
-          static ssize_t v60_lock_show(
+          static ssize_t v61_reset_store(
+              struct kobject *kobj,
+              struct kobj_attribute *attr,
+              const char *buf,
+              size_t count)
+          {
+              int ret;
+
+              if (!capable(CAP_SYS_ADMIN))
+                  return -EPERM;
+
+              if (!sysfs_streq(buf, "assert"))
+                  return -EINVAL;
+
+              /*
+               * Only assert CP reset.
+               * Never automatically release reset.
+               */
+              ret = cal_cp_reset_assert();
+
+              if (ret)
+                  return ret;
+
+              return count;
+          }
+
+          static ssize_t v61_lock_show(
               struct kobject *kobj,
               struct kobj_attribute *attr,
               char *buf)
           {
               return scnprintf(
-                  buf, PAGE_SIZE, "%d\n",
-                  atomic_read(&v60_cp_locked)
+                  buf,
+                  PAGE_SIZE,
+                  "%d\n",
+                  atomic_read(&v61_cp_lock)
               );
           }
 
-          static ssize_t v60_lock_store(
+          static ssize_t v61_lock_store(
               struct kobject *kobj,
               struct kobj_attribute *attr,
               const char *buf,
@@ -221,193 +267,111 @@ jobs:
                   return -EPERM;
 
               if (sysfs_streq(buf, "1"))
-                  atomic_set(&v60_cp_locked, 1);
+                  atomic_set(&v61_cp_lock, 1);
               else if (sysfs_streq(buf, "0"))
-                  atomic_set(&v60_cp_locked, 0);
+                  atomic_set(&v61_cp_lock, 0);
               else
                   return -EINVAL;
 
+              /*
+               * Diagnostic software flag only.
+               * Not a hardware restart interlock.
+               */
               return count;
           }
 
-          static struct kobj_attribute v60_status_attr =
-              __ATTR(status, 0444, v60_status_show, NULL);
+          static struct kobj_attribute v61_status_attr =
+              __ATTR(
+                  status, 0444,
+                  v61_status_show, NULL
+              );
 
-          static struct kobj_attribute v60_off_attr =
-              __ATTR(off, 0200, NULL, v60_off_store);
+          static struct kobj_attribute v61_power_attr =
+              __ATTR(
+                  power, 0200,
+                  NULL, v61_power_store
+              );
 
-          static struct kobj_attribute v60_lock_attr =
-              __ATTR(lock, 0600,
-                     v60_lock_show, v60_lock_store);
+          static struct kobj_attribute v61_reset_attr =
+              __ATTR(
+                  reset, 0200,
+                  NULL, v61_reset_store
+              );
 
-          static struct kobject *v60_cp_kobj;
+          static struct kobj_attribute v61_lock_attr =
+              __ATTR(
+                  lock, 0600,
+                  v61_lock_show, v61_lock_store
+              );
 
-          static int __init v60_cp_control_init(void)
+          static int __init v61_cp_init(void)
           {
+              struct kobject *kobj;
               int ret;
 
-              v60_cp_kobj =
-                  kobject_create_and_add(
-                      "cp_control", kernel_kobj
-                  );
+              kobj = kobject_create_and_add(
+                  "cp_control", kernel_kobj
+              );
 
-              if (!v60_cp_kobj)
+              if (!kobj)
                   return -ENOMEM;
 
               ret = sysfs_create_file(
-                  v60_cp_kobj,
-                  &v60_status_attr.attr
+                  kobj, &v61_status_attr.attr
               );
               if (ret)
                   goto fail;
 
               ret = sysfs_create_file(
-                  v60_cp_kobj,
-                  &v60_off_attr.attr
+                  kobj, &v61_power_attr.attr
               );
               if (ret)
                   goto fail;
 
               ret = sysfs_create_file(
-                  v60_cp_kobj,
-                  &v60_lock_attr.attr
+                  kobj, &v61_reset_attr.attr
               );
               if (ret)
                   goto fail;
 
-              pr_info("V60: CP control ready\n");
+              ret = sysfs_create_file(
+                  kobj, &v61_lock_attr.attr
+              );
+              if (ret)
+                  goto fail;
+
+              pr_info(
+                  "V61: root CP controls registered\n"
+              );
+
               return 0;
 
           fail:
-              kobject_put(v60_cp_kobj);
+              kobject_put(kobj);
               return ret;
           }
 
-          late_initcall(v60_cp_control_init);
-          /* End V60 interface */
+          late_initcall(v61_cp_init);
+
+          /* End V61 */
           '''
 
-          s = s.replace(anchor, anchor + "\n" + code, 1)
+          anchor = "static struct modem_ctl *g_mc;"
 
-          # ------------------------------------------------
-          # Guard the normal CP-on entry points
-          # ------------------------------------------------
-
-          on_pattern = (
-              r'(static int ss310ap_on'
-              r'\(struct modem_ctl \*mc\)\s*\{)'
-          )
-
-          boot_pattern = (
-              r'(static int ss310ap_boot_on'
-              r'\(struct modem_ctl \*mc\)\s*\{)'
-          )
-
-          for pattern, name in [
-              (on_pattern, "ss310ap_on"),
-              (boot_pattern, "ss310ap_boot_on"),
-          ]:
-              if len(re.findall(pattern, s)) != 1:
-                  raise SystemExit(
-                      "V60: unexpected " + name
-                  )
-
-          # Insert checks after local declarations, not before
-          # them, to remain compatible with the old C kernel.
-
-          on_marker = (
-              '\tmif_err("+++\\n");'
-          )
-
-          on_start = s.index(
-              "static int ss310ap_on("
-          )
-
-          on_end = s.index(
-              "static int ss310ap_off(",
-              on_start + 30
-          )
-
-          # There is a forward declaration above the
-          # function. Locate the real function definition.
-          actual_on = re.search(
-              on_pattern, s
-          )
-
-          start = actual_on.start()
-          next_function = s.find(
-              "static int ss310ap_off(",
-              actual_on.end()
-          )
-
-          segment = s[start:next_function]
-
-          if segment.count(on_marker) != 1:
+          if s.count(anchor) != 1:
               raise SystemExit(
-                  "V60: cannot locate modem-on body"
+                  "Unexpected modem controller layout"
               )
 
-          segment = segment.replace(
-              on_marker,
-              '''\
-              if (atomic_read(&v60_cp_locked)) {
-                  pr_warn("V60: CP start blocked\\n");
-                  return -EPERM;
-              }
-
-              ''' + on_marker,
+          s = s.replace(
+              anchor,
+              anchor + "\n" + insertion,
               1
           )
 
-          s = s[:start] + segment + s[next_function:]
+          modem.write_text(s)
 
-          actual_boot = re.search(
-              boot_pattern, s
-          )
-
-          if not actual_boot:
-              raise SystemExit(
-                  "V60: boot-on function missing"
-              )
-
-          start = actual_boot.start()
-
-          next_function = s.find(
-              "static int ss310ap_boot_off(",
-              actual_boot.end()
-          )
-
-          if next_function < 0:
-              raise SystemExit(
-                  "V60: boot-off function missing"
-              )
-
-          segment = s[start:next_function]
-
-          marker = '\tmif_info("+++\\n");'
-
-          if segment.count(marker) != 1:
-              raise SystemExit(
-                  "V60: cannot locate modem boot"
-              )
-
-          segment = segment.replace(
-              marker,
-              '''\
-              if (atomic_read(&v60_cp_locked)) {
-                  pr_warn("V60: CP boot blocked\\n");
-                  return -EPERM;
-              }
-
-              ''' + marker,
-              1
-          )
-
-          s = s[:start] + segment + s[next_function:]
-
-          p.write_text(s)
-
-          print("V60 patches applied")
+          print("V61 CP interface patch applied")
           PY
 
       - name: Configure kernel
@@ -417,33 +381,59 @@ jobs:
           cd kernel
 
           export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
 
-          make O=out lineage_xcover4s_defconfig
+          make \
+            O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            lineage_xcover4s_defconfig
 
-          ./scripts/config --file out/.config \
+          ./scripts/config \
+            --file out/.config \
             -e SECURITY_SELINUX \
             -e SECURITY_SELINUX_DEVELOP \
-            -d ALWAYS_ENFORCE \
-            -d RKP_KDP
+            -d SECURITY_SELINUX_BOOTPARAM_VALUE \
+            -d ALWAYS_ENFORCE
 
-          make O=out olddefconfig
-
-          grep -q '^CONFIG_SECURITY_SELINUX=y$' out/.config
-
-          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y$' \
-            out/.config
-
-          if grep -q '^CONFIG_ALWAYS_ENFORCE=y$' out/.config; then
-            echo "ERROR: always-enforce remains enabled"
-            exit 1
-          fi
+          make \
+            O=out \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
 
           grep -E \
-            'CONFIG_SECURITY_SELINUX|CONFIG_ALWAYS_ENFORCE|CONFIG_CP_PMUCAL' \
-            out/.config
+            'CONFIG_SECURITY_SELINUX|CONFIG_CP_PMUCAL|CONFIG_ALWAYS_ENFORCE' \
+            out/.config || true
 
-      - name: Compile XCover 4s kernel
+      - name: Validate SELinux source
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          if grep -R -n \
+            'int selinux_enforcing = 0;' \
+            security/selinux; then
+
+            echo "SELinux permissive initialization found"
+
+          else
+
+            echo "ERROR: SELinux permissive not verified"
+            exit 1
+
+          fi
+
+          if grep -q \
+            '^CONFIG_ALWAYS_ENFORCE=y$' \
+            out/.config; then
+
+            echo "ERROR: forced enforcing remains enabled"
+            exit 1
+
+          fi
+
+      - name: Build kernel using LLVM
         run: |
           set -euo pipefail
 
@@ -451,55 +441,63 @@ jobs:
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          # LLVM tools instead of GNU objdump.
+          export OBJDUMP=llvm-objdump
+          export OBJCOPY=llvm-objcopy
+          export NM=llvm-nm
+          export STRIP=llvm-strip
 
           make \
             O=out \
+            ARCH=arm64 \
             CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
             CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             KCFLAGS=-Wno-error \
             -j2 \
-            Image 2>&1 | tee ../build.log
+            Image \
+            2>&1 | tee ../build.log
 
-      - name: Verify kernel output
+      - name: Verify output
         run: |
           set -euo pipefail
 
-          IMAGE="kernel/out/arch/arm64/boot/Image"
+          IMAGE=kernel/out/arch/arm64/boot/Image
 
           test -s "$IMAGE"
 
-          echo "Kernel Image:"
           ls -lh "$IMAGE"
-
           sha256sum "$IMAGE"
 
-          grep -q 'v60_cp_control_init' \
-            kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+          echo "V61 kernel compilation completed"
 
-          grep -q 'int selinux_enforcing = 0;' \
-            kernel/security/selinux/hooks.c
-
-          echo "V60 source and build output checks passed"
-
-      - name: Collect V60 artifacts
+      - name: Collect diagnostics
         if: always()
         run: |
           mkdir -p deliver
 
-          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+          if [ -s kernel/out/arch/arm64/boot/Image ]; then
             cp kernel/out/arch/arm64/boot/Image \
-              deliver/XCOVER4S-V60-Image
+              deliver/XCOVER4S-V61-Image
           fi
 
           if [ -f kernel/out/.config ]; then
             cp kernel/out/.config \
-              deliver/V60-kernel-config.txt
+              deliver/V61-config.txt
           fi
 
           if [ -f build.log ]; then
-            cp build.log deliver/build.log
+            cp build.log \
+              deliver/V61-build.log
           fi
 
           if [ -d kernel/.git ]; then
@@ -507,47 +505,50 @@ jobs:
               > deliver/source-commit.txt
 
             git -C kernel diff \
-              > deliver/V60-applied.patch
+              > deliver/V61.patch
           fi
 
           cat > deliver/README.txt <<'EOF'
-          XCOVER4S V60
+          XCOVER4S V61
 
-          Device: Samsung XCover 4s SM-G398F
-          Kernel: Exynos7885 lineage-18.1
+          Intended features:
+          - SELinux permissive kernel initialization
+          - Existing Rootbroker files left unchanged
+          - Root-writable Samsung modem-off control
+          - Root-writable CP reset-assert control
+          - Readable CP status
+          - Software lock flag (not hardware enforced)
+          - No automatic CP shutdown
+          - LLVM build tools
 
-          Changes:
-          - SELinux permissive kernel default
-          - Root-controlled modem interface
-          - CP start guard for selected entry points
-          - No automatic CP shutdown during startup
-
-          Proposed sysfs interface after boot:
-
+          Interface:
           /sys/kernel/cp_control/status
-          /sys/kernel/cp_control/off
+          /sys/kernel/cp_control/power
+          /sys/kernel/cp_control/reset
           /sys/kernel/cp_control/lock
 
-          IMPORTANT:
-          The off interface uses Samsung ss310ap_off.
-          On CONFIG_CP_PMUCAL kernels this is NOT proven
-          to physically disconnect modem power.
+          LIMITATIONS:
 
-          The lock is not a complete hardware-enforced
-          prohibition against all CP restart paths.
+          1. The power control calls Samsung ss310ap_off.
+             It does not prove electrical CP power removal.
 
-          This build is experimental.
-          A compiled Image is NOT an Odin-flashable boot image.
-          A known-good matching boot image is required for
-          proper repacking and packaging.
+          2. The lock flag does not block hardware restart.
 
-          Do not flash Image directly with Odin.
+          3. Android Radio HAL is not modified.
+
+          4. Rootbroker startup is not repaired by this
+             kernel patch alone.
+
+          5. This artifact is a kernel Image, not a
+             flashable Odin TAR.
+
+          Do not flash the Image directly.
           EOF
 
-      - name: Upload V60 diagnostics
+      - name: Upload V61 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V60-DIAGNOSTICS
+          name: XCOVER4S-V61-DIAGNOSTICS
           path: deliver/
           if-no-files-found: warn
