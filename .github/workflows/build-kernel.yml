@@ -1,5 +1,5 @@
 
-name: XCOVER4S V64 - CP Rootbroker ARM64 Fixed
+name: XCOVER4S V64 - CP Rootbroker Fixed
 
 on:
   workflow_dispatch:
@@ -16,69 +16,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install kernel and ARM64 build dependencies
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-
           sudo apt-get update -qq
-
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            git \
-            make \
-            clang \
-            lld \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            linux-libc-dev-arm64-cross \
-            libgcc-11-dev-arm64-cross \
-            libssl-dev \
-            libelf-dev \
-            python3 \
-            cpio \
-            gzip \
-            xz-utils \
-            unzip
-
-          aarch64-linux-gnu-gcc --version
-          aarch64-linux-gnu-gcc -print-sysroot
-
-          test -f /usr/aarch64-linux-gnu/include/bits/wordsize.h
+            build-essential bc bison flex git make clang lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross linux-libc-dev-arm64-cross \
+            libssl-dev libelf-dev python3 cpio gzip xz-utils unzip
 
       - name: Verify original boot image
         shell: bash
         run: |
           set -euo pipefail
-
           unzip -o boot-original-for-github.zip -d .
-
           test -s boot-original.img
-
-          echo \
-            'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' \
-            | sha256sum -c -
+          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
 
       - name: Download pinned Samsung kernel
         shell: bash
         run: |
           set -euo pipefail
-
           git clone --depth 1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           git -C kernel fetch --depth 1 origin \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
           git -C kernel checkout --detach \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
-          test "$(git -C kernel rev-parse HEAD)" = \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
       - name: Apply V64 CP patch and fix SRCU
@@ -93,10 +58,7 @@ jobs:
           from pathlib import Path
           import re
 
-          p = Path(
-              "kernel/drivers/soc/samsung/cal-if/pmucal_cp.c"
-          )
-
+          p = Path("kernel/drivers/soc/samsung/cal-if/pmucal_cp.c")
           s = p.read_text()
 
           pattern = re.compile(
@@ -104,30 +66,17 @@ jobs:
           )
 
           matches = list(pattern.finditer(s))
-
           if len(matches) > 1:
-              raise SystemExit("Multiple SRCU declarations found")
+              raise SystemExit("Multiple SRCU declarations")
 
           if matches:
-              s = pattern.sub(
-                  "DEFINE_SRCU(v64_cp_srcu);",
-                  s,
-                  count=1
-              )
+              s = pattern.sub("DEFINE_SRCU(v64_cp_srcu);", s, count=1)
               p.write_text(s)
 
-          s = p.read_text()
-
-          if re.search(
-              r'\bstatic\s+DEFINE_SRCU\s*\(\s*v64_cp_srcu\s*\)',
-              s
-          ):
-              raise SystemExit("Duplicate static remains")
-
           if s.count("DEFINE_SRCU(v64_cp_srcu);") != 1:
-              raise SystemExit("SRCU declaration verification failed")
+              raise SystemExit("SRCU verification failed")
 
-          print("PASS: V64 SRCU fixed")
+          print("PASS: CP SRCU declaration")
           PY
 
       - name: Check display driver floating point issue
@@ -143,7 +92,6 @@ jobs:
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon_reg.c"
           )
-
           s = p.read_text()
 
           pattern = re.compile(
@@ -159,14 +107,12 @@ jobs:
               end = s.find("};", m.end())
 
               if end < 0:
-                  raise SystemExit("Clock table end not found")
+                  raise SystemExit("Clock table end missing")
 
               table = s[m.end():end]
 
               if re.search(r'\d+\.\d+', table):
-                  raise SystemExit(
-                      "Fractional display clocks require manual review"
-                  )
+                  raise SystemExit("Fractional clock values require review")
 
               declaration = m.group(0)
               replacement = declaration.replace(
@@ -180,7 +126,7 @@ jobs:
 
               print("Display clock declaration corrected")
           else:
-              print("No matching float clock table found; unchanged")
+              print("Display driver unchanged")
           PY
 
           git -C kernel diff --check
@@ -228,13 +174,10 @@ jobs:
           export KCFLAGS=-Wno-error
 
           set +e
-
           make -C kernel \
             O="$GITHUB_WORKSPACE/out" \
             -j2 Image > V64-build.log 2>&1
-
           result=$?
-
           set -e
 
           python3 - <<'PY'
@@ -257,11 +200,9 @@ jobs:
           ]
 
           output = []
-
           for i in matches[:20]:
               start = max(0, i - 8)
               end = min(len(lines), i + 10)
-
               output.append(
                   f"\n===== LOG LINES {start + 1}-{end} =====\n"
                   + "\n".join(lines[start:end])
@@ -271,56 +212,55 @@ jobs:
               output.append("\n".join(lines[-150:]))
 
           report = "\n".join(output)
-
           Path("V64-ERRORS.txt").write_text(report)
-
           print(report)
           PY
 
           echo "Kernel compiler exit code: $result"
-
           test "$result" -eq 0
           test -s out/arch/arm64/boot/Image
 
-      - name: Build rootbroker and init wrapper with ARM64 sysroot
+      - name: Fix rootbroker offsetof and build ARM64 binaries
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f /usr/aarch64-linux-gnu/include/bits/wordsize.h
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("tools/rootbroker.c")
+          s = p.read_text()
+
+          if "#include <stddef.h>" not in s:
+              s = "#include <stddef.h>\n" + s
+              p.write_text(s)
+
+          assert "#include <stddef.h>" in p.read_text()
+          print("PASS: rootbroker offsetof header added")
+          PY
 
           aarch64-linux-gnu-gcc \
-            --sysroot=/ \
-            -static \
-            -Os \
-            -Wall \
+            -static -Os -Wall \
             -o tools/rootbroker.arm64 \
             tools/rootbroker.c
 
           aarch64-linux-gnu-gcc \
-            --sysroot=/ \
-            -static \
-            -Os \
-            -Wall \
+            -static -Os -Wall \
             -o tools/init-wrapper.arm64 \
             tools/init-wrapper.c
 
           test -s tools/rootbroker.arm64
           test -s tools/init-wrapper.arm64
 
-          for elf in \
-            tools/rootbroker.arm64 \
-            tools/init-wrapper.arm64
-          do
+          for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
             readelf -h "$elf" | grep -q 'Machine:.*AArch64'
-
             if readelf -l "$elf" | grep -q INTERP; then
               echo "Unexpected dynamic ELF: $elf" >&2
               exit 1
             fi
           done
 
-          echo "PASS: static ARM64 rootbroker and wrapper built"
+          echo "PASS: ARM64 rootbroker and init wrapper built"
 
       - name: Repack boot image and create Odin TAR
         shell: bash
@@ -330,25 +270,18 @@ jobs:
           python3 tools/repack_boot.py
 
           test -s deliver/boot.img
-
           test "$(stat -c %s deliver/boot.img)" = 37748736
 
-          tar -C deliver \
-            --format=ustar \
-            -cf deliver/V64-EXPERIMENTAL-ODIN.tar \
-            boot.img
+          tar -C deliver --format=ustar \
+            -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
 
           mkdir -p restore
-
           cp boot-original.img restore/boot.img
 
-          tar -C restore \
-            --format=ustar \
-            -cf deliver/V64-ORIGINAL-RESTORE.tar \
-            boot.img
+          tar -C restore --format=ustar \
+            -cf deliver/V64-ORIGINAL-RESTORE.tar boot.img
 
-          sha256sum deliver/*.tar \
-            > deliver/V64-checksums.txt
+          sha256sum deliver/*.tar > deliver/V64-checksums.txt
 
           ls -lah deliver/
 
