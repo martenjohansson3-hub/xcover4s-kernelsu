@@ -1,0 +1,6 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.xcover.rootmanager'
+    compileSdk 35
+    defaultConfig { applicationId 'com.xcover.rootmanager'; minSdk 30; targetSdk 30; versionCode 1; versionName '1.0-test' }
+}
