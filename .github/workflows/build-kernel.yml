@@ -1,5 +1,5 @@
 
-name: XCOVER4S V64 - Build and capture errors
+name: XCOVER4S V64 - CP Latch Rootbroker Odin Build
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 100
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -22,13 +22,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc bison flex git make \
-            clang lld gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev python3 \
-            cpio gzip xz-utils unzip
+            build-essential bc bison flex git make clang lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev python3 cpio gzip xz-utils unzip
 
-      - name: Verify original boot
+      - name: Verify original boot image
         shell: bash
         run: |
           set -euo pipefail
@@ -36,7 +34,7 @@ jobs:
           test -s boot-original.img
           echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
 
-      - name: Download pinned kernel
+      - name: Download pinned Samsung kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -47,7 +45,7 @@ jobs:
           git -C kernel checkout --detach \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply V64 patch
+      - name: Apply V64 CP patch
         shell: bash
         run: |
           set -euo pipefail
@@ -67,21 +65,95 @@ jobs:
               s = s.replace(old, new)
               p.write_text(s)
 
-          assert new in p.read_text()
-          print("V64 SRCU declaration checked")
+          if new not in p.read_text():
+              raise SystemExit("V64 SRCU declaration missing")
+
+          print("V64 SRCU checked")
+          PY
+
+      - name: Fix Exynos 7885 display clock floating point error
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c"
+          )
+
+          s = p.read_text()
+
+          # The display clock table must not use floating-point
+          # types inside an ARM64 kernel compiled with
+          # -mgeneral-regs-only.
+          #
+          # Only convert the table when its declaration matches
+          # the expected Samsung source.
+
+          pattern = re.compile(
+              r'\b(?:static\s+)?(?:const\s+)?'
+              r'(?:double|float)\s+'
+              r'(decon_clocks_table\s*\[[^\n;]*?\])'
+          )
+
+          matches = list(pattern.finditer(s))
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Cannot uniquely identify floating-point "
+                  "decon_clocks_table declaration. "
+                  "Refusing unsafe replacement."
+              )
+
+          m = matches[0]
+          declaration = m.group(0)
+
+          # Use integer clock values rather than floating point.
+          # This requires the table values to be integral.
+          table_start = m.end()
+          table_end = s.find("};", table_start)
+
+          if table_end < 0:
+              raise SystemExit("Display clock table end not found")
+
+          table = s[table_start:table_end]
+
+          if re.search(r'\d+\.\d+', table):
+              raise SystemExit(
+                  "Clock table contains fractional values; "
+                  "cannot convert safely without scaling."
+              )
+
+          replacement = declaration.replace(
+              "double", "unsigned long"
+          ).replace(
+              "float", "unsigned long"
+          )
+
+          s = s[:m.start()] + replacement + s[m.end():]
+
+          p.write_text(s)
+
+          print("Display clock table converted to integers")
           PY
 
           git -C kernel diff --check
 
-      - name: Configure kernel
+      - name: Configure ARM64 kernel
         shell: bash
         run: |
           set -euo pipefail
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CC=clang
+          export LD=aarch64-linux-gnu-ld
           export KCFLAGS=-Wno-error
 
           mkdir -p out
@@ -100,7 +172,7 @@ jobs:
 
           grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
 
-      - name: Compile V64 and capture first real error
+      - name: Compile kernel and capture errors
         id: compile
         shell: bash
         run: |
@@ -121,14 +193,14 @@ jobs:
           result=$?
           set -e
 
-          echo "BUILD_EXIT_CODE=$result" >> "$GITHUB_ENV"
-
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          log = Path("V64-build.log").read_text(errors="replace")
-          lines = log.splitlines()
+          lines = Path("V64-build.log").read_text(
+              errors="replace"
+          ).splitlines()
+
           pattern = re.compile(
               r"fatal error:|error:|undefined reference|"
               r"multiple definition|No rule to make target|"
@@ -141,7 +213,7 @@ jobs:
           ]
 
           output = []
-          for i in matches[:30]:
+          for i in matches[:20]:
               start = max(0, i - 8)
               end = min(len(lines), i + 10)
               output.append(
@@ -150,10 +222,7 @@ jobs:
               )
 
           if not output:
-              output.append(
-                  "No explicit compiler error matched.\n"
-                  + "\n".join(lines[-150:])
-              )
+              output.append("\n".join(lines[-150:]))
 
           report = "\n".join(output)
           Path("V64-ERRORS.txt").write_text(report)
@@ -161,15 +230,10 @@ jobs:
           PY
 
           echo "Compiler exit code: $result"
-
-          if [ "$result" -ne 0 ]; then
-            exit 1
-          fi
-
+          test "$result" -eq 0
           test -s out/arch/arm64/boot/Image
 
       - name: Build rootbroker and init wrapper
-        if: steps.compile.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -187,8 +251,7 @@ jobs:
           test -s tools/rootbroker.arm64
           test -s tools/init-wrapper.arm64
 
-      - name: Repack boot and create Odin TAR
-        if: steps.compile.outcome == 'success'
+      - name: Repack boot image and create Odin TAR
         shell: bash
         run: |
           set -euo pipefail
@@ -210,7 +273,7 @@ jobs:
           sha256sum deliver/*.tar \
             > deliver/V64-checksums.txt
 
-      - name: Upload diagnostics and boot files
+      - name: Upload results and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -223,21 +286,3 @@ jobs:
             deliver/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Final status
-        if: always()
-        shell: bash
-        run: |
-          echo "===================================="
-          echo "XCOVER4S V64 BUILD RESULT"
-          echo "===================================="
-
-          if [ -f V64-ERRORS.txt ]; then
-            cat V64-ERRORS.txt
-          fi
-
-          if [ -s deliver/V64-EXPERIMENTAL-ODIN.tar ]; then
-            echo "Odin TAR generated, not hardware-verified."
-          else
-            echo "No completed Odin TAR."
-          fi
