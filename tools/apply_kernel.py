@@ -1,337 +1,362 @@
 
-#!/usr/bin/env python3
-"""V64 CP software latch patch for Samsung Exynos 7885.
-
-Experimental: does not establish physical CP power-off or complete
-coverage of modem restart paths.
-"""
-
-from pathlib import Path
-import re
-
-ROOT = Path("kernel")
-CP = ROOT / "drivers/soc/samsung/cal-if/pmucal_cp.c"
-MODEM = ROOT / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
-
-for path in (CP, MODEM):
-    if not path.is_file():
-        raise SystemExit(f"Missing source: {path}")
-
-cp_source = CP.read_text()
-modem_source = MODEM.read_text()
-
-if "v64_cp_latched" in cp_source:
-    raise SystemExit("V64 CP patch already applied")
-
-if "v64_cp_read_enter" in modem_source:
-    raise SystemExit("V64 modem patch already applied")
-
-
-def wrap_function(source, name, signature, is_static=False):
-    prefix = r"static\s+" if is_static else ""
-
-    pattern = re.compile(
-        r"(?m)^"
-        + prefix
-        + r"int\s+"
-        + re.escape(name)
-        + r"\s*\(\s*"
-        + re.escape(signature)
-        + r"\s*\)\s*\{"
-    )
-
-    matches = list(pattern.finditer(source))
-
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"Expected one definition of {name}, found {len(matches)}"
-        )
-
-    match = matches[0]
-
-    closing = re.search(
-        r"(?m)^\}\s*$",
-        source[match.end():]
-    )
-
-    if closing is None:
-        raise RuntimeError(
-            f"Cannot locate end of {name}"
-        )
-
-    end = match.end() + closing.end()
-
-    original = source[match.start():end]
-
-    renamed = re.sub(
-        r"\b" + re.escape(name) + r"\b",
-        "v64_original_" + name,
-        original,
-        count=1
-    )
-
-    arguments = "" if signature == "void" else "mc"
-    storage = "static " if is_static else ""
-
-    wrapper = f"""
-{storage}int {name}({signature})
-{{
-    int cookie;
-    int ret;
-
-    cookie = v64_cp_read_enter();
-
-    if (cookie < 0)
-        return cookie;
-
-    ret = v64_original_{name}({arguments});
-
-    v64_cp_read_leave(cookie);
-
-    return ret;
-}}
-"""
-
-    return (
-        source[:match.start()]
-        + renamed
-        + "\n"
-        + wrapper
-        + source[end:]
-    )
-
-
-# Add kernel headers and forward declarations.
-cp_source = """#include <linux/srcu.h>
-#include <linux/mutex.h>
-#include <linux/errno.h>
-#include <linux/kernel.h>
-#include <linux/kobject.h>
-#include <linux/sysfs.h>
-#include <linux/init.h>
-
-int v64_cp_read_enter(void);
-void v64_cp_read_leave(int cookie);
-
-""" + cp_source
-
-
-# Protect selected low-level CP initialization/release paths.
-for function in (
-    "pmucal_cp_init",
-    "pmucal_cp_reset_release",
-):
-    cp_source = wrap_function(
-        cp_source,
-        function,
-        "void"
-    )
-
-
-# Avoid kernel panic at the reviewed CP reset failure sites.
-for statement in (
-    'panic("cp reset assert fail");',
-    'panic("cp reset release fail");',
-):
-    if cp_source.count(statement) != 1:
-        raise RuntimeError(
-            f"Unexpected panic site: {statement}"
-        )
-
-    cp_source = cp_source.replace(
-        statement,
-        "/* V64: panic removed; inspect error propagation. */",
-        1
-    )
-
-
-# Protect selected Samsung modem controller paths.
-modem_source = """/* V64 CP software latch hooks */
-extern int v64_cp_read_enter(void);
-extern void v64_cp_read_leave(int cookie);
-
-""" + modem_source
-
-for function in (
-    "ss310ap_on",
-    "ss310ap_reset",
-    "ss310ap_boot_on",
-    "ss310ap_dump_start",
-):
-    modem_source = wrap_function(
-        modem_source,
-        function,
-        "struct modem_ctl *mc",
-        is_static=True
-    )
-
-
-# The latch is created in the CP source.
-# IMPORTANT: DEFINE_SRCU already supplies static in this kernel.
-# Never write "static DEFINE_SRCU".
-cp_source += r"""
-
-/* V64 one-way software CP latch. */
-DEFINE_SRCU(v64_cp_srcu);
-static DEFINE_MUTEX(v64_cp_set_mutex);
-
-static int v64_cp_latched;
-static int v64_cp_result = -EAGAIN;
-
-int v64_cp_read_enter(void)
-{
-    int cookie = srcu_read_lock(&v64_cp_srcu);
-
-    if (READ_ONCE(v64_cp_latched)) {
-        srcu_read_unlock(&v64_cp_srcu, cookie);
-        return -EPERM;
-    }
-
-    return cookie;
-}
-
-void v64_cp_read_leave(int cookie)
-{
-    srcu_read_unlock(&v64_cp_srcu, cookie);
-}
-
-static ssize_t v64_hard_off_lock_show(
-    struct kobject *kobj,
-    struct kobj_attribute *attr,
-    char *buf)
-{
-    return scnprintf(
-        buf,
-        PAGE_SIZE,
-        "%d\n",
-        READ_ONCE(v64_cp_latched)
-    );
-}
-
-static ssize_t v64_hard_off_result_show(
-    struct kobject *kobj,
-    struct kobj_attribute *attr,
-    char *buf)
-{
-    return scnprintf(
-        buf,
-        PAGE_SIZE,
-        "%d\n",
-        READ_ONCE(v64_cp_result)
-    );
-}
-
-static ssize_t v64_hard_off_lock_store(
-    struct kobject *kobj,
-    struct kobj_attribute *attr,
-    const char *buf,
-    size_t count)
-{
-    int ret;
-
-    if (count != 2 || buf[0] != '1' || buf[1] != '\n')
-        return -EINVAL;
-
-    mutex_lock(&v64_cp_set_mutex);
-
-    if (READ_ONCE(v64_cp_latched)) {
-        mutex_unlock(&v64_cp_set_mutex);
-        return -EPERM;
-    }
-
-    WRITE_ONCE(v64_cp_latched, 1);
-
-    synchronize_srcu(&v64_cp_srcu);
-
-    ret = pmucal_cp_reset_assert();
-
-    WRITE_ONCE(v64_cp_result, ret);
-
-    mutex_unlock(&v64_cp_set_mutex);
-
-    return ret ? ret : count;
-}
-
-static struct kobj_attribute v64_lock_attr =
-    __ATTR(
-        hard_off_lock,
-        0600,
-        v64_hard_off_lock_show,
-        v64_hard_off_lock_store
-    );
-
-static struct kobj_attribute v64_result_attr =
-    __ATTR(
-        hard_off_result,
-        0400,
-        v64_hard_off_result_show,
-        NULL
-    );
-
-static int __init v64_cp_sysfs_init(void)
-{
-    struct kobject *kobj;
-    int ret;
-
-    kobj = kobject_create_and_add(
-        "cp_control",
-        kernel_kobj
-    );
-
-    if (!kobj)
-        return -ENOMEM;
-
-    ret = sysfs_create_file(
-        kobj,
-        &v64_lock_attr.attr
-    );
-
-    if (!ret)
-        ret = sysfs_create_file(
-            kobj,
-            &v64_result_attr.attr
-        );
-
-    if (ret)
-        kobject_put(kobj);
-
-    return ret;
-}
-
-late_initcall(v64_cp_sysfs_init);
-"""
-
-
-# Check the generated output before modifying source files.
-if "static DEFINE_SRCU(v64_cp_srcu)" in cp_source:
-    raise RuntimeError("Duplicate-static SRCU declaration")
-
-if cp_source.count("DEFINE_SRCU(v64_cp_srcu);") != 1:
-    raise RuntimeError("Invalid SRCU declaration count")
-
-for function in (
-    "pmucal_cp_init",
-    "pmucal_cp_reset_release",
-):
-    if f"v64_original_{function}" not in cp_source:
-        raise RuntimeError(f"Missing wrapper for {function}")
-
-for function in (
-    "ss310ap_on",
-    "ss310ap_reset",
-    "ss310ap_boot_on",
-    "ss310ap_dump_start",
-):
-    if f"v64_original_{function}" not in modem_source:
-        raise RuntimeError(f"Missing wrapper for {function}")
-
-
-CP.write_text(cp_source)
-MODEM.write_text(modem_source)
-
-print("V64 CP patch applied")
-print("PASS: DEFINE_SRCU without duplicate static")
-print("CP:", CP)
-print("MODEM:", MODEM)
-print("SELinux unchanged")
-print("Rootbroker and boot repacking handled by workflow")
+name: XCOVER4S V64 - Display Fix and Rootbroker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-v64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 100
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex git make clang lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross linux-libc-dev-arm64-cross \
+            libssl-dev libelf-dev python3 cpio gzip xz-utils unzip
+
+      - name: Verify original boot image
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -o boot-original-for-github.zip -d .
+          test -s boot-original.img
+          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
+
+      - name: Download pinned Samsung kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git -C kernel fetch --depth 1 origin \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git -C kernel checkout --detach \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          test "$(git -C kernel rev-parse HEAD)" = \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
+      - name: Apply V64 CP patch and verify SRCU
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/apply_kernel.py
+          python3 tools/apply_kernel.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("kernel/drivers/soc/samsung/cal-if/pmucal_cp.c")
+          s = p.read_text()
+
+          s = re.sub(
+              r'\bstatic\s+DEFINE_SRCU\s*\(\s*v64_cp_srcu\s*\)\s*;',
+              'DEFINE_SRCU(v64_cp_srcu);',
+              s
+          )
+
+          p.write_text(s)
+
+          if re.search(r'\bstatic\s+DEFINE_SRCU\s*\(', s):
+              raise SystemExit("Invalid static DEFINE_SRCU")
+
+          if s.count("DEFINE_SRCU(v64_cp_srcu);") != 1:
+              raise SystemExit("SRCU declaration count incorrect")
+
+          print("PASS: CP SRCU declaration")
+          PY
+
+      - name: Diagnose and correct display clock types
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c"
+          )
+
+          s = p.read_text()
+          lines = s.splitlines()
+
+          print("=== Clock declarations ===")
+          for i, line in enumerate(lines, 1):
+              if (
+                  "decon_clocks_table" in line
+                  or "decon_reg_get_clock_ratio" in line
+              ):
+                  print(f"{i}: {line}")
+
+          # Identify the actual declaration, allowing qualifiers,
+          # whitespace, and multidimensional arrays.
+          pattern = re.compile(
+              r'\b(?P<type>float|double)\s+'
+              r'(?P<name>decon_clocks_table)'
+              r'(?P<dimensions>(?:\s*\[[^\]]*\])+)',
+              re.S
+          )
+
+          matches = list(pattern.finditer(s))
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Expected exactly one float/double "
+                  "decon_clocks_table declaration; "
+                  f"found {len(matches)}. "
+                  "Source inspection required."
+              )
+
+          m = matches[0]
+
+          # Refuse a conversion if fractional literals occur in
+          # the initializer. Such values require manual handling.
+          initializer_start = s.find("=", m.end())
+          initializer_end = s.find("};", m.end())
+
+          if (
+              initializer_start < 0
+              or initializer_end < initializer_start
+          ):
+              raise SystemExit(
+                  "Cannot safely locate clock table initializer"
+              )
+
+          initializer = s[
+              initializer_start:initializer_end
+          ]
+
+          if re.search(
+              r'\b\d+\.\d+(?:[fFlL])?\b',
+              initializer
+          ):
+              raise SystemExit(
+                  "Fractional clock values detected; "
+                  "automatic integer conversion refused"
+              )
+
+          s = (
+              s[:m.start("type")]
+              + "unsigned long"
+              + s[m.end("type"):]
+          )
+
+          p.write_text(s)
+
+          print("PASS: decon_clocks_table integer conversion")
+          PY
+
+          git -C kernel diff --check
+
+      - name: Configure ARM64 kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+
+          mkdir -p out
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            lineage_xcover4s_defconfig
+
+          kernel/scripts/config --file out/.config \
+            -e CP_PMUCAL \
+            -e OVERLAY_FS
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            olddefconfig
+
+          grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
+
+      - name: Fast display driver compilation test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            -j2 \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
+            2>&1 | tee V64-display-test.log
+
+          test -s \
+            out/drivers/video/fbdev/exynos/dpu_7885/decon_reg.o
+
+          echo "PASS: display driver compiled"
+
+      - name: Compile V64 kernel
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+
+          set +e
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            -j2 Image > V64-build.log 2>&1
+          result=$?
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          lines = Path("V64-build.log").read_text(
+              errors="replace"
+          ).splitlines()
+
+          pattern = re.compile(
+              r"fatal error:|error:|undefined reference|"
+              r"multiple definition|No rule to make target|"
+              r"Error [1-9][0-9]*"
+          )
+
+          matches = [
+              i for i, line in enumerate(lines)
+              if pattern.search(line)
+          ]
+
+          output = []
+
+          for i in matches[:20]:
+              start = max(0, i - 8)
+              end = min(len(lines), i + 10)
+
+              output.append(
+                  f"\n===== LOG LINES {start + 1}-{end} =====\n"
+                  + "\n".join(lines[start:end])
+              )
+
+          if not output:
+              output.append("\n".join(lines[-150:]))
+
+          report = "\n".join(output)
+
+          Path("V64-ERRORS.txt").write_text(report)
+          print(report)
+          PY
+
+          echo "Kernel compiler exit code: $result"
+
+          test "$result" -eq 0
+          test -s out/arch/arm64/boot/Image
+
+      - name: Fix rootbroker offsetof and build ARM64 binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("tools/rootbroker.c")
+          s = p.read_text()
+
+          if "#include <stddef.h>" not in s:
+              s = "#include <stddef.h>\n" + s
+              p.write_text(s)
+
+          print("PASS: rootbroker stddef.h")
+          PY
+
+          aarch64-linux-gnu-gcc \
+            -static -Os -Wall \
+            -o tools/rootbroker.arm64 \
+            tools/rootbroker.c
+
+          aarch64-linux-gnu-gcc \
+            -static -Os -Wall \
+            -o tools/init-wrapper.arm64 \
+            tools/init-wrapper.c
+
+          for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
+            test -s "$elf"
+            readelf -h "$elf" | grep -q 'Machine:.*AArch64'
+
+            if readelf -l "$elf" | grep -q INTERP; then
+              echo "Unexpected dynamic ELF: $elf" >&2
+              exit 1
+            fi
+          done
+
+          echo "PASS: ARM64 rootbroker and init wrapper"
+
+      - name: Repack boot image and create Odin TAR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 tools/repack_boot.py
+
+          test -s deliver/boot.img
+
+          test "$(stat -c %s deliver/boot.img)" = 37748736
+
+          tar -C deliver --format=ustar \
+            -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
+
+          mkdir -p restore
+          cp boot-original.img restore/boot.img
+
+          tar -C restore --format=ustar \
+            -cf deliver/V64-ORIGINAL-RESTORE.tar boot.img
+
+          sha256sum deliver/*.tar \
+            > deliver/V64-checksums.txt
+
+          ls -lah deliver/
+
+      - name: Upload results even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V64-RESULTS
+          path: |
+            V64-build.log
+            V64-ERRORS.txt
+            V64-display-test.log
+            out/.config
+            out/arch/arm64/boot/Image
+            deliver/
+          if-no-files-found: warn
+          retention-days: 14
