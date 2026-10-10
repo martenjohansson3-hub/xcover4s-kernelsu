@@ -1,4 +1,3 @@
-
 name: XCOVER4S V64 - Experimental Odin boot with rootbroker and CP latch
 
 on:
@@ -11,6 +10,7 @@ jobs:
   build-v64:
     runs-on: ubuntu-22.04
     timeout-minutes: 100
+
     steps:
       - name: Check out your files
         uses: actions/checkout@v4
@@ -19,6 +19,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -s boot-original-for-github.zip
+          unzip -o boot-original-for-github.zip -d .
           test -s boot-original.img
           test -s tools/rootbroker.c
           test -s tools/init-wrapper.c
