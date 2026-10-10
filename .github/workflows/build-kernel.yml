@@ -1,5 +1,5 @@
 
-name: XCOVER4S V64 - CP Latch Rootbroker Odin Build
+name: XCOVER4S V64 - CP Rootbroker Odin Fixed
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 100
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -26,7 +26,7 @@ jobs:
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             libssl-dev libelf-dev python3 cpio gzip xz-utils unzip
 
-      - name: Verify original boot image
+      - name: Verify original boot
         shell: bash
         run: |
           set -euo pipefail
@@ -34,7 +34,7 @@ jobs:
           test -s boot-original.img
           echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
 
-      - name: Download pinned Samsung kernel
+      - name: Download Samsung kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -45,33 +45,60 @@ jobs:
           git -C kernel checkout --detach \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Apply V64 CP patch
+      - name: Apply CP patch and verify SRCU fix
         shell: bash
         run: |
           set -euo pipefail
+
           python3 -m py_compile tools/apply_kernel.py
           python3 tools/apply_kernel.py
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          p = Path("kernel/drivers/soc/samsung/cal-if/pmucal_cp.c")
+          p = Path(
+              "kernel/drivers/soc/samsung/cal-if/pmucal_cp.c"
+          )
           s = p.read_text()
 
-          old = "static DEFINE_SRCU(v64_cp_srcu);"
-          new = "DEFINE_SRCU(v64_cp_srcu);"
+          # Fix both forms, including whitespace variations.
+          pattern = re.compile(
+              r'\bstatic\s+DEFINE_SRCU\s*\(\s*v64_cp_srcu\s*\)\s*;'
+          )
 
-          if old in s:
-              s = s.replace(old, new)
+          matches = list(pattern.finditer(s))
+          if len(matches) > 1:
+              raise SystemExit(
+                  "More than one duplicate-static SRCU declaration"
+              )
+
+          if matches:
+              s = pattern.sub(
+                  "DEFINE_SRCU(v64_cp_srcu);", s, count=1
+              )
               p.write_text(s)
 
-          if new not in p.read_text():
-              raise SystemExit("V64 SRCU declaration missing")
+          s = p.read_text()
 
-          print("V64 SRCU checked")
+          if re.search(
+              r'\bstatic\s+DEFINE_SRCU\s*\(\s*v64_cp_srcu\s*\)',
+              s
+          ):
+              raise SystemExit("Duplicate static still present")
+
+          if s.count("DEFINE_SRCU(v64_cp_srcu);") != 1:
+              raise SystemExit(
+                  "Expected exactly one corrected SRCU declaration"
+              )
+
+          print("PASS: V64 SRCU duplicate-static fixed")
           PY
 
-      - name: Fix Exynos 7885 display clock floating point error
+          grep -n 'DEFINE_SRCU(v64_cp_srcu)' \
+            kernel/drivers/soc/samsung/cal-if/pmucal_cp.c
+
+      - name: Fix display clock floating point table
         shell: bash
         run: |
           set -euo pipefail
@@ -84,15 +111,7 @@ jobs:
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon_reg.c"
           )
-
           s = p.read_text()
-
-          # The display clock table must not use floating-point
-          # types inside an ARM64 kernel compiled with
-          # -mgeneral-regs-only.
-          #
-          # Only convert the table when its declaration matches
-          # the expected Samsung source.
 
           pattern = re.compile(
               r'\b(?:static\s+)?(?:const\s+)?'
@@ -101,33 +120,23 @@ jobs:
           )
 
           matches = list(pattern.finditer(s))
-
           if len(matches) != 1:
               raise SystemExit(
-                  "Cannot uniquely identify floating-point "
-                  "decon_clocks_table declaration. "
-                  "Refusing unsafe replacement."
+                  "Cannot uniquely identify decon_clocks_table"
               )
 
           m = matches[0]
-          declaration = m.group(0)
+          end = s.find("};", m.end())
+          if end < 0:
+              raise SystemExit("Clock table end missing")
 
-          # Use integer clock values rather than floating point.
-          # This requires the table values to be integral.
-          table_start = m.end()
-          table_end = s.find("};", table_start)
-
-          if table_end < 0:
-              raise SystemExit("Display clock table end not found")
-
-          table = s[table_start:table_end]
-
+          table = s[m.end():end]
           if re.search(r'\d+\.\d+', table):
               raise SystemExit(
-                  "Clock table contains fractional values; "
-                  "cannot convert safely without scaling."
+                  "Fractional clock values need explicit scaling"
               )
 
+          declaration = m.group(0)
           replacement = declaration.replace(
               "double", "unsigned long"
           ).replace(
@@ -135,15 +144,14 @@ jobs:
           )
 
           s = s[:m.start()] + replacement + s[m.end():]
-
           p.write_text(s)
 
-          print("Display clock table converted to integers")
+          print("PASS: display clock declaration corrected")
           PY
 
           git -C kernel diff --check
 
-      - name: Configure ARM64 kernel
+      - name: Configure kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -172,8 +180,7 @@ jobs:
 
           grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
 
-      - name: Compile kernel and capture errors
-        id: compile
+      - name: Compile V64 and save errors
         shell: bash
         run: |
           set -uo pipefail
@@ -251,7 +258,7 @@ jobs:
           test -s tools/rootbroker.arm64
           test -s tools/init-wrapper.arm64
 
-      - name: Repack boot image and create Odin TAR
+      - name: Repack boot and create Odin TAR
         shell: bash
         run: |
           set -euo pipefail
@@ -273,7 +280,7 @@ jobs:
           sha256sum deliver/*.tar \
             > deliver/V64-checksums.txt
 
-      - name: Upload results and diagnostics
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
