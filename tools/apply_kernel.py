@@ -1,3 +1,98 @@
+
+#!/usr/bin/env python3
+"""V64 CP software latch patch. Not proof of electrical CP power-off."""
+from pathlib import Path
+import re
+
+root = Path('kernel')
+cp = root / 'drivers/soc/samsung/cal-if/pmucal_cp.c'
+modem = root / 'drivers/misc/modem_v1/modem_ctrl_ss310ap.c'
+
+for p in (cp, modem):
+    if not p.is_file():
+        raise SystemExit(f'Missing source: {p}')
+
+# Fail before changing any file when input does not match the reviewed sources.
+a = cp.read_text()
+b = modem.read_text()
+if 'v64_cp_latched' in a or 'v64_cp_read_enter' in b:
+    raise SystemExit('V64 already present: refusing to apply twice')
+
+
+def wrap_function(src, name, signature, static=False):
+    # Original Samsung source: one top-level int function with a brace on next line.
+    regex = re.compile(r'(?m)^' + (r'static\s+' if static else '') +
+                       r'int\s+' + re.escape(name) +
+                       r'\s*\(\s*' + re.escape(signature) + r'\s*\)\s*\{')
+    matches = list(regex.finditer(src))
+    if len(matches) != 1:
+        raise RuntimeError(f'Expected exactly one {name} definition, found {len(matches)}')
+    m = matches[0]
+    # The reviewed files use a top-level closing brace at column zero.
+    close = re.search(r'(?m)^\}\s*$', src[m.end():])
+    if close is None:
+        raise RuntimeError(f'Cannot find closing brace for {name}')
+    end = m.end() + close.end()
+    original = src[m.start():end]
+    renamed = re.sub(r'\b' + re.escape(name) + r'\b', 'v64_original_' + name,
+                     original, count=1)
+    args = '' if signature == 'void' else 'mc'
+    prefix = 'static ' if static else ''
+    wrapper = f'''\n{prefix}int {name}({signature})
+{{
+    int cookie = v64_cp_read_enter();
+    int ret;
+    if (cookie < 0)
+        return cookie;
+    ret = v64_original_{name}({args});
+    v64_cp_read_leave(cookie);
+    return ret;
+}}
+'''
+    return src[:m.start()] + renamed + '\n' + wrapper + src[end:]
+
+for fn in ('pmucal_cp_init', 'pmucal_cp_reset_release'):
+    a = wrap_function(a, fn, 'void')
+for panic in ('panic("cp reset assert fail");', 'panic("cp reset release fail");'):
+    if a.count(panic) != 1:
+        raise RuntimeError(f'Unexpected panic occurrence: {panic}')
+    a = a.replace(panic, '/* V64: propagate existing error return, do not panic. */')
+
+# Guard the reviewed high-level modem paths as well as low-level PMUCAL.
+b = '''/* V64 CP software latch hooks */
+extern int v64_cp_read_enter(void);
+extern void v64_cp_read_leave(int cookie);
+''' + b
+for fn in ('ss310ap_on', 'ss310ap_reset', 'ss310ap_boot_on', 'ss310ap_dump_start'):
+    b = wrap_function(b, fn, 'struct modem_ctl *mc', static=True)
+
+# Functions are declared before their wrappers and implemented below.
+a = '''#include <linux/srcu.h>
+#include <linux/mutex.h>
+#include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/init.h>
+
+int v64_cp_read_enter(void);
+void v64_cp_read_leave(int cookie);
+
+''' + a
+
+a += r'''
+/* V64 software-only one-way latch; does not guarantee CP power isolation. */
+static DEFINE_SRCU(v64_cp_srcu);
+static DEFINE_MUTEX(v64_cp_set_mutex);
+static int v64_cp_latched;
+static int v64_cp_result = -EAGAIN;
+
+int v64_cp_read_enter(void)
+{
+    int cookie = srcu_read_lock(&v64_cp_srcu);
+    if (READ_ONCE(v64_cp_latched)) {
+        srcu_read_unlock(&v64_cp_srcu, cookie);
+        return -EPERM;
     }
     return cookie;
 }
@@ -30,11 +125,9 @@ static ssize_t v64_hard_off_lock_store(struct kobject *kobj,
         mutex_unlock(&v64_cp_set_mutex);
         return -EPERM;
     }
-    /* Latch first: reject new CP bring-up attempts and wait for in-flight calls. */
     WRITE_ONCE(v64_cp_latched, 1);
     synchronize_srcu(&v64_cp_srcu);
     ret = pmucal_cp_reset_assert();
-    /* Never silently re-arm CP if reset assertion fails. */
     WRITE_ONCE(v64_cp_result, ret);
     mutex_unlock(&v64_cp_set_mutex);
     return ret ? ret : count;
@@ -60,61 +153,12 @@ static int __init v64_cp_sysfs_init(void)
     return ret;
 }
 late_initcall(v64_cp_sysfs_init);
-
 '''
 
-def insert_after_function(src, func_name, wrapper):
-    rgx = re.compile(r'(?m)^((?:static\s+)?int\s+)'+re.escape(func_name)+r'(\s*\([^;]*?\)\s*\{)',re.S)
-    m = rgx.search(src)
-    if not m or len(list(rgx.finditer(src))) != 1:
-        raise RuntimeError(f'expected one {func_name} definition')
-    # Rename only the definition, preserving all nested body operations.
-    defn = src[m.start():m.end()].replace(func_name,'v64_original_'+func_name,1)
-    src=src[:m.start()]+defn+src[m.end():]
-    start=m.start()+len(defn)
-    # The Samsung source has preprocessor alternative branches whose C braces
-    # cannot be counted literally. Top-level closing braces begin in column 0.
-    end=re.search(r'(?m)^\}\s*$',src[start:])
-    if not end:
-        raise RuntimeError('could not find end of function '+func_name)
-    i=start+end.end()
-    return src[:i]+'\n\n'+wrapper+'\n'+src[i:]
-
-def wrapped(name, param='void'):
-    args = '' if param == 'void' else 'mc'
-    return f'''int {name}({param})
-{{
-    int cookie;
-    int ret;
-    cookie = v64_cp_read_enter();
-    if (cookie < 0)
-        return cookie;
-    ret = v64_original_{name}({args});
-    v64_cp_read_leave(cookie);
-    return ret;
-}}'''
-
-s=cp.read_text()
-assert 'v64_cp_srcu' not in s
-# Original cp function exists before any sysfs registration; forward declare.
-preamble=CP_PREAMBLE.replace('/* V64:', 'extern int pmucal_cp_reset_assert(void);\n\n/* V64:',1)
-s=preamble+s
-for name in ('pmucal_cp_init','pmucal_cp_reset_release'):
-    s=insert_after_function(s,name,wrapped(name))
-for line in ('panic("cp reset assert fail");','panic("cp reset release fail");'):
-    if s.count(line)!=1:raise RuntimeError('unexpected reset panic site '+line)
-    s=s.replace(line,'/* V64: return existing error code; do not panic. */')
-cp.write_text(s)
-
-s=modem.read_text()
-assert 'v64_cp_read_enter' not in s
-s='''/* CP action guard for CONFIG_CP_PMUCAL=y (verified V62 config). */
-extern int v64_cp_read_enter(void);
-extern void v64_cp_read_leave(int cookie);
-''' + s
-for name in ('ss310ap_on','ss310ap_reset','ss310ap_boot_on','ss310ap_dump_start'):
-    s=insert_after_function(s,name,wrapped(name,'struct modem_ctl *mc').replace('int '+name+'(', 'static int '+name+'(',1))
-modem.write_text(s)
-
-print('V64: CP patch applied', cp, modem)
-print('SELinux boot configuration is handled by workflow')
+# Verify outputs before writing either source file.
+assert 'int v64_cp_read_enter(void)' in a
+assert 'static int ss310ap_on(struct modem_ctl *mc)' in b
+cp.write_text(a)
+modem.write_text(b)
+print('V64 CP patch applied:', cp, modem)
+print('NOTE: SELinux, rootbroker, boot repack and other CP paths are not handled here.')
