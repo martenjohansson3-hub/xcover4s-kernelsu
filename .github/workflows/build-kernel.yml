@@ -1,4 +1,5 @@
-name: XCOVER4S V62 - CP Fix and Verification
+
+name: XCOVER4S V63 - Permanent CP Off Lock
 
 on:
   workflow_dispatch:
@@ -33,81 +34,61 @@ jobs:
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
-
           git -C kernel rev-parse HEAD | tee source-commit.txt
 
-      - name: Inspect CP implementation and correct V61 void assignment
+      - name: Verify permanent CP lock implementation
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          p = Path("kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c")
-          if not p.exists():
-              raise SystemExit("ERROR: Samsung CP source file missing")
+          root = Path("kernel")
+          modem = root / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
+          cal = root / "drivers/soc/samsung/cal-if/pmucal_cp.c"
 
-          s = p.read_text()
-          original = s
+          for path in (modem, cal):
+              if not path.is_file():
+                  raise SystemExit(f"Missing source: {path}")
 
-          print("Checking Samsung CP control source")
+          source = modem.read_text(errors="replace")
+          cal_source = cal.read_text(errors="replace")
 
-          for symbol in (
-              "ss310ap_off",
-              "cal_cp_reset_assert",
-              "cal_cp_reset_release",
-              "cal_cp_power_on",
-          ):
-              print(f"{symbol}: {'FOUND' if symbol in s else 'NOT FOUND'}")
+          required = {
+              "Manual hard-off interface": "hard_off_lock",
+              "Persistent in-memory lock": "cp_hard_off_latched",
+              "CP reset assertion": "cal_cp_reset_assert",
+              "CP reset release": "cal_cp_reset_release",
+              "CP power-on control": "cal_cp_power_on",
+          }
 
-          # Only correct a clearly identifiable V61-style assignment
-          # of a void-returning reset assertion function.
-          #
-          # Never replace arbitrary assignments or invent return values.
-          pattern = re.compile(
-              r'(?m)^([ \t]*)'
-              r'(?:int\s+)?'
-              r'(ret|result|rc)\s*=\s*'
-              r'cal_cp_reset_assert\s*\(\s*\)\s*;'
+          report = []
+          for label, symbol in required.items():
+              found = symbol in source or symbol in cal_source
+              report.append(
+                  f"{label}: {'FOUND' if found else 'MISSING'}"
+              )
+
+          Path("V63-CP-REVIEW.txt").write_text(
+              "\n".join(report) + "\n"
           )
 
-          matches = list(pattern.finditer(s))
+          print("\n".join(report))
 
-          if len(matches) == 1:
-              s = pattern.sub(
-                  lambda m: (
-                      m.group(1) +
-                      "cal_cp_reset_assert();"
-                  ),
-                  s,
-                  count=1
-              )
-              print("Corrected one void assignment")
-          elif len(matches) > 1:
-              raise SystemExit(
-                  "ERROR: Multiple possible void assignments; "
-                  "manual review required"
-              )
-          else:
-              print(
-                  "No exact void assignment found in this source. "
-                  "The V61 patch may be generated elsewhere."
-              )
+          # V63 must never silently build an ordinary kernel
+          # and claim the modem has a permanent hard-off lock.
+          #
+          # Presence of symbols alone is not sufficient:
+          # all power-on and reset-release paths must be
+          # reviewed, including callers outside these files.
+          #
+          # The verified patch must be added before this gate
+          # can be removed.
 
-          if s != original:
-              p.write_text(s)
-
-          Path("cp-source-inspection.txt").write_text(
-              "\n".join([
-                  f"source={p}",
-                  f"void_assignment_matches={len(matches)}",
-                  f"source_changed={s != original}",
-                  f"ss310ap_off={'ss310ap_off' in s}",
-                  f"cal_cp_reset_assert={'cal_cp_reset_assert' in s}",
-                  f"cal_cp_reset_release={'cal_cp_reset_release' in s}",
-                  f"cal_cp_power_on={'cal_cp_power_on' in s}",
-              ]) + "\n"
+          raise SystemExit(
+              "V63 BLOCKED: permanent CP hard-off patch "
+              "has not yet been verified against this "
+              "kernel source. Refusing unsafe build."
           )
           PY
 
@@ -120,40 +101,24 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
 
           mkdir -p out
+          make O=out lineage_xcover4s_defconfig
 
-          if [ -f arch/arm64/configs/lineage_xcover4s_defconfig ]; then
-            make O=out lineage_xcover4s_defconfig
-          else
-            echo "ERROR: Expected XCover4s defconfig not found"
-            find arch/arm64/configs -iname '*xcover*' -o -iname '*g398*'
-            exit 1
-          fi
-
-          # Request permissive SELinux at boot through kernel config.
-          # Runtime behavior still requires device verification.
-          if [ -x scripts/config ]; then
-            scripts/config --file out/.config \
-              -e SECURITY_SELINUX \
-              -e SECURITY_SELINUX_BOOTPARAM \
-              --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
-          fi
+          scripts/config --file out/.config \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_BOOTPARAM \
+            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=out ARCH=arm64 olddefconfig
-
           cp out/.config ../kernel-config.txt
 
-      - name: Build kernel with complete diagnostics
-        id: compile
+      - name: Build kernel
         run: |
           set -euo pipefail
-
           cd kernel
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-
-          set +e
 
           make \
             O=out \
@@ -169,177 +134,44 @@ jobs:
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             KCFLAGS=-Wno-error \
             -j2 Image \
-            > ../build.log 2>&1
+            2>&1 | tee ../build.log
 
-          result=$?
-
-          set -e
-
-          cd ..
-
-          # Keep the complete, unmodified build.log.
-          # Filter known objdump DWARF noise from console only.
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          lines = Path("build.log").read_text(
-              errors="replace"
-          ).splitlines()
-
-          noise = (
-              "Unrecognized form: 0x22",
-              "Unrecognized form: 0x23",
-              "Bogus end-of-siblings marker",
-              "Further warnings about bogus end-of-sibling",
-              "refers to abbreviation number",
-              "Corrupt attribute block length",
-              "Corrupt attribute",
-          )
-
-          filtered = []
-
-          for line in lines:
-              if "aarch64-linux-gnu-objdump: Warning:" in line:
-                  if any(n in line for n in noise):
-                      continue
-
-              if line.strip() in (
-                  "Unrecognized form: 0x22",
-                  "Unrecognized form: 0x23",
-              ):
-                  continue
-
-              filtered.append(line)
-
-          Path("build-console.log").write_text(
-              "\n".join(filtered) + "\n"
-          )
-
-          for line in filtered:
-              print(line)
-          PY
-
-          echo "build_exit_code=$result" >> "$GITHUB_OUTPUT"
-
-          if [ "$result" -ne 0 ]; then
-            echo "Kernel build failed with exit code $result"
-            exit "$result"
-          fi
-
-      - name: Check kernel image and CP safety requirements
-        run: |
-          set -euo pipefail
-
-          IMAGE=kernel/out/arch/arm64/boot/Image
-
-          if [ ! -s "$IMAGE" ]; then
-            echo "ERROR: Kernel Image missing or empty"
-            exit 1
-          fi
-
-          file "$IMAGE"
-          sha256sum "$IMAGE" | tee kernel-image-sha256.txt
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "kernel/drivers/misc/modem_v1/"
-              "modem_ctrl_ss310ap.c"
-          ).read_text()
-
-          required = {
-              "CP power-off implementation": "ss310ap_off",
-              "CP reset assertion": "cal_cp_reset_assert",
-              "CP restart path": "cal_cp_reset_release",
-          }
-
-          failures = []
-
-          for name, symbol in required.items():
-              found = symbol in source
-              print(f"{name}: {'FOUND' if found else 'MISSING'}")
-              if not found:
-                  failures.append(name)
-
-          # A symbol existing is not evidence that all restart
-          # paths are protected or that CP is electrically off.
-          #
-          # V62 must not be labelled flash-ready without a
-          # reviewed irreversible latch implementation.
-          report = [
-              "XCOVER4S V62 SAFETY REPORT",
-              "",
-              "Kernel Image: built",
-              "SELinux boot permissive: requested, untested",
-              "Rootbroker autostart: untested",
-              "Manual CP hard-off: not verified",
-              "Irreversible CP latch: not verified",
-              "All CP restart paths blocked: not verified",
-              "Physical modem shutdown: not verified",
-              "Wi-Fi after CP shutdown: untested",
-              "Odin flash package: NOT GENERATED",
-              "",
-              "This is a diagnostic build, NOT a flash release.",
-          ]
-
-          if failures:
-              report.append(
-                  "Missing symbols: " + ", ".join(failures)
-              )
-
-          Path("V62-SAFETY-REPORT.txt").write_text(
-              "\n".join(report) + "\n"
-          )
-
-          print("\n".join(report))
-          PY
-
-      - name: Collect source patch and diagnostic summary
+      - name: Collect source evidence
         if: always()
         run: |
           set -euo pipefail
-
           mkdir -p diagnostics
 
-          if [ -d kernel/.git ]; then
-            git -C kernel diff > diagnostics/kernel-changes.patch
-            git -C kernel status --short \
-              > diagnostics/source-status.txt
-          fi
-
           for f in \
-            build.log \
-            build-console.log \
             source-commit.txt \
+            V63-CP-REVIEW.txt \
             kernel-config.txt \
-            kernel-image-sha256.txt \
-            cp-source-inspection.txt \
-            V62-SAFETY-REPORT.txt
+            build.log
           do
             if [ -f "$f" ]; then
               cp "$f" diagnostics/
             fi
           done
 
-          if [ -f kernel/out/arch/arm64/boot/Image ]; then
-            cp kernel/out/arch/arm64/boot/Image \
-              diagnostics/Image
+          if [ -d kernel/.git ]; then
+            git -C kernel diff \
+              > diagnostics/kernel-changes.patch
           fi
 
-          grep -nEi \
-            '(^|[[:space:]])(fatal error:|error:|undefined reference|make: \*\*\*)' \
-            build.log \
-            > diagnostics/build-errors.txt || true
+          for f in \
+            drivers/misc/modem_v1/modem_ctrl_ss310ap.c \
+            drivers/soc/samsung/cal-if/pmucal_cp.c
+          do
+            if [ -f "kernel/$f" ]; then
+              cp "kernel/$f" diagnostics/
+            fi
+          done
 
-          echo "V62 diagnostic files collected"
-
-      - name: Upload V62 diagnostics
+      - name: Upload V63 source evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V62-DIAGNOSTICS
+          name: XCOVER4S-V63-CP-SOURCES
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 30
