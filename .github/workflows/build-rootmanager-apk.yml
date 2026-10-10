@@ -9,6 +9,7 @@ permissions:
 jobs:
   build-apk:
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -20,16 +21,25 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
+      - name: Prepare Android SDK
         run: |
           set -euo pipefail
 
-          sdkmanager --install \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          echo "Checking installed Android SDK..."
+
+          ls -la "$ANDROID_HOME/platforms" || true
+          ls -la "$ANDROID_HOME/build-tools" || true
+
+          test -d "$ANDROID_HOME/platforms/android-35"
+          test -d "$ANDROID_HOME/build-tools/35.0.0"
+
+          echo "Android SDK ready"
 
       - name: Prepare Android project
         run: |
@@ -47,7 +57,7 @@ jobs:
           cp MainActivity.java \
             XCoverRootManager/app/src/main/java/com/xcover/rootmanager/MainActivity.java
 
-          echo "Checking files..."
+          echo "Checking project files..."
 
           test -s XCoverRootManager/settings.gradle
           test -s XCoverRootManager/build.gradle
@@ -55,7 +65,7 @@ jobs:
           test -s XCoverRootManager/app/src/main/AndroidManifest.xml
           test -s XCoverRootManager/app/src/main/java/com/xcover/rootmanager/MainActivity.java
 
-      - name: Install Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
@@ -81,6 +91,8 @@ jobs:
 
           sha256sum deliver/XCoverRootManager-UNTESTED.apk \
             > deliver/SHA256SUMS.txt
+
+          echo "APK build completed"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
