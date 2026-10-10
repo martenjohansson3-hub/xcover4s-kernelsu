@@ -1,0 +1,90 @@
+name: Build XCover Root Manager APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Prepare Android project
+        run: |
+          set -euo pipefail
+
+          mkdir -p XCoverRootManager/app/src/main/java/com/xcover/rootmanager
+
+          cp settings.gradle XCoverRootManager/settings.gradle
+          cp build.gradle XCoverRootManager/build.gradle
+          cp "build (1).gradle" XCoverRootManager/app/build.gradle
+
+          cp AndroidManifest.xml \
+            XCoverRootManager/app/src/main/AndroidManifest.xml
+
+          cp MainActivity.java \
+            XCoverRootManager/app/src/main/java/com/xcover/rootmanager/MainActivity.java
+
+          echo "Checking files..."
+
+          test -s XCoverRootManager/settings.gradle
+          test -s XCoverRootManager/build.gradle
+          test -s XCoverRootManager/app/build.gradle
+          test -s XCoverRootManager/app/src/main/AndroidManifest.xml
+          test -s XCoverRootManager/app/src/main/java/com/xcover/rootmanager/MainActivity.java
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        working-directory: XCoverRootManager
+        run: |
+          set -euo pipefail
+
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+
+          APK="XCoverRootManager/app/build/outputs/apk/debug/app-debug.apk"
+
+          test -s "$APK"
+
+          mkdir -p deliver
+
+          cp "$APK" deliver/XCoverRootManager-UNTESTED.apk
+
+          sha256sum deliver/XCoverRootManager-UNTESTED.apk \
+            > deliver/SHA256SUMS.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCoverRootManager-UNTESTED-APK
+          path: deliver/
+          retention-days: 7
