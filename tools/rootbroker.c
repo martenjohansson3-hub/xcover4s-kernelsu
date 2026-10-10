@@ -1,137 +1,158 @@
 #define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <sched.h>
-#include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/mount.h>
-#include <sys/prctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <sys/wait.h>
 #include <unistd.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
-/* V64: explicit choice: no per-app authorization. Any app with su access may get UID 0. */
-#define SOCK_NAME "v64_auto_rootbroker"
-#define MAX_CMD 131072u
-#define APP_PATH "/system/bin:/system/xbin:/vendor/bin"
-static void logmsg(const char *msg) { int fd=open("/dev/kmsg",O_WRONLY|O_CLOEXEC); if(fd>=0){dprintf(fd,"V64-rootbroker: %s\n",msg);close(fd);} }
-static int send_all(int fd,const void *buf,size_t n){const char*p=buf;while(n){ssize_t r=write(fd,p,n);if(r<0&&errno==EINTR)continue;if(r<=0)return -1;p+=r;n-=r;}return 0;}
-static int recv_all(int fd,void *buf,size_t n){char*p=buf;while(n){ssize_t r=read(fd,p,n);if(r<0&&errno==EINTR)continue;if(r<=0)return -1;p+=r;n-=r;}return 0;}
-static int dial(void){int s=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0);if(s<0)return -1;struct sockaddr_un a={0};a.sun_family=AF_UNIX;a.sun_path[0]='\0';memcpy(a.sun_path+1,SOCK_NAME,sizeof(SOCK_NAME)-1);socklen_t len=offsetof(struct sockaddr_un,sun_path)+sizeof(SOCK_NAME);if(connect(s,(void*)&a,len)){close(s);return -1;}return s;}
-static int client(int argc,char **argv){
-    const char *cmd=NULL;char *joined=NULL;
-    if(argc>=3 && !strcmp(argv[1],"-c")){cmd=argv[2];}
-    else if(argc>=2 && !strcmp(argv[1],"-v")){puts("V64 su experimental");return 0;}
-    else if(argc>=2 && !strcmp(argv[1],"-V")){puts("64");return 0;}
-    else if(argc>=2 && strcmp(argv[1],"-")){
-        /* Some clients pass a command without -c. */
-        size_t n=0;for(int i=1;i<argc;i++)n+=strlen(argv[i])+1;
-        joined=malloc(n+1);if(!joined)return 1;joined[0]=0;
-        for(int i=1;i<argc;i++){if(i>1)strcat(joined," ");strcat(joined,argv[i]);}
-        cmd=joined;
+#define REQUEST_SOCK "/data/local/rootmanager/request.sock"
+#define CONTROL_SOCK "/data/local/rootmanager/control.sock"
+#define ALLOWLIST "/data/local/rootmanager/allowlist"
+#define DENYLIST  "/data/local/rootmanager/denylist"
+#define PENDING   "/data/local/rootmanager/pending"
+#define PACKAGES  "/data/system/packages.list"
+
+static int uid_in_file(const char *path, uid_t uid) {
+    FILE *f=fopen(path,"r"); unsigned int x;
+    if(!f) return 0;
+    while(fscanf(f,"%u",&x)==1) if((uid_t)x==uid){fclose(f);return 1;}
+    fclose(f); return 0;
+}
+static int add_uid(const char *path, uid_t uid) {
+    if(uid_in_file(path,uid)) return 0;
+    FILE *f=fopen(path,"a"); if(!f) return -1;
+    fprintf(f,"%u\n",(unsigned)uid); fclose(f); chmod(path,0600); return 0;
+}
+static int remove_uid(const char *path, uid_t uid) {
+    char tmp[256]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    FILE *in=fopen(path,"r"); if(!in) return 0;
+    FILE *out=fopen(tmp,"w"); if(!out){fclose(in);return -1;}
+    unsigned int x;
+    while(fscanf(in,"%u",&x)==1) if((uid_t)x!=uid) fprintf(out,"%u\n",x);
+    fclose(in); fclose(out); chmod(tmp,0600);
+    if(rename(tmp,path)!=0) return -1;
+    chmod(path,0600); return 0;
+}
+static uid_t manager_uid(void) {
+    FILE *f=fopen(PACKAGES,"r"); if(!f) return (uid_t)-1;
+    char line[4096], pkg[256]; unsigned int uid;
+    while(fgets(line,sizeof(line),f)) {
+        if(sscanf(line,"%255s %u",pkg,&uid)==2 && !strcmp(pkg,"com.xcover.rootmanager")) {
+            fclose(f); return (uid_t)uid;
+        }
     }
-    size_t n=cmd?strlen(cmd):0;
-    if(n>MAX_CMD){free(joined);return 1;}
-    int s=dial(); if(s<0){dprintf(2,"V64 su: broker unavailable: %s\n",strerror(errno));free(joined);return 1;}
-    uint32_t len=htonl((uint32_t)n);
-    if(send_all(s,&len,4)|| (n&&send_all(s,cmd,n))){close(s);free(joined);return 1;}
-    free(joined);
-    pid_t pid=fork();
-    if(pid==0){char buf[8192];for(;;){ssize_t r=read(0,buf,sizeof(buf));if(r<=0)break;if(send_all(s,buf,(size_t)r))break;}shutdown(s,SHUT_WR);_exit(0);}
-    char buf[8192];ssize_t r;
-    while((r=read(s,buf,sizeof(buf)))>0){if(send_all(1,buf,(size_t)r))break;}
-    close(s);
-    if(pid>0){kill(pid,SIGTERM);waitpid(pid,NULL,0);}
-    return r<0?1:0;
+    fclose(f); return (uid_t)-1;
 }
-static void reap(int sig){(void)sig;while(waitpid(-1,NULL,WNOHANG)>0){}}
-static int mkdir_safe(const char*p){if(mkdir(p,0700)&&errno!=EEXIST)return -1;return 0;}
-static int file_copy_fd(int in,const char *dst){
-    if(lseek(in,0,SEEK_SET)<0)return -1;
-    int out=open(dst,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0755);if(out<0){close(in);return -1;}
-    char buf[16384];ssize_t r;int ok=0;
-    while((r=read(in,buf,sizeof(buf)))>0)if(send_all(out,buf,(size_t)r)){ok=-1;break;}
-    if(r<0)ok=-1;
-    fchmod(out,0755);close(out);return ok;
+static void list_file(int fd,const char *path,const char *begin,const char *end) {
+    dprintf(fd,"%s\n",begin);
+    FILE *f=fopen(path,"r"); char line[64];
+    if(f){while(fgets(line,sizeof(line),f)) dprintf(fd,"%s",line); fclose(f);}
+    dprintf(fd,"%s\n",end);
 }
-static int install_overlay(const char *dir,const char *tag){
-    char upper[256],work[256],opt[768],client[300];
-    snprintf(upper,sizeof(upper),"/data/local/v64-root/%s-up",tag);
-    snprintf(work,sizeof(work),"/data/local/v64-root/%s-work",tag);
-    if(mkdir_safe(upper)||mkdir_safe(work))return -1;
-    snprintf(client,sizeof(client),"%s/su",upper);
-    int src=open("/data/local/v64-root/broker-binary",O_RDONLY|O_CLOEXEC);
-    if(src<0)return -1;
-    int copied=file_copy_fd(src,client);close(src);if(copied)return -1;
-    snprintf(opt,sizeof(opt),"lowerdir=%s,upperdir=%s,workdir=%s",dir,upper,work);
-    return mount("overlay",dir,"overlay",0,opt);
-}
-static void try_install_su(int broker_fd){
-    /* Wait for Android PID 1 to switch its root and for /data to be mounted. */
-    int ready=0;
-    for(int i=0;i<1200;i++){
-        if(access("/proc/1/root/system/bin/sh",X_OK)==0 && access("/proc/1/root/data/local",F_OK)==0){ready=1;break;}
-        usleep(100000);
+static void launch_popup(uid_t uid) {
+    pid_t p=fork();
+    if(p==0){
+        char u[32]; snprintf(u,sizeof(u),"%u",(unsigned)uid);
+        execl("/system/bin/am","am","start","-n","com.xcover.rootmanager/.MainActivity",
+              "--ei","uid",u,(char*)NULL);
+        _exit(127);
     }
-    if(!ready){logmsg("system root not accessible; su injection skipped");return;}
-    int ns=open("/proc/1/ns/mnt",O_RDONLY|O_CLOEXEC);
-    if(ns>=0){(void)setns(ns,CLONE_NEWNS);close(ns);}
-    if(chdir("/proc/1/root")||chroot(".")||chdir("/")){logmsg("failed joining Android root; su skipped");return;}
-    /* /data must be real encrypted userdata and not just an empty directory. */
-    ready=0;for(int i=0;i<1200;i++){
-       if(access("/data/system/packages.list",R_OK)==0){ready=1;break;}
-       usleep(100000);
-    }
-    if(!ready){logmsg("/data not ready; su skipped");return;}
-    if(mkdir_safe("/data/local/v64-root")){logmsg("failed mkdir su root");return;}
-    if(broker_fd<0 || file_copy_fd(broker_fd,"/data/local/v64-root/broker-binary")){logmsg("broker binary unavailable after switchroot");return;}
-    int ok=0;
-    if(access("/system/xbin",F_OK)==0 && install_overlay("/system/xbin","xbin")==0)ok++;
-    if(access("/system/bin",F_OK)==0 && install_overlay("/system/bin","bin")==0)ok++;
-    logmsg(ok?"su overlay mounted (device test required)":"failed mounting su overlays");
 }
-static void session(int fd){
-    if(chdir("/proc/1/root") || chroot(".") || chdir("/"))_exit(127);
-    uint32_t netlen; if(recv_all(fd,&netlen,4))_exit(2);
-    uint32_t n=ntohl(netlen);if(n>MAX_CMD)_exit(2);
-    char *cmd=NULL;
-    if(n){cmd=malloc((size_t)n+1);if(!cmd||recv_all(fd,cmd,n))_exit(2);cmd[n]=0;}
-    if(dup2(fd,0)<0||dup2(fd,1)<0||dup2(fd,2)<0)_exit(2);
-    if(fd>2)close(fd);
-    setenv("PATH",APP_PATH,1);
-    if(cmd)execl("/system/bin/sh","sh","-c",cmd,(char*)NULL);
-    else execl("/system/bin/sh","sh",(char*)NULL);
-    _exit(127);
+static int make_server(const char *path) {
+    int s=socket(AF_UNIX,SOCK_STREAM,0); if(s<0) return -1;
+    unlink(path);
+    struct sockaddr_un a; memset(&a,0,sizeof(a)); a.sun_family=AF_UNIX;
+    strncpy(a.sun_path,path,sizeof(a.sun_path)-1);
+    if(bind(s,(struct sockaddr*)&a,sizeof(a))<0){close(s);return -1;}
+    /* Peer credentials are verified on the control socket. */
+    chmod(path,0666);
+    if(listen(s,16)<0){close(s);return -1;}
+    return s;
 }
-static int daemon_run(void){
-    if(geteuid()!=0){logmsg("no uid0 at startup");return 1;}
-    struct sigaction sa={0};sa.sa_handler=reap;sa.sa_flags=SA_RESTART|SA_NOCLDSTOP;sigemptyset(&sa.sa_mask);sigaction(SIGCHLD,&sa,NULL);
-    int s=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0);
-    if(s<0)return 1;
-    struct sockaddr_un a={0};a.sun_family=AF_UNIX;a.sun_path[0]='\0';memcpy(a.sun_path+1,SOCK_NAME,sizeof(SOCK_NAME)-1);
-    if(bind(s,(void*)&a,offsetof(struct sockaddr_un,sun_path)+sizeof(SOCK_NAME))||listen(s,32)){close(s);return 1;}
-    /* Fork installer separately so incoming app requests are served. */
-    int binfd=open("/rootbroker-v64",O_RDONLY|O_CLOEXEC);
-    pid_t p=fork();if(p==0){close(s);try_install_su(binfd);_exit(0);}
-    if(binfd>=0)close(binfd);
-    for(;;){int fd=accept4(s,NULL,NULL,SOCK_CLOEXEC);if(fd<0){if(errno==EINTR)continue;usleep(100000);continue;}
-        struct ucred cr; socklen_t slen=sizeof(cr);
-        if(getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&cr,&slen)){close(fd);continue;}
-        pid_t child=fork();if(child==0){close(s);session(fd);}
+static void root_session(int fd) {
+    pid_t p=fork();
+    if(p==0){
+        dup2(fd,STDIN_FILENO); dup2(fd,STDOUT_FILENO); dup2(fd,STDERR_FILENO);
         close(fd);
+        execl("/system/bin/sh","sh",(char*)NULL);
+        _exit(127);
     }
 }
-int main(int argc,char **argv){
-    const char *base=strrchr(argv[0],'/');base=base?base+1:argv[0];
-    signal(SIGPIPE,SIG_IGN);
-    if(!strcmp(base,"su"))return client(argc,argv);
-    return daemon_run();
+static void handle_request(int fd, uid_t uid) {
+    if(uid<10000){dprintf(fd,"DENY protected_uid=%u\n",(unsigned)uid);return;}
+    if(uid_in_file(DENYLIST,uid)){dprintf(fd,"DENY uid=%u\n",(unsigned)uid);return;}
+    if(uid_in_file(ALLOWLIST,uid)){dprintf(fd,"ALLOW uid=%u\n",(unsigned)uid);root_session(fd);return;}
+
+    add_uid(PENDING,uid);
+    launch_popup(uid);
+    dprintf(fd,"PENDING uid=%u\n",(unsigned)uid);
+
+    for(int i=0;i<120;i++){ /* 60 seconds */
+        usleep(500000);
+        if(uid_in_file(ALLOWLIST,uid)){
+            remove_uid(PENDING,uid);
+            dprintf(fd,"ALLOW uid=%u\n",(unsigned)uid);
+            root_session(fd); return;
+        }
+        if(uid_in_file(DENYLIST,uid)){
+            remove_uid(PENDING,uid);
+            dprintf(fd,"DENY uid=%u\n",(unsigned)uid); return;
+        }
+    }
+    remove_uid(PENDING,uid);
+    dprintf(fd,"DENY timeout uid=%u\n",(unsigned)uid);
+}
+static void handle_control(int fd, uid_t peer) {
+    uid_t mu=manager_uid();
+    if(mu==(uid_t)-1 || peer!=mu){
+        dprintf(fd,"DENY control_uid=%u manager_uid=%u\n",(unsigned)peer,(unsigned)mu); return;
+    }
+    char c[256]; ssize_t n=read(fd,c,sizeof(c)-1); if(n<=0)return; c[n]=0;
+    unsigned int uid;
+    if(!strncmp(c,"LIST",4)) list_file(fd,ALLOWLIST,"LIST_BEGIN","LIST_END");
+    else if(!strncmp(c,"PENDING",7)) list_file(fd,PENDING,"PENDING_BEGIN","PENDING_END");
+    else if(!strncmp(c,"DENIED",6)) list_file(fd,DENYLIST,"DENIED_BEGIN","DENIED_END");
+    else if(sscanf(c,"ALLOW %u",&uid)==1 && uid>=10000 && uid<100000){
+        remove_uid(DENYLIST,uid); remove_uid(PENDING,uid); add_uid(ALLOWLIST,uid);
+        dprintf(fd,"ALLOW_OK uid=%u\n",uid);
+    } else if(sscanf(c,"DENY %u",&uid)==1 && uid>=10000 && uid<100000){
+        remove_uid(ALLOWLIST,uid); remove_uid(PENDING,uid); add_uid(DENYLIST,uid);
+        dprintf(fd,"DENY_OK uid=%u\n",uid);
+    } else if(sscanf(c,"ASK %u",&uid)==1 && uid>=10000 && uid<100000){
+        remove_uid(ALLOWLIST,uid); remove_uid(DENYLIST,uid); remove_uid(PENDING,uid);
+        dprintf(fd,"ASK_OK uid=%u\n",uid);
+    } else dprintf(fd,"ERROR unknown_command\n");
+}
+int main(void) {
+    mkdir("/data/local/rootmanager",0711);
+    const char *files[]={ALLOWLIST,DENYLIST,PENDING};
+    for(int i=0;i<3;i++){int f=open(files[i],O_CREAT|O_APPEND,0600);if(f>=0)close(f);}
+    int rs=make_server(REQUEST_SOCK), cs=make_server(CONTROL_SOCK);
+    if(rs<0||cs<0){perror("broker socket");return 1;}
+    fprintf(stderr,"rootbroker-final-test ready\n");
+    for(;;){
+        fd_set set; FD_ZERO(&set); FD_SET(rs,&set); FD_SET(cs,&set);
+        int mx=rs>cs?rs:cs;
+        if(select(mx+1,&set,NULL,NULL,NULL)<0) continue;
+        int which=FD_ISSET(rs,&set)?rs:cs;
+        int fd=accept(which,NULL,NULL); if(fd<0) continue;
+        struct ucred cr; socklen_t l=sizeof(cr);
+        if(getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&cr,&l)!=0){close(fd);continue;}
+        /* Serve requests concurrently: a pending root request must not block
+           the manager from sending ALLOW or DENY on the control socket. */
+        pid_t worker=fork();
+        if(worker==0){
+            close(rs); close(cs);
+            if(which==rs) handle_request(fd,cr.uid);
+            else handle_control(fd,cr.uid);
+            close(fd);
+            _exit(0);
+        }
+        close(fd);
+        while(waitpid(-1,NULL,WNOHANG)>0){}
+    }
 }

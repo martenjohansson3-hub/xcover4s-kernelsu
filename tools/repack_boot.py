@@ -20,7 +20,8 @@ if original[:8]!=b'ANDROID!':raise SystemExit('Invalid boot magic')
 ksize,ka,rsize,ra,ssize,sa,taddr,page,ver,osver=struct.unpack_from('<10I',original,8)
 if page!=2048 or ver!=1 or ssize!=0:raise SystemExit('Unknown boot format')
 roundp=lambda n:(n+page-1)//page*page
-kernel=Path('out/arch/arm64/boot/Image').read_bytes()
+kernel=original[page:page+ksize]
+assert hashlib.sha256(kernel).hexdigest()==hashlib.sha256(original[page:page+ksize]).hexdigest()
 if not (18_000_000<len(kernel)<30_000_000):raise SystemExit('Unexpected kernel image size')
 ram_off=page+roundp(ksize)
 old_ram=original[ram_off:ram_off+rsize]
@@ -33,12 +34,12 @@ with tempfile.TemporaryDirectory() as temp:
     init=stage/'init'
     if not init.is_file() or not initramfs.startswith(b'070701'):raise SystemExit('Missing original /init')
     init.rename(stage/'init.original')
-    for path,name in [('tools/init-wrapper.arm64','init'),('tools/rootbroker.arm64','rootbroker-v64')]:
+    for path,name in [('tools/init-wrapper.arm64','init'),('tools/rootbroker.arm64','rootbroker')]:
         dst=stage/name
         dst.write_bytes(Path(path).read_bytes())
         dst.chmod(0o755)
     # Require a static launcher and broker: they run before Android linker is mounted.
-    for name in ('init','rootbroker-v64'):
+    for name in ('init','rootbroker'):
         elf=(stage/name).read_bytes()
         if elf[:4]!=b'\x7fELF':raise SystemExit('Not ELF: '+name)
     # cpio --owner=0:0 preserves correct init boot root ownership after runner extraction.
@@ -100,5 +101,5 @@ assert hashlib.sha256(salt+newimage[:padded]).digest()==newimage[padded+off+nm+s
 assert gzip.decompress(ram)[:6]==b'070701'
 Path('deliver').mkdir(exist_ok=True)
 Path('deliver/boot.img').write_bytes(newimage)
-Path('deliver/V64-image-sha256.txt').write_text(hashlib.sha256(newimage).hexdigest()+'  boot.img\n')
-print('V64 boot.img created:',len(newimage),'bytes; kernel:',len(kernel),'ramdisk:',len(ram),'AVB:',padded,'verified')
+Path('deliver/ROOTBROKER-image-sha256.txt').write_text(hashlib.sha256(newimage).hexdigest()+'  boot.img\n')
+print('Rootbroker boot.img created:',len(newimage),'bytes; kernel:',len(kernel),'ramdisk:',len(ram),'AVB:',padded,'verified')
