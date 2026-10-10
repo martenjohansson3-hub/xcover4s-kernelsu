@@ -1,5 +1,5 @@
 
-name: XCOVER4S V63 - Permanent CP Off Lock
+name: XCOVER4S V64 - Experimental Odin boot with rootbroker and CP latch
 
 on:
   workflow_dispatch:
@@ -8,170 +8,126 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  build-v64:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
+    timeout-minutes: 100
     steps:
-      - name: Install build dependencies
+      - name: Check out your files
+        uses: actions/checkout@v4
+
+      - name: Confirm original /e/OS boot image and scripts
+        shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            git make python3 bc bison flex \
-            build-essential clang llvm lld \
-            gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi \
-            binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev \
-            libncurses-dev cpio zip unzip
+          test -s boot-original.img
+          test -s tools/rootbroker.c
+          test -s tools/init-wrapper.c
+          test -s tools/apply_kernel.py
+          test -s tools/repack_boot.py
+          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
 
-      - name: Download kernel source
+      - name: Install pinned build dependencies
+        shell: bash
         run: |
           set -euo pipefail
-          git clone \
-            --depth 1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-          git -C kernel rev-parse HEAD | tee source-commit.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex git make clang lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev python3 cpio gzip xz-utils
 
-      - name: Verify permanent CP lock implementation
+      - name: Get exactly the V62-tested kernel base
+        shell: bash
         run: |
           set -euo pipefail
+          git clone --depth 1 --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+          git -C kernel fetch --depth 1 origin 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          git -C kernel checkout --detach 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          test "$(git -C kernel rev-parse HEAD)" = 6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          root = Path("kernel")
-          modem = root / "drivers/misc/modem_v1/modem_ctrl_ss310ap.c"
-          cal = root / "drivers/soc/samsung/cal-if/pmucal_cp.c"
-
-          for path in (modem, cal):
-              if not path.is_file():
-                  raise SystemExit(f"Missing source: {path}")
-
-          source = modem.read_text(errors="replace")
-          cal_source = cal.read_text(errors="replace")
-
-          required = {
-              "Manual hard-off interface": "hard_off_lock",
-              "Persistent in-memory lock": "cp_hard_off_latched",
-              "CP reset assertion": "cal_cp_reset_assert",
-              "CP reset release": "cal_cp_reset_release",
-              "CP power-on control": "cal_cp_power_on",
-          }
-
-          report = []
-          for label, symbol in required.items():
-              found = symbol in source or symbol in cal_source
-              report.append(
-                  f"{label}: {'FOUND' if found else 'MISSING'}"
-              )
-
-          Path("V63-CP-REVIEW.txt").write_text(
-              "\n".join(report) + "\n"
-          )
-
-          print("\n".join(report))
-
-          # V63 must never silently build an ordinary kernel
-          # and claim the modem has a permanent hard-off lock.
-          #
-          # Presence of symbols alone is not sufficient:
-          # all power-on and reset-release paths must be
-          # reviewed, including callers outside these files.
-          #
-          # The verified patch must be added before this gate
-          # can be removed.
-
-          raise SystemExit(
-              "V63 BLOCKED: permanent CP hard-off patch "
-              "has not yet been verified against this "
-              "kernel source. Refusing unsafe build."
-          )
-          PY
-
-      - name: Configure kernel
+      - name: Patch kernel CP latch and early SELinux default
+        shell: bash
         run: |
           set -euo pipefail
-          cd kernel
+          python3 tools/apply_kernel.py
+          git -C kernel diff --check
+          git -C kernel diff > V64-applied-kernel.patch
+          test -s V64-applied-kernel.patch
 
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          mkdir -p out
-          make O=out lineage_xcover4s_defconfig
-
-          scripts/config --file out/.config \
-            -e SECURITY_SELINUX \
-            -e SECURITY_SELINUX_BOOTPARAM \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
-
-          make O=out ARCH=arm64 olddefconfig
-          cp out/.config ../kernel-config.txt
-
-      - name: Build kernel
+      - name: Build full ARM64 Image with CP PMUCAL and overlayfs
+        shell: bash
         run: |
           set -euo pipefail
-          cd kernel
-
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+          mkdir -p out
+          make -C kernel O="$GITHUB_WORKSPACE/out" lineage_xcover4s_defconfig
+          kernel/scripts/config --file out/.config \
+            -e CP_PMUCAL \
+            -e OVERLAY_FS \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_DEVELOP \
+            -e SECURITY_SELINUX_BOOTPARAM \
+            -d SECURITY_SELINUX_DISABLE
+          kernel/scripts/config --file out/.config --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+          make -C kernel O="$GITHUB_WORKSPACE/out" olddefconfig
+          grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
+          grep -qx 'CONFIG_OVERLAY_FS=y' out/.config
+          grep -qx 'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' out/.config
+          make -C kernel O="$GITHUB_WORKSPACE/out" -j2 Image 2>&1 | tee V64-build.log
+          test -s out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image
 
-          make \
-            O=out \
-            ARCH=arm64 \
-            CC=clang \
-            LD=aarch64-linux-gnu-ld \
-            AR=aarch64-linux-gnu-ar \
-            NM=aarch64-linux-gnu-nm \
-            OBJCOPY=aarch64-linux-gnu-objcopy \
-            OBJDUMP=aarch64-linux-gnu-objdump \
-            STRIP=aarch64-linux-gnu-strip \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-            KCFLAGS=-Wno-error \
-            -j2 Image \
-            2>&1 | tee ../build.log
-
-      - name: Collect source evidence
-        if: always()
+      - name: Build own static ARM64 rootbroker and init wrapper (NO KernelSU)
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p diagnostics
-
-          for f in \
-            source-commit.txt \
-            V63-CP-REVIEW.txt \
-            kernel-config.txt \
-            build.log
-          do
-            if [ -f "$f" ]; then
-              cp "$f" diagnostics/
+          aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror \
+            -o tools/rootbroker.arm64 tools/rootbroker.c
+          aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror \
+            -o tools/init-wrapper.arm64 tools/init-wrapper.c
+          file tools/rootbroker.arm64 tools/init-wrapper.arm64
+          for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
+            readelf -h "$elf" | grep -q 'Machine:.*AArch64'
+            if readelf -l "$elf" | grep -q INTERP; then
+              echo "ERROR: $elf is dynamically linked and unsafe for early boot" >&2
+              exit 1
             fi
           done
 
-          if [ -d kernel/.git ]; then
-            git -C kernel diff \
-              > diagnostics/kernel-changes.patch
-          fi
+      - name: Repack original boot ramdisk and update AVB hash footer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/repack_boot.py
+          test "$(stat -c %s deliver/boot.img)" = 37748736
+          tar -C deliver --format=ustar -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
+          mkdir -p restore
+          cp boot-original.img restore/boot.img
+          tar -C restore --format=ustar -cf deliver/V64-ORIGINAL-RESTORE.tar boot.img
+          cp V64-build.log V64-applied-kernel.patch out/.config deliver/
+          sha256sum deliver/*.tar deliver/boot.img > deliver/V64-checksums.txt
+          printf '%s\n' \
+            'V64 is FLASH-PACKAGED but has NOT been boot-tested on hardware.' \
+            'No KernelSU, Magisk or authorization prompt; any su caller receives UID 0.' \
+            'CP manually triggered: echo 1 > /sys/kernel/cp_control/hard_off_lock (as root).' \
+            'After trigger: cat /sys/kernel/cp_control/hard_off_result; 0 is syscall success, NOT RF proof.' \
+            'Physical radio shutdown and permanent CP inhibition are NOT verified.' \
+            'Init wrapper and overlayfs su visibility are experimental and may bootloop.' \
+            'Do not flash without Odin restore readiness and a verified download mode.' \
+            > deliver/IMPORTANT-READ-FIRST.txt
+          ls -lah deliver/
 
-          for f in \
-            drivers/misc/modem_v1/modem_ctrl_ss310ap.c \
-            drivers/soc/samsung/cal-if/pmucal_cp.c
-          do
-            if [ -f "kernel/$f" ]; then
-              cp "kernel/$f" diagnostics/
-            fi
-          done
-
-      - name: Upload V63 source evidence
-        if: always()
+      - name: Upload V64 Odin package and original restore
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V63-CP-SOURCES
-          path: diagnostics/
-          if-no-files-found: warn
-          retention-days: 30
+          name: XCOVER4S-V64-EXPERIMENTAL-FLASH-PACKAGE
+          path: deliver/
+          if-no-files-found: error
+          retention-days: 14
