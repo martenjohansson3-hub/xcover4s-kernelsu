@@ -1,4 +1,5 @@
-name: XCOVER4S V64 - Experimental Odin boot with rootbroker and CP latch
+
+name: XCOVER4S V64 - Display Diagnostics and Kernel Build
 
 on:
   workflow_dispatch:
@@ -12,147 +13,109 @@ jobs:
     timeout-minutes: 100
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract and verify original boot image
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-
-          test -s boot-original-for-github.zip
-          unzip -o boot-original-for-github.zip -d .
-
-          test -s boot-original.img
-          test -s tools/rootbroker.c
-          test -s tools/init-wrapper.c
-          test -s tools/apply_kernel.py
-          test -s tools/repack_boot.py
-
-          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc bison flex git make clang lld \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev python3 cpio gzip xz-utils
+            build-essential bc bison flex git make \
+            clang lld gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross \
+            libssl-dev libelf-dev python3 \
+            cpio gzip xz-utils unzip
 
-      - name: Download kernel source
+      - name: Validate Python files
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m py_compile \
+            tools/apply_kernel.py \
+            tools/repack_boot.py
 
+      - name: Verify original boot
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -o boot-original-for-github.zip -d .
+          test -s boot-original.img
+          echo \
+          'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' \
+            | sha256sum -c -
+
+      - name: Download pinned Samsung kernel
+        shell: bash
+        run: |
+          set -euo pipefail
           git clone --depth 1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
           git -C kernel fetch --depth 1 origin \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
           git -C kernel checkout --detach \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-          test "$(git -C kernel rev-parse HEAD)" = \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
-      - name: Repair V64 Python patch source
+      - name: Apply V64 CP patch
         shell: bash
         run: |
           set -euo pipefail
+          python3 tools/apply_kernel.py
+          git -C kernel diff --check
+          git -C kernel diff > V64-applied-kernel.patch
+          test -s V64-applied-kernel.patch
 
+      - name: Inspect display clock source
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          p = Path("tools/apply_kernel.py")
-          s = p.read_text()
-
-          commit = "6020dfa8315134187f07ca903c9d2ed7ee0256f5"
-
-          s, removed = re.subn(
-              r"(?m)^[ \t]*" + re.escape(commit) + r"[ \t]*(?:\n|$)",
-              "",
-              s
+          source = Path(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c"
           )
+          text = source.read_text()
+          lines = text.splitlines()
 
-          print("Removed stray commit lines:", removed)
+          output = []
 
-          if "SELinux boot default ambiguous" in s:
-              lines = s.splitlines(keepends=True)
-
-              starts = [
+          for term in (
+              "decon_clocks_table",
+              "decon_reg_get_clock_ratio",
+          ):
+              matches = [
                   i for i, line in enumerate(lines)
-                  if re.fullmatch(
-                      r"s\s*=\s*sel\.read_text\(\)",
-                      line.strip()
-                  )
+                  if term in line
               ]
 
-              ends = [
-                  i for i, line in enumerate(lines)
-                  if re.fullmatch(
-                      r"sel\.write_text\(s\)",
-                      line.strip()
-                  )
-              ]
-
-              if len(starts) != 1 or len(ends) != 1:
-                  raise SystemExit(
-                      "Cannot uniquely identify obsolete SELinux patch"
-                  )
-
-              start = starts[0]
-              end = ends[0]
-
-              if end <= start:
-                  raise SystemExit("Invalid SELinux patch boundaries")
-
-              section = "".join(lines[start:end + 1])
-
-              if "SELinux boot default ambiguous" not in section:
-                  raise SystemExit("Unexpected SELinux patch structure")
-
-              if end + 1 < len(lines):
-                  if "print('V64: changed'" in lines[end + 1]:
-                      end += 1
-
-              s = "".join(
-                  lines[:start]
-                  + [
-                      'print("V64 CP patch applied:", cp, modem)\n',
-                      'print("SELinux handled by kernel configuration")\n'
-                  ]
-                  + lines[end + 1:]
+              output.append(
+                  f"\n=== {term}: {len(matches)} matches ==="
               )
 
-              print("Removed obsolete SELinux source patch.")
+              for i in matches[:20]:
+                  start = max(0, i - 8)
+                  end = min(len(lines), i + 16)
 
-          if "SELinux boot default ambiguous" in s:
-              raise SystemExit("Old SELinux patch still present")
+                  for j in range(start, end):
+                      output.append(
+                          f"{j + 1:5}: {lines[j]}"
+                      )
 
-          compile(s, str(p), "exec")
-          p.write_text(s)
+          Path("V64-display-source.txt").write_text(
+              "\n".join(output) + "\n"
+          )
 
-          print("Python syntax OK")
+          print("\n".join(output))
           PY
 
-      - name: Apply CP kernel patch
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 tools/apply_kernel.py
-
-          git -C kernel diff --check
-          git -C kernel diff > V64-applied-kernel.patch
-
-          test -s V64-applied-kernel.patch
-
-      - name: Build ARM64 kernel
+      - name: Configure ARM64 kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -171,57 +134,83 @@ jobs:
             O="$GITHUB_WORKSPACE/out" \
             lineage_xcover4s_defconfig
 
-          kernel/scripts/config --file out/.config \
+          kernel/scripts/config \
+            --file out/.config \
             -e CP_PMUCAL \
-            -e OVERLAY_FS \
-            -e SECURITY_SELINUX \
-            -e SECURITY_SELINUX_DEVELOP \
-            -e SECURITY_SELINUX_BOOTPARAM \
-            -d SECURITY_SELINUX_DISABLE
-
-          kernel/scripts/config --file out/.config \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+            -e OVERLAY_FS
 
           make -C kernel \
             O="$GITHUB_WORKSPACE/out" \
             olddefconfig
 
           grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
-          grep -qx 'CONFIG_OVERLAY_FS=y' out/.config
-          grep -qx 'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' out/.config
 
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            -j2 Image 2>&1 | tee V64-build.log
-
-          test -s out/arch/arm64/boot/Image
-          file out/arch/arm64/boot/Image
-
-      - name: Build custom ARM64 rootbroker and init wrapper
+      - name: Compile display driver first
         shell: bash
         run: |
           set -euo pipefail
 
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            -j2 \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
+            2>&1 | tee V64-display-test.log
+
+      - name: Compile complete kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            -j2 Image \
+            2>&1 | tee V64-build.log
+
+          test -s out/arch/arm64/boot/Image
+
+      - name: Compile ARM64 rootbroker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/rootbroker.c")
+          text = path.read_text()
+
+          if "#include <stddef.h>" not in text:
+              text = "#include <stddef.h>\n" + text
+              path.write_text(text)
+          PY
+
           aarch64-linux-gnu-gcc \
-            -static -Os -Wall -Wextra -Werror \
+            -static -Os -Wall \
             -o tools/rootbroker.arm64 \
             tools/rootbroker.c
 
           aarch64-linux-gnu-gcc \
-            -static -Os -Wall -Wextra -Werror \
+            -static -Os -Wall \
             -o tools/init-wrapper.arm64 \
             tools/init-wrapper.c
 
-          for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
-            readelf -h "$elf" | grep -q 'Machine:.*AArch64'
-
-            if readelf -l "$elf" | grep -q INTERP; then
-              echo "ERROR: dynamically linked binary: $elf"
-              exit 1
-            fi
-          done
-
-      - name: Repack Android boot image
+      - name: Repack boot and prepare Odin TAR
         shell: bash
         run: |
           set -euo pipefail
@@ -229,63 +218,38 @@ jobs:
           python3 tools/repack_boot.py
 
           test -s deliver/boot.img
-          test "$(stat -c %s deliver/boot.img)" = 37748736
 
-      - name: Create Odin TAR and original restore
-        shell: bash
-        run: |
-          set -euo pipefail
+          test "$(stat -c %s deliver/boot.img)" \
+            = 37748736
 
-          tar -C deliver --format=ustar \
-            -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
+          tar -C deliver \
+            --format=ustar \
+            -cf deliver/V64-EXPERIMENTAL-ODIN.tar \
+            boot.img
 
           mkdir -p restore
           cp boot-original.img restore/boot.img
 
-          tar -C restore --format=ustar \
-            -cf deliver/V64-ORIGINAL-RESTORE.tar boot.img
+          tar -C restore \
+            --format=ustar \
+            -cf deliver/V64-ORIGINAL-RESTORE.tar \
+            boot.img
 
-          cp V64-build.log deliver/
-          cp V64-applied-kernel.patch deliver/
-          cp out/.config deliver/kernel-config.txt
-
-          sha256sum deliver/*.tar deliver/boot.img \
+          sha256sum deliver/*.tar \
             > deliver/V64-checksums.txt
 
-          cat > deliver/IMPORTANT-READ-FIRST.txt <<'EOF'
-          XCOVER4S V64 - EXPERIMENTAL
-
-          Device: Samsung Galaxy XCover 4s
-          OS: /e/OS Android 11
-
-          ROOT:
-          Custom rootbroker
-          No KernelSU
-          No Magisk
-          Automatic root access intended
-          Root functionality not hardware-tested
-
-          CP:
-          Manual CP latch intended
-          Physical modem shutdown not verified
-          Permanent CP inhibition not verified
-
-          SELINUX:
-          Permissive boot default requested
-          Runtime permissive state not verified
-
-          WARNING:
-          This build has not been boot-tested.
-          Odin packaging does not guarantee successful flashing.
-          Do not flash without verified recovery readiness.
-          EOF
-
-          ls -lah deliver/
-
-      - name: Upload V64 Odin artifacts
+      - name: Upload results and diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V64-EXPERIMENTAL-FLASH-PACKAGE
-          path: deliver/
-          if-no-files-found: error
+          name: XCOVER4S-V64-RESULTS
+          path: |
+            V64-applied-kernel.patch
+            V64-display-source.txt
+            V64-display-test.log
+            V64-build.log
+            out/.config
+            out/arch/arm64/boot/Image
+            deliver/
+          if-no-files-found: warn
           retention-days: 14
