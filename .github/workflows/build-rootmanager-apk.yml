@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-apk:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -21,7 +21,8 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Prepare Android SDK
+      - name: Check Android SDK
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -31,25 +32,17 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
-          echo "Checking installed Android SDK..."
-
-          ls -la "$ANDROID_HOME/platforms" || true
-          ls -la "$ANDROID_HOME/build-tools" || true
-
           test -d "$ANDROID_HOME/platforms/android-35"
           test -d "$ANDROID_HOME/build-tools/35.0.0"
 
           echo "Android SDK ready"
 
       - name: Prepare Android project
+        shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p XCoverRootManager/app/src/main/java/com/xcover/rootmanager
-
-          cp settings.gradle XCoverRootManager/settings.gradle
-          cp build.gradle XCoverRootManager/build.gradle
-          cp "build (1).gradle" XCoverRootManager/app/build.gradle
 
           cp AndroidManifest.xml \
             XCoverRootManager/app/src/main/AndroidManifest.xml
@@ -57,13 +50,64 @@ jobs:
           cp MainActivity.java \
             XCoverRootManager/app/src/main/java/com/xcover/rootmanager/MainActivity.java
 
-          echo "Checking project files..."
+          cat > XCoverRootManager/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = 'XCoverRootManager'
+          include ':app'
+          EOF
+
+          cat > XCoverRootManager/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > XCoverRootManager/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.xcover.rootmanager'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.xcover.rootmanager'
+                  minSdk 30
+                  targetSdk 30
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
 
           test -s XCoverRootManager/settings.gradle
           test -s XCoverRootManager/build.gradle
           test -s XCoverRootManager/app/build.gradle
           test -s XCoverRootManager/app/src/main/AndroidManifest.xml
           test -s XCoverRootManager/app/src/main/java/com/xcover/rootmanager/MainActivity.java
+
+          echo "Android project ready"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -72,12 +116,13 @@ jobs:
 
       - name: Build debug APK
         working-directory: XCoverRootManager
+        shell: bash
         run: |
           set -euo pipefail
-
-          gradle --no-daemon :app:assembleDebug
+          gradle --no-daemon --stacktrace :app:assembleDebug
 
       - name: Verify APK
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -92,7 +137,7 @@ jobs:
           sha256sum deliver/XCoverRootManager-UNTESTED.apk \
             > deliver/SHA256SUMS.txt
 
-          echo "APK build completed"
+          echo "APK successfully compiled"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
