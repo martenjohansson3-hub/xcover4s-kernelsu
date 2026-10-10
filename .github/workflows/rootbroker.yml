@@ -1,0 +1,86 @@
+name: XCOVER4S ROOTBROKER BUILD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cpio \
+            python3
+
+      - name: Download working boot backup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh release download boot-backup \
+            --repo "$GH_REPO" \
+            --pattern "boot-original.img" \
+            --dir .
+
+          echo \
+            "f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img" \
+            | sha256sum -c -
+
+      - name: Compile ARM64 Rootbroker
+        run: |
+          set -euo pipefail
+
+          aarch64-linux-gnu-gcc \
+            -static -Os -Wall -Wextra \
+            -o tools/rootbroker.arm64 \
+            tools/rootbroker.c
+
+          aarch64-linux-gnu-gcc \
+            -static -Os -Wall -Wextra -Werror \
+            -o tools/init-wrapper.arm64 \
+            tools/init-wrapper.c
+
+          readelf -h tools/rootbroker.arm64 | grep -q AArch64
+          readelf -h tools/init-wrapper.arm64 | grep -q AArch64
+
+      - name: Repack boot image
+        run: |
+          set -euo pipefail
+
+          python3 tools/repack_boot.py
+
+          test -s deliver/boot.img
+
+          test "$(stat -c %s deliver/boot.img)" = 37748736
+
+      - name: Package Odin image
+        run: |
+          set -euo pipefail
+
+          tar -C deliver \
+            -cf deliver/XCOVER4S-ROOTBROKER-UNTESTED-ODIN.tar \
+            boot.img
+
+          sha256sum deliver/boot.img \
+            > deliver/SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-ROOTBROKER-UNTESTED
+          path: deliver/
+          retention-days: 7
