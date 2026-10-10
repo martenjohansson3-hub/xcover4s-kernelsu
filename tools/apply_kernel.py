@@ -19,118 +19,142 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -s boot-original-for-github.zip
           unzip -o boot-original-for-github.zip -d .
-
           test -s boot-original.img
           test -s tools/rootbroker.c
           test -s tools/init-wrapper.c
           test -s tools/apply_kernel.py
           test -s tools/repack_boot.py
-
           echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
 
       - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
-
           sudo apt-get update -qq
-
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            git \
-            make \
-            clang \
-            lld \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            libssl-dev \
-            libelf-dev \
-            python3 \
-            cpio \
-            gzip \
-            xz-utils
+            build-essential bc bison flex git make clang lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev python3 cpio gzip xz-utils
 
       - name: Download kernel source
         shell: bash
         run: |
           set -euo pipefail
-
-          git clone \
-            --depth 1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
+          git clone --depth 1 --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
           git -C kernel fetch --depth 1 origin \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
           git -C kernel checkout --detach \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
           test "$(git -C kernel rev-parse HEAD)" = \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Fix old SELinux patch in apply_kernel.py
+      - name: Remove obsolete SELinux source patch
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
+          import ast
 
           p = Path("tools/apply_kernel.py")
-          s = p.read_text()
+          source = p.read_text()
+          tree = ast.parse(source, filename=str(p))
+          lines = source.splitlines(keepends=True)
 
-          old = """s=sel.read_text()
-          pattern=re.compile(r'(?m)^([ \\t]*(?:static[ \\t]+)?int[ \\t]+selinux_enforcing[ \\t]*=[ \\t]*)1([ \\t]*;)')
-          matches=list(pattern.finditer(s))
-          if len(matches)!=1:raise RuntimeError('SELinux boot default ambiguous; refusing to patch')
-          s=pattern.sub(r'\\g<1>0\\g<2>',s,count=1)
-          sel.write_text(s)
-          print('V64: changed',cp,modem,sel)"""
+          # Locate the obsolete top-level SELinux patch by its error message.
+          matches = []
+          for node in tree.body:
+              if isinstance(node, ast.If):
+                  segment = ast.get_source_segment(source, node) or ""
+                  if "SELinux boot default ambiguous" in segment:
+                      matches.append(node)
 
-          if old in s:
-              s = s.replace(
-                  old,
-                  'print("V64: CP patch applied", cp, modem)'
-              )
-              p.write_text(s)
-              print("Removed old SELinux source patch.")
-          elif "SELinux boot default ambiguous" in s:
+          if len(matches) != 1:
               raise SystemExit(
-                  "Unknown SELinux patch structure. "
-                  "Refusing automatic modification."
+                  "Expected exactly one obsolete SELinux check; "
+                  f"found {len(matches)}. Refusing unsafe modification."
               )
-          else:
-              print("Old SELinux patch already absent.")
 
-          compile(p.read_text(), str(p), "exec")
+          check = matches[0]
+          start = check.lineno - 1
+
+          # Find the preceding top-level `s=sel.read_text()` statement.
+          preceding = [
+              n for n in tree.body
+              if isinstance(n, ast.Assign)
+              and n.lineno < check.lineno
+              and any(
+                  isinstance(t, ast.Name) and t.id == "s"
+                  for t in n.targets
+              )
+              and isinstance(n.value, ast.Call)
+              and isinstance(n.value.func, ast.Attribute)
+              and n.value.func.attr == "read_text"
+              and isinstance(n.value.func.value, ast.Name)
+              and n.value.func.value.id == "sel"
+          ]
+
+          if len(preceding) != 1:
+              raise SystemExit(
+                  "Could not uniquely identify SELinux patch start."
+              )
+
+          start = preceding[0].lineno - 1
+
+          # Find the final sel.write_text(s) after the check.
+          following = [
+              n for n in tree.body
+              if isinstance(n, ast.Expr)
+              and n.lineno > check.end_lineno
+              and isinstance(n.value, ast.Call)
+              and isinstance(n.value.func, ast.Attribute)
+              and n.value.func.attr == "write_text"
+              and isinstance(n.value.func.value, ast.Name)
+              and n.value.func.value.id == "sel"
+          ]
+
+          if len(following) != 1:
+              raise SystemExit(
+                  "Could not uniquely identify SELinux patch end."
+              )
+
+          end = following[0].end_lineno
+
+          # Include an immediately following informational print, if present.
+          if end < len(lines) and "print('V64: changed'" in lines[end]:
+              end += 1
+
+          replacement = [
+              'print("V64: CP patch applied", cp, modem)\n',
+              'print("SELinux boot default controlled by kernel config")\n'
+          ]
+
+          updated = "".join(lines[:start] + replacement + lines[end:])
+          compile(updated, str(p), "exec")
+
+          if "SELinux boot default ambiguous" in updated:
+              raise SystemExit("Obsolete SELinux check remains.")
+
+          p.write_text(updated)
+          print("Obsolete SELinux source patch removed.")
           PY
 
       - name: Apply CP kernel patch
         shell: bash
         run: |
           set -euo pipefail
-
           python3 tools/apply_kernel.py
-
           git -C kernel diff --check
-
           git -C kernel diff > V64-applied-kernel.patch
-
           test -s V64-applied-kernel.patch
 
       - name: Build ARM64 kernel
         shell: bash
         run: |
           set -euo pipefail
-
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
@@ -140,10 +164,7 @@ jobs:
           export KCFLAGS=-Wno-error
 
           mkdir -p out
-
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            lineage_xcover4s_defconfig
+          make -C kernel O="$GITHUB_WORKSPACE/out" lineage_xcover4s_defconfig
 
           kernel/scripts/config --file out/.config \
             -e CP_PMUCAL \
@@ -153,45 +174,33 @@ jobs:
             -e SECURITY_SELINUX_BOOTPARAM \
             -d SECURITY_SELINUX_DISABLE
 
-          kernel/scripts/config \
-            --file out/.config \
+          kernel/scripts/config --file out/.config \
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            olddefconfig
+          make -C kernel O="$GITHUB_WORKSPACE/out" olddefconfig
 
           grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
           grep -qx 'CONFIG_OVERLAY_FS=y' out/.config
           grep -qx 'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' out/.config
 
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            -j2 Image 2>&1 | tee V64-build.log
+          make -C kernel O="$GITHUB_WORKSPACE/out" -j2 Image \
+            2>&1 | tee V64-build.log
 
           test -s out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image
 
       - name: Build custom ARM64 rootbroker and init wrapper
         shell: bash
         run: |
           set -euo pipefail
+          aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror \
+            -o tools/rootbroker.arm64 tools/rootbroker.c
 
-          aarch64-linux-gnu-gcc \
-            -static -Os -Wall -Wextra -Werror \
-            -o tools/rootbroker.arm64 \
-            tools/rootbroker.c
+          aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror \
+            -o tools/init-wrapper.arm64 tools/init-wrapper.c
 
-          aarch64-linux-gnu-gcc \
-            -static -Os -Wall -Wextra -Werror \
-            -o tools/init-wrapper.arm64 \
-            tools/init-wrapper.c
-
-          for elf in \
-            tools/rootbroker.arm64 \
-            tools/init-wrapper.arm64
-          do
+          for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
             readelf -h "$elf" | grep -q 'Machine:.*AArch64'
-
             if readelf -l "$elf" | grep -q INTERP; then
               echo "ERROR: dynamically linked binary: $elf"
               exit 1
@@ -202,65 +211,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python3 tools/repack_boot.py
-
           test -s deliver/boot.img
-
           test "$(stat -c %s deliver/boot.img)" = 37748736
 
       - name: Create Odin TAR and original restore
         shell: bash
         run: |
           set -euo pipefail
-
-          tar -C deliver \
-            --format=ustar \
-            -cf deliver/V64-EXPERIMENTAL-ODIN.tar \
-            boot.img
+          tar -C deliver --format=ustar \
+            -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
 
           mkdir -p restore
-
           cp boot-original.img restore/boot.img
-
-          tar -C restore \
-            --format=ustar \
-            -cf deliver/V64-ORIGINAL-RESTORE.tar \
-            boot.img
+          tar -C restore --format=ustar \
+            -cf deliver/V64-ORIGINAL-RESTORE.tar boot.img
 
           cp V64-build.log deliver/
           cp V64-applied-kernel.patch deliver/
           cp out/.config deliver/kernel-config.txt
 
-          sha256sum \
-            deliver/*.tar \
-            deliver/boot.img \
+          sha256sum deliver/*.tar deliver/boot.img \
             > deliver/V64-checksums.txt
 
           cat > deliver/IMPORTANT-READ-FIRST.txt <<'EOF'
           XCOVER4S V64 - EXPERIMENTAL
 
-          Device: Samsung Galaxy XCover 4s
-          Android: /e/OS Android 11
+          Custom rootbroker without KernelSU or Magisk.
+          Automatic root access intended, not yet tested.
+          CP manual latch intended, physical shutdown unverified.
+          SELinux permissive boot default requested, not runtime verified.
 
-          Custom rootbroker:
-          - No KernelSU
-          - No Magisk
-          - No per-app approval prompts intended
-
-          CP:
-          - Manual CP latch intended
-          - Kernel-level software protection
-          - Physical modem shutdown NOT verified
-
-          SELinux:
-          - Permissive boot default requested in kernel config
-          - Actual runtime state NOT verified
-
-          WARNING:
-          This build has NOT been boot-tested.
-          Odin packaging does not prove device compatibility.
-          A successful build does not prove modem shutdown.
+          This package has NOT been boot-tested.
           Do not flash without a verified recovery procedure.
           EOF
 
