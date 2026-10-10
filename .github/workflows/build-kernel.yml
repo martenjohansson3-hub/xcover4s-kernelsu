@@ -37,6 +37,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update -qq
+
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex git make clang lld \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
@@ -59,7 +60,7 @@ jobs:
           test "$(git -C kernel rev-parse HEAD)" = \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Repair V64 Python patch source
+      - name: Repair Python source and obsolete SELinux patch
         shell: bash
         run: |
           set -euo pipefail
@@ -67,80 +68,92 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
+          import ast
 
           p = Path("tools/apply_kernel.py")
-          s = p.read_text()
+          source = p.read_text()
 
-          # Remove the accidentally pasted standalone commit hash.
           commit = "6020dfa8315134187f07ca903c9d2ed7ee0256f5"
 
-          s, removed = re.subn(
+          source, removed = re.subn(
               r"(?m)^[ \t]*" + re.escape(commit) + r"[ \t]*(?:\n|$)",
               "",
-              s
+              source
           )
 
           print("Removed stray commit lines:", removed)
 
-          # Remove only the obsolete SELinux source patch.
-          if "SELinux boot default ambiguous" in s:
-              lines = s.splitlines(keepends=True)
+          # The original V64 script contains a SELinux source patch.
+          # Remove it only if its start and end can be identified
+          # unambiguously. SELinux is configured during kernel build.
+
+          if "SELinux boot default ambiguous" in source:
+              lines = source.splitlines(keepends=True)
 
               starts = [
                   i for i, line in enumerate(lines)
-                  if re.fullmatch(
-                      r"\s*s\s*=\s*sel\.read_text\(\)\s*",
-                      line.strip()
+                  if re.match(
+                      r"^\s*s\s*=\s*sel\.read_text\(\)\s*$",
+                      line
                   )
               ]
 
               ends = [
                   i for i, line in enumerate(lines)
-                  if re.fullmatch(
-                      r"\s*sel\.write_text\(s\)\s*",
-                      line.strip()
+                  if re.match(
+                      r"^\s*sel\.write_text\(s\)\s*$",
+                      line
                   )
               ]
 
               if len(starts) != 1 or len(ends) != 1:
                   raise SystemExit(
-                      "Cannot uniquely identify obsolete SELinux patch"
+                      "Cannot safely identify obsolete SELinux section. "
+                      "Source file requires manual review."
                   )
 
               start = starts[0]
               end = ends[0]
 
               if end <= start:
-                  raise SystemExit("Invalid SELinux patch boundaries")
+                  raise SystemExit("Invalid SELinux section boundaries")
 
               section = "".join(lines[start:end + 1])
 
               if "SELinux boot default ambiguous" not in section:
-                  raise SystemExit("Unexpected SELinux patch structure")
+                  raise SystemExit("Unexpected SELinux section")
 
               if end + 1 < len(lines):
                   if "print('V64: changed'" in lines[end + 1]:
                       end += 1
 
-              s = "".join(
-                  lines[:start]
-                  + [
-                      'print("V64 CP patch applied:", cp, modem)\n',
-                      'print("SELinux handled by kernel configuration")\n'
-                  ]
-                  + lines[end + 1:]
+              replacement = [
+                  'print("V64 CP patch applied:", cp, modem)\n',
+                  'print("SELinux controlled by kernel configuration")\n'
+              ]
+
+              source = "".join(
+                  lines[:start] + replacement + lines[end + 1:]
               )
 
-              print("Removed obsolete SELinux source patch.")
+              print("Removed obsolete SELinux source patch")
 
-          if "SELinux boot default ambiguous" in s:
-              raise SystemExit("Old SELinux patch still present")
+          if "SELinux boot default ambiguous" in source:
+              raise SystemExit("Obsolete SELinux patch remains")
 
-          compile(s, str(p), "exec")
-          p.write_text(s)
+          ast.parse(source, filename=str(p))
+          compile(source, str(p), "exec")
 
-          print("Python syntax OK")
+          if "v64_cp_read_enter" not in source:
+              raise SystemExit("Expected V64 CP latch code missing")
+
+          p.write_text(source)
+
+          print("Python syntax verified")
+          print("Repair complete")
           PY
+
+          python3 -m py_compile tools/apply_kernel.py
 
       - name: Apply CP kernel patch
         shell: bash
@@ -197,6 +210,7 @@ jobs:
             -j2 Image 2>&1 | tee V64-build.log
 
           test -s out/arch/arm64/boot/Image
+
           file out/arch/arm64/boot/Image
 
       - name: Build custom ARM64 rootbroker and init wrapper
@@ -215,15 +229,17 @@ jobs:
             tools/init-wrapper.c
 
           for elf in tools/rootbroker.arm64 tools/init-wrapper.arm64; do
+
             readelf -h "$elf" | grep -q 'Machine:.*AArch64'
 
             if readelf -l "$elf" | grep -q INTERP; then
               echo "ERROR: dynamically linked binary: $elf"
               exit 1
             fi
+
           done
 
-      - name: Repack Android boot image
+      - name: Repack original Android boot image
         shell: bash
         run: |
           set -euo pipefail
@@ -231,9 +247,10 @@ jobs:
           python3 tools/repack_boot.py
 
           test -s deliver/boot.img
+
           test "$(stat -c %s deliver/boot.img)" = 37748736
 
-      - name: Create Odin TAR and original restore
+      - name: Create experimental Odin TAR and restore
         shell: bash
         run: |
           set -euo pipefail
@@ -242,6 +259,7 @@ jobs:
             -cf deliver/V64-EXPERIMENTAL-ODIN.tar boot.img
 
           mkdir -p restore
+
           cp boot-original.img restore/boot.img
 
           tar -C restore --format=ustar \
@@ -258,18 +276,18 @@ jobs:
           XCOVER4S V64 - EXPERIMENTAL
 
           Device: Samsung Galaxy XCover 4s
-          OS: /e/OS Android 11
+          Operating system: /e/OS Android 11
 
           ROOT:
           Custom rootbroker
           No KernelSU
           No Magisk
           Automatic root access intended
-          Root functionality not hardware-tested
+          Root operation not tested on device
 
           CP:
           Manual CP latch intended
-          Physical modem shutdown not verified
+          Physical modem power-off not verified
           Permanent CP inhibition not verified
 
           SELINUX:
@@ -277,9 +295,9 @@ jobs:
           Runtime permissive state not verified
 
           WARNING:
-          This build has not been boot-tested.
-          Odin packaging does not guarantee successful flashing.
-          Do not flash without verified recovery readiness.
+          This package has not been boot-tested.
+          A successful build does not prove safe flashing.
+          Do not flash without a verified recovery procedure.
           EOF
 
           ls -lah deliver/
