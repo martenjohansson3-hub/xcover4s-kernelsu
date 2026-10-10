@@ -1,158 +1,275 @@
-#!/usr/bin/env python3
-"""V64 proof-of-build CP latch and SELinux boot default patch.
-Physical RF power loss and all firmware paths cannot be validated offline.
-"""
-from pathlib import Path
-import re
+name: XCOVER4S V64 - Experimental Odin boot with rootbroker and CP latch
 
-ROOT = Path('kernel')
-cp = ROOT/'drivers/soc/samsung/cal-if/pmucal_cp.c'
-modem = ROOT/'drivers/misc/modem_v1/modem_ctrl_ss310ap.c'
-sel = ROOT/'security/selinux/hooks.c'
+on:
+  workflow_dispatch:
 
-CP_PREAMBLE = r'''#include <linux/srcu.h>
-#include <linux/mutex.h>
-#include <linux/errno.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/kobject.h>
-#include <linux/sysfs.h>
+permissions:
+  contents: read
 
-/* V64: software latch protects listed Linux CP initialization/release paths.
- * This is NOT a physical RF kill switch or a guarantee against CP firmware. */
-static DEFINE_SRCU(v64_cp_srcu);
-static DEFINE_MUTEX(v64_cp_set_mutex);
-static int v64_cp_latched;
-static int v64_cp_result = -EAGAIN;
+jobs:
+  build-v64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 100
 
-int v64_cp_read_enter(void)
-{
-    int cookie = srcu_read_lock(&v64_cp_srcu);
-    if (READ_ONCE(v64_cp_latched)) {
-        srcu_read_unlock(&v64_cp_srcu, cookie);
-        return -EPERM;
-    }
-    return cookie;
-}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-void v64_cp_read_leave(int cookie)
-{
-    srcu_read_unlock(&v64_cp_srcu, cookie);
-}
+      - name: Extract and verify original boot image
+        shell: bash
+        run: |
+          set -euo pipefail
 
-static ssize_t v64_hard_off_lock_show(struct kobject *kobj,
-    struct kobj_attribute *attr, char *buf)
-{
-    return scnprintf(buf, PAGE_SIZE, "%d\n", READ_ONCE(v64_cp_latched));
-}
+          test -s boot-original-for-github.zip
+          unzip -o boot-original-for-github.zip -d .
 
-static ssize_t v64_hard_off_result_show(struct kobject *kobj,
-    struct kobj_attribute *attr, char *buf)
-{
-    return scnprintf(buf, PAGE_SIZE, "%d\n", READ_ONCE(v64_cp_result));
-}
+          test -s boot-original.img
+          test -s tools/rootbroker.c
+          test -s tools/init-wrapper.c
+          test -s tools/apply_kernel.py
+          test -s tools/repack_boot.py
 
-static ssize_t v64_hard_off_lock_store(struct kobject *kobj,
-    struct kobj_attribute *attr, const char *buf, size_t count)
-{
-    int ret;
-    if (count != 2 || buf[0] != '1' || buf[1] != '\n')
-        return -EINVAL;
-    mutex_lock(&v64_cp_set_mutex);
-    if (READ_ONCE(v64_cp_latched)) {
-        mutex_unlock(&v64_cp_set_mutex);
-        return -EPERM;
-    }
-    /* Latch first: reject new CP bring-up attempts and wait for in-flight calls. */
-    WRITE_ONCE(v64_cp_latched, 1);
-    synchronize_srcu(&v64_cp_srcu);
-    ret = pmucal_cp_reset_assert();
-    /* Never silently re-arm CP if reset assertion fails. */
-    WRITE_ONCE(v64_cp_result, ret);
-    mutex_unlock(&v64_cp_set_mutex);
-    return ret ? ret : count;
-}
+          echo 'f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  boot-original.img' | sha256sum -c -
 
-static struct kobj_attribute v64_lock_attr =
-    __ATTR(hard_off_lock, 0600, v64_hard_off_lock_show, v64_hard_off_lock_store);
-static struct kobj_attribute v64_result_attr =
-    __ATTR(hard_off_result, 0400, v64_hard_off_result_show, NULL);
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
 
-static int __init v64_cp_sysfs_init(void)
-{
-    struct kobject *kobj;
-    int ret;
-    kobj = kobject_create_and_add("cp_control", kernel_kobj);
-    if (!kobj)
-        return -ENOMEM;
-    ret = sysfs_create_file(kobj, &v64_lock_attr.attr);
-    if (!ret)
-        ret = sysfs_create_file(kobj, &v64_result_attr.attr);
-    if (ret)
-        kobject_put(kobj);
-    return ret;
-}
-late_initcall(v64_cp_sysfs_init);
+          sudo apt-get update -qq
 
-'''
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            git \
+            make \
+            clang \
+            lld \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libssl-dev \
+            libelf-dev \
+            python3 \
+            cpio \
+            gzip \
+            xz-utils
 
-def insert_after_function(src, func_name, wrapper):
-    rgx = re.compile(r'(?m)^((?:static\s+)?int\s+)'+re.escape(func_name)+r'(\s*\([^;]*?\)\s*\{)',re.S)
-    m = rgx.search(src)
-    if not m or len(list(rgx.finditer(src))) != 1:
-        raise RuntimeError(f'expected one {func_name} definition')
-    # Rename only the definition, preserving all nested body operations.
-    defn = src[m.start():m.end()].replace(func_name,'v64_original_'+func_name,1)
-    src=src[:m.start()]+defn+src[m.end():]
-    start=m.start()+len(defn)
-    # The Samsung source has preprocessor alternative branches whose C braces
-    # cannot be counted literally. Top-level closing braces begin in column 0.
-    end=re.search(r'(?m)^\}\s*$',src[start:])
-    if not end:
-        raise RuntimeError('could not find end of function '+func_name)
-    i=start+end.end()
-    return src[:i]+'\n\n'+wrapper+'\n'+src[i:]
+      - name: Download kernel source
+        shell: bash
+        run: |
+          set -euo pipefail
 
-def wrapped(name, param='void'):
-    args = '' if param == 'void' else 'mc'
-    return f'''int {name}({param})
-{{
-    int cookie;
-    int ret;
-    cookie = v64_cp_read_enter();
-    if (cookie < 0)
-        return cookie;
-    ret = v64_original_{name}({args});
-    v64_cp_read_leave(cookie);
-    return ret;
-}}'''
+          git clone \
+            --depth 1 \
+            --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
-s=cp.read_text()
-assert 'v64_cp_srcu' not in s
-# Original cp function exists before any sysfs registration; forward declare.
-preamble=CP_PREAMBLE.replace('/* V64:', 'extern int pmucal_cp_reset_assert(void);\n\n/* V64:',1)
-s=preamble+s
-for name in ('pmucal_cp_init','pmucal_cp_reset_release'):
-    s=insert_after_function(s,name,wrapped(name))
-for line in ('panic("cp reset assert fail");','panic("cp reset release fail");'):
-    if s.count(line)!=1:raise RuntimeError('unexpected reset panic site '+line)
-    s=s.replace(line,'/* V64: propagate CP failure to caller rather than panic. */')
-cp.write_text(s)
+          git -C kernel fetch --depth 1 origin \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-s=modem.read_text()
-assert 'v64_cp_read_enter' not in s
-s='''/* CP action guard for CONFIG_CP_PMUCAL=y (verified V62 config). */
-extern int v64_cp_read_enter(void);
-extern void v64_cp_read_leave(int cookie);
-''' + s
-for name in ('ss310ap_on','ss310ap_reset','ss310ap_boot_on','ss310ap_dump_start'):
-    s=insert_after_function(s,name,wrapped(name,'struct modem_ctl *mc').replace('int '+name+'(', 'static int '+name+'(',1))
-modem.write_text(s)
+          git -C kernel checkout --detach \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-s=sel.read_text()
-pattern=re.compile(r'(?m)^([ \t]*(?:static[ \t]+)?int[ \t]+selinux_enforcing[ \t]*=[ \t]*)1([ \t]*;)')
-matches=list(pattern.finditer(s))
-if len(matches)!=1:raise RuntimeError('SELinux boot default ambiguous; refusing to patch')
-s=pattern.sub(r'\g<1>0\g<2>',s,count=1)
-sel.write_text(s)
-print('V64: changed',cp,modem,sel)
+          test "$(git -C kernel rev-parse HEAD)" = \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
+      - name: Fix old SELinux patch in apply_kernel.py
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("tools/apply_kernel.py")
+          s = p.read_text()
+
+          old = """s=sel.read_text()
+          pattern=re.compile(r'(?m)^([ \\t]*(?:static[ \\t]+)?int[ \\t]+selinux_enforcing[ \\t]*=[ \\t]*)1([ \\t]*;)')
+          matches=list(pattern.finditer(s))
+          if len(matches)!=1:raise RuntimeError('SELinux boot default ambiguous; refusing to patch')
+          s=pattern.sub(r'\\g<1>0\\g<2>',s,count=1)
+          sel.write_text(s)
+          print('V64: changed',cp,modem,sel)"""
+
+          if old in s:
+              s = s.replace(
+                  old,
+                  'print("V64: CP patch applied", cp, modem)'
+              )
+              p.write_text(s)
+              print("Removed old SELinux source patch.")
+          elif "SELinux boot default ambiguous" in s:
+              raise SystemExit(
+                  "Unknown SELinux patch structure. "
+                  "Refusing automatic modification."
+              )
+          else:
+              print("Old SELinux patch already absent.")
+
+          compile(p.read_text(), str(p), "exec")
+          PY
+
+      - name: Apply CP kernel patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 tools/apply_kernel.py
+
+          git -C kernel diff --check
+
+          git -C kernel diff > V64-applied-kernel.patch
+
+          test -s V64-applied-kernel.patch
+
+      - name: Build ARM64 kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export LD=aarch64-linux-gnu-ld
+          export KCFLAGS=-Wno-error
+
+          mkdir -p out
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            lineage_xcover4s_defconfig
+
+          kernel/scripts/config --file out/.config \
+            -e CP_PMUCAL \
+            -e OVERLAY_FS \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_DEVELOP \
+            -e SECURITY_SELINUX_BOOTPARAM \
+            -d SECURITY_SELINUX_DISABLE
+
+          kernel/scripts/config \
+            --file out/.config \
+            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            olddefconfig
+
+          grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
+          grep -qx 'CONFIG_OVERLAY_FS=y' out/.config
+          grep -qx 'CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0' out/.config
+
+          make -C kernel \
+            O="$GITHUB_WORKSPACE/out" \
+            -j2 Image 2>&1 | tee V64-build.log
+
+          test -s out/arch/arm64/boot/Image
+
+      - name: Build custom ARM64 rootbroker and init wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aarch64-linux-gnu-gcc \
+            -static -Os -Wall -Wextra -Werror \
+            -o tools/rootbroker.arm64 \
+            tools/rootbroker.c
+
+          aarch64-linux-gnu-gcc \
+            -static -Os -Wall -Wextra -Werror \
+            -o tools/init-wrapper.arm64 \
+            tools/init-wrapper.c
+
+          for elf in \
+            tools/rootbroker.arm64 \
+            tools/init-wrapper.arm64
+          do
+            readelf -h "$elf" | grep -q 'Machine:.*AArch64'
+
+            if readelf -l "$elf" | grep -q INTERP; then
+              echo "ERROR: dynamically linked binary: $elf"
+              exit 1
+            fi
+          done
+
+      - name: Repack Android boot image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 tools/repack_boot.py
+
+          test -s deliver/boot.img
+
+          test "$(stat -c %s deliver/boot.img)" = 37748736
+
+      - name: Create Odin TAR and original restore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar -C deliver \
+            --format=ustar \
+            -cf deliver/V64-EXPERIMENTAL-ODIN.tar \
+            boot.img
+
+          mkdir -p restore
+
+          cp boot-original.img restore/boot.img
+
+          tar -C restore \
+            --format=ustar \
+            -cf deliver/V64-ORIGINAL-RESTORE.tar \
+            boot.img
+
+          cp V64-build.log deliver/
+          cp V64-applied-kernel.patch deliver/
+          cp out/.config deliver/kernel-config.txt
+
+          sha256sum \
+            deliver/*.tar \
+            deliver/boot.img \
+            > deliver/V64-checksums.txt
+
+          cat > deliver/IMPORTANT-READ-FIRST.txt <<'EOF'
+          XCOVER4S V64 - EXPERIMENTAL
+
+          Device: Samsung Galaxy XCover 4s
+          Android: /e/OS Android 11
+
+          Custom rootbroker:
+          - No KernelSU
+          - No Magisk
+          - No per-app approval prompts intended
+
+          CP:
+          - Manual CP latch intended
+          - Kernel-level software protection
+          - Physical modem shutdown NOT verified
+
+          SELinux:
+          - Permissive boot default requested in kernel config
+          - Actual runtime state NOT verified
+
+          WARNING:
+          This build has NOT been boot-tested.
+          Odin packaging does not prove device compatibility.
+          A successful build does not prove modem shutdown.
+          Do not flash without a verified recovery procedure.
+          EOF
+
+          ls -lah deliver/
+
+      - name: Upload V64 Odin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCOVER4S-V64-EXPERIMENTAL-FLASH-PACKAGE
+          path: deliver/
+          if-no-files-found: error
+          retention-days: 14
