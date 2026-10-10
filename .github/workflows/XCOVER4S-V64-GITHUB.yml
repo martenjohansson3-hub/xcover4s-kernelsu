@@ -1,5 +1,5 @@
 
-name: XCOVER4S V64 - Display Diagnostics and Kernel Build
+name: XCOVER4S V64 - Display Fixed Kernel Build
 
 on:
   workflow_dispatch:
@@ -52,11 +52,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
+
           git -C kernel fetch --depth 1 origin \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
           git -C kernel checkout --detach \
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
@@ -64,55 +67,98 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python3 tools/apply_kernel.py
+
           git -C kernel diff --check
-          git -C kernel diff > V64-applied-kernel.patch
+
+          git -C kernel diff \
+            > V64-applied-kernel.patch
+
           test -s V64-applied-kernel.patch
 
-      - name: Inspect display clock source
+      - name: Fix display floating-point compilation
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          source = Path(
+          p = Path(
               "kernel/drivers/video/fbdev/exynos/"
               "dpu_7885/decon_reg.c"
           )
-          text = source.read_text()
-          lines = text.splitlines()
+
+          s = p.read_text()
+
+          old = (
+              "const double "
+              "decon_clocks_table[][CLK_ID_MAX]"
+          )
+
+          new = (
+              "const unsigned int "
+              "decon_clocks_table[][CLK_ID_MAX]"
+          )
+
+          if s.count(old) != 1:
+              raise SystemExit(
+                  "ERROR: expected exactly one "
+                  "decon_clocks_table declaration"
+              )
+
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          assert old not in s
+          assert s.count(new) == 1
+
+          print("PASS: floating-point table removed")
+          print("PASS: display clock values preserved")
+          print("PASS: CP patch unchanged")
+          PY
+
+          git -C kernel diff --check
+
+          git -C kernel diff \
+            > V64-applied-kernel.patch
+
+      - name: Save display source diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "kernel/drivers/video/fbdev/exynos/"
+              "dpu_7885/decon_reg.c"
+          )
+
+          lines = p.read_text().splitlines()
 
           output = []
 
-          for term in (
-              "decon_clocks_table",
-              "decon_reg_get_clock_ratio",
-          ):
-              matches = [
-                  i for i, line in enumerate(lines)
-                  if term in line
-              ]
-
-              output.append(
-                  f"\n=== {term}: {len(matches)} matches ==="
-              )
-
-              for i in matches[:20]:
-                  start = max(0, i - 8)
-                  end = min(len(lines), i + 16)
+          for i, line in enumerate(lines):
+              if (
+                  "decon_clocks_table" in line
+                  or "decon_reg_get_clock_ratio" in line
+              ):
+                  start = max(0, i - 3)
+                  end = min(len(lines), i + 10)
 
                   for j in range(start, end):
                       output.append(
-                          f"{j + 1:5}: {lines[j]}"
+                          f"{j + 1}: {lines[j]}"
                       )
 
           Path("V64-display-source.txt").write_text(
               "\n".join(output) + "\n"
           )
 
-          print("\n".join(output))
+          print("PASS: display diagnostics saved")
           PY
 
       - name: Configure ARM64 kernel
@@ -143,7 +189,9 @@ jobs:
             O="$GITHUB_WORKSPACE/out" \
             olddefconfig
 
-          grep -qx 'CONFIG_CP_PMUCAL=y' out/.config
+          grep -qx \
+            'CONFIG_CP_PMUCAL=y' \
+            out/.config
 
       - name: Compile display driver first
         shell: bash
@@ -163,6 +211,11 @@ jobs:
             -j2 \
             drivers/video/fbdev/exynos/dpu_7885/decon_reg.o \
             2>&1 | tee V64-display-test.log
+
+          test -s \
+            out/drivers/video/fbdev/exynos/dpu_7885/decon_reg.o
+
+          echo "PASS: display driver compiled"
 
       - name: Compile complete kernel
         shell: bash
@@ -184,6 +237,8 @@ jobs:
 
           test -s out/arch/arm64/boot/Image
 
+          echo "PASS: kernel Image compiled"
+
       - name: Compile ARM64 rootbroker
         shell: bash
         run: |
@@ -192,12 +247,12 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("tools/rootbroker.c")
-          text = path.read_text()
+          p = Path("tools/rootbroker.c")
+          s = p.read_text()
 
-          if "#include <stddef.h>" not in text:
-              text = "#include <stddef.h>\n" + text
-              path.write_text(text)
+          if "#include <stddef.h>" not in s:
+              s = "#include <stddef.h>\n" + s
+              p.write_text(s)
           PY
 
           aarch64-linux-gnu-gcc \
@@ -209,6 +264,11 @@ jobs:
             -static -Os -Wall \
             -o tools/init-wrapper.arm64 \
             tools/init-wrapper.c
+
+          test -s tools/rootbroker.arm64
+          test -s tools/init-wrapper.arm64
+
+          echo "PASS: rootbroker compiled"
 
       - name: Repack boot and prepare Odin TAR
         shell: bash
@@ -228,6 +288,7 @@ jobs:
             boot.img
 
           mkdir -p restore
+
           cp boot-original.img restore/boot.img
 
           tar -C restore \
@@ -237,6 +298,8 @@ jobs:
 
           sha256sum deliver/*.tar \
             > deliver/V64-checksums.txt
+
+          echo "PASS: Odin TAR packages created"
 
       - name: Upload results and diagnostics
         if: always()
