@@ -1,4 +1,4 @@
-name: XCOVER4S V58 EARLY CP HARD OFF
+name: XCOVER4S V59 EARLY CP HARD OFF
 
 on:
   workflow_dispatch:
@@ -13,25 +13,34 @@ jobs:
 
     steps:
       - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
             git make bc bison flex \
             libssl-dev libelf-dev \
             clang lld gcc-aarch64-linux-gnu \
-            python3 zip
+            python3 zip gzip
 
-      - name: Download kernel
+      - name: Download kernel source
+        shell: bash
         run: |
           set -euo pipefail
+
           git clone --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
           cd kernel
-          git checkout 6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
-      - name: Restore V55 modem protection
+          git checkout \
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
+
+          git rev-parse HEAD > ../source-commit.txt
+
+      - name: Apply embedded V55 modem patch
         shell: bash
         run: |
           set -euo pipefail
@@ -39,7 +48,7 @@ jobs:
           cat > /tmp/v55.gz.b64 <<'PATCH'
           H4sIAAAAAAAC/+VY+2/iSBL+Gf6K2qxmZMCADYQhyWV32YSMIuWBMpm5udVJLWO3oTd+sG47w+4p//tVtRtiiMmEmeik0yLlYXd1
           VXV9Xz0aT/g+NJtTkYLT9hJxzxPZDoV022Hs8ZDd2/ofN00CJmXXtpx5y4XJDsJVEXl8AYNeZ9/ng87E81utSY9PDgYT27ZssC2r
-          3+tVm83mTj5UG43Gbn788gs0u1bXHECD/nQswDcydVLhgohS/BEpCx0RTOIFS/hUGjJNMjeFpbYA6qFbq0IVfvS4LyIOw3HnZMxO
+          3+tVm83mTj5UG43Gbn788gs0u1bXHECD/nQswDcydVLhgohS/BEpCx0RTOIFS/hUGjJNMjeFpbYA6qFbq0IVIFS/hUGjJNMjeFpbYA6qFbq0IV
           zt6z0+urUaXy6/mtYdXK1oenpzeVirWwe4OOhZ9q40fhoxScXF+dnb9nKDa+/HgyvKg2+CLlSQSTOA5gHmauEzB3zoRkse+zwEnd
           GfeM+1h4tSPUwiNP+NVGtXgSfWYWR9uO8J9n7AN+hA/GVtu1Gu0H/QmFz3iSGHuf9q1DOBkDioIWPYKE/87dVETT3AV8Rj+T9N/R
           Hnm/0uE2f5rP4ogzOgWHY/hwO7wdseuzs4vzq1FBMuFphsFpjsajm0v9/qEYhgoFAKWO8F99eBEzj98Ll0NdxN6RlsFzOejZPVkL
@@ -64,14 +73,16 @@ jobs:
           f1dRUmEYAAA=
           PATCH
 
-          base64 -d /tmp/v55.gz.b64 | gzip -d > /tmp/v55.patch
+          base64 -d /tmp/v55.gz.b64 \
+            | gzip -d > /tmp/v55.patch
 
           cd kernel
+
           git apply --check /tmp/v55.patch
           git apply /tmp/v55.patch
           git diff --check
 
-      - name: V58 early CP shutdown and permanent latch
+      - name: V59 early CP shutdown
         shell: bash
         run: |
           set -euo pipefail
@@ -85,7 +96,6 @@ jobs:
 
           s = p.read_text()
 
-          # V55 must already provide the CP-off mechanism.
           required = [
               'v46_cp_off_set',
               'v46_cp_off_latched',
@@ -96,101 +106,45 @@ jobs:
           for symbol in required:
               if symbol not in s:
                   raise SystemExit(
-                      'Missing V55 symbol: ' + symbol
+                      'Missing CP symbol: ' + symbol
                   )
-
-          if s.count('static int v46_cp_off_set(') != 2:
-              raise SystemExit(
-                  'Unexpected V55 CP-off function layout'
-              )
 
           if '#include <linux/init.h>' not in s:
               s = '#include <linux/init.h>\n' + s
 
-          # Request shutdown during kernel initialization.
-          # Latch is activated only if the existing V55
-          # status verification succeeds.
+          if 'v59_cp_off_init' in s:
+              raise SystemExit('V59 already applied')
+
           code = r'''
           /*
-           * XCOVER4S V58
-           * Automatic CP shutdown.
-           * Keep the V55 restart protection.
+           * XCOVER4S V59
+           * Automatic early CP shutdown.
+           *
+           * Existing V55 restart guards remain active.
            */
-          static int __init v58_cp_off_init(void)
+          static int __init v59_cp_off_init(void)
           {
               int ret;
 
-              pr_info("V58: requesting early CP shutdown\n");
+              pr_info("V59: early CP shutdown requested\n");
 
               ret = v46_cp_off_set("1", NULL);
 
-              if (ret) {
-                  pr_err(
-                      "V58: CP shutdown failed: %d\n",
-                      ret
-                  );
-              } else {
-                  pr_info(
-                      "V58: CP shutdown latched\n"
-                  );
-              }
+              if (ret)
+                  pr_err("V59: CP shutdown failed: %d\n", ret);
+              else
+                  pr_info("V59: CP-off latch active\n");
 
               return 0;
           }
 
-          late_initcall(v58_cp_off_init);
+          subsys_initcall(v59_cp_off_init);
           '''
-
-          if 'v58_cp_off_init' in s:
-              raise SystemExit(
-                  'V58 already applied'
-              )
 
           p.write_text(s + '\n' + code)
           PYCP
 
-      - name: V58 SELinux permissive at boot
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PYSEL'
-          from pathlib import Path
-          import re
-
-          p = Path(
-              'kernel/security/selinux/hooks.c'
-          )
-
-          s = p.read_text()
-
-          pattern = (
-              r'(?m)^(\s*(?:static\s+)?int\s+'
-              r'selinux_enforcing\s*=\s*)1(\s*;)'
-          )
-
-          matches = list(re.finditer(pattern, s))
-
-          if len(matches) != 1:
-              raise SystemExit(
-                  'SELinux default layout differs; '
-                  'cannot safely patch'
-              )
-
-          m = matches[0]
-
-          s = (
-              s[:m.start()]
-              + m.group(1)
-              + '0'
-              + m.group(2)
-              + s[m.end():]
-          )
-
-          p.write_text(s)
-          PYSEL
-
-      - name: Configure kernel
+      - name: V59 configure kernel and SELinux
         shell: bash
         run: |
           set -euo pipefail
@@ -206,23 +160,47 @@ jobs:
 
           make O=../out lineage_xcover4s_defconfig
 
-          scripts/config \
-            --file ../out/.config \
+          scripts/config --file ../out/.config \
             -e SECURITY_SELINUX \
             -e SECURITY_SELINUX_DEVELOP \
             -e SECURITY_SELINUX_BOOTPARAM \
-            -d SECURITY_SELINUX_DISABLE
-
-          scripts/config \
-            --file ../out/.config \
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make O=../out olddefconfig
 
-          grep CONFIG_SECURITY_SELINUX ../out/.config \
-            > ../selinux-config.txt || true
+          grep -q '^CONFIG_SECURITY_SELINUX=y$' \
+            ../out/.config
 
-      - name: Compile ARM64 kernel
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y$' \
+            ../out/.config
+
+          grep -q '^CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0$' \
+            ../out/.config
+
+          echo "V59: SELinux boot configuration verified"
+
+          grep CONFIG_SECURITY_SELINUX \
+            ../out/.config > ../selinux-config.txt
+
+      - name: Verify CP source modifications
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -q 'subsys_initcall(v59_cp_off_init)' \
+            kernel/drivers/soc/samsung/cal-if/pmucal_cp.c
+
+          grep -q 'v46_cp_off_latched' \
+            kernel/drivers/soc/samsung/cal-if/pmucal_cp.c
+
+          grep -q 'pmucal_cp_is_off_latched' \
+            kernel/drivers/misc/modem_v1/modem_ctrl_ss310ap.c
+
+          git -C kernel diff --check
+
+          echo "V59 CP source checks passed"
+
+      - name: Build ARM64 kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -238,14 +216,20 @@ jobs:
           make O=../out -j2 Image \
             2>&1 | tee ../build.log
 
-      - name: Collect V58 diagnostics
+          test -s ../out/arch/arm64/boot/Image
+
+          echo "V59 kernel Image built successfully"
+
+      - name: Collect diagnostics
         if: always()
         shell: bash
         run: |
           mkdir -p deliver
 
           cp build.log deliver/ 2>/dev/null || true
+          cp source-commit.txt deliver/ 2>/dev/null || true
           cp selinux-config.txt deliver/ 2>/dev/null || true
+
           cp out/.config deliver/kernel.config \
             2>/dev/null || true
 
@@ -254,32 +238,31 @@ jobs:
 
           if [ -d kernel/.git ]; then
             git -C kernel diff \
-              > deliver/v58.patch || true
-
-            git -C kernel rev-parse HEAD \
-              > deliver/source-commit.txt || true
+              > deliver/v59.patch || true
           fi
 
           cat > deliver/READ-ME.txt <<'EOF'
-          XCOVER4S V58
+          XCOVER4S V59
 
           CP:
-          Early automatic shutdown requested.
-          V55 latch and restart guards retained.
+          Automatic early CP shutdown requested.
+          V55 restart protection retained.
+          subsys_initcall used instead of late_initcall.
 
           SELINUX:
-          Boot-time permissive requested.
+          Boot permissive requested through kernel config.
+          Runtime state is not yet verified.
 
           IMPORTANT:
-          Kernel Image is not an Odin-flashable TAR.
-          Successful compilation does not prove CP RF-off.
-          Boot and hardware behavior remain unverified.
+          A successful build does not prove RF shutdown.
+          The Image is not an Odin-flashable boot image.
+          Original boot image and repacking are required.
           EOF
 
-      - name: Upload V58 artifact
+      - name: Upload V59 diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V58-DIAGNOSTICS
+          name: XCOVER4S-V59-DIAGNOSTICS
           path: deliver/
           retention-days: 14
