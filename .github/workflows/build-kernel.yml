@@ -1,4 +1,4 @@
-name: XCOVER4S V61 - Permissive and CP Controls
+name: XCOVER4S V61 - GNU Linker Fix
 
 on:
   workflow_dispatch:
@@ -17,8 +17,6 @@ jobs:
       CROSS_COMPILE: aarch64-linux-gnu-
       CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
       CLANG_TRIPLE: aarch64-linux-gnu-
-      LLVM: "1"
-      LLVM_IAS: "1"
       KCFLAGS: -Wno-error
 
     steps:
@@ -70,8 +68,6 @@ jobs:
 
           s = hooks.read_text()
 
-          # Kernel versions differ in where the initial
-          # enforcing state is declared.
           candidates = [
               (
                   r'(?m)^int selinux_enforcing\s*=\s*1\s*;',
@@ -98,7 +94,6 @@ jobs:
                   "SELinux enforcing variable not in hooks.c; "
                   "checking other source files"
               )
-
           else:
               hooks.write_text(s)
 
@@ -131,7 +126,6 @@ jobs:
                       + symbol
                   )
 
-          # Find actual modem-off definition.
           off_pattern = (
               r'static\s+int\s+ss310ap_off\s*'
               r'\(\s*struct\s+modem_ctl\s*\*\s*mc\s*\)'
@@ -143,19 +137,11 @@ jobs:
                   "Unexpected ss310ap_off definition"
               )
 
-          # Identify modem_ctl pointer.
           if "static struct modem_ctl *g_mc;" not in s:
               raise SystemExit(
                   "Global modem controller g_mc missing; "
                   "refusing unsafe CP patch"
               )
-
-          # Do not install a control that cannot
-          # actually operate on the modem.
-          #
-          # Power OFF uses Samsung's existing
-          # ss310ap_off function. With CP_PMUCAL
-          # this is not proof of physical power loss.
 
           insertion = r'''
           /* V61 root-controlled modem interface */
@@ -232,10 +218,6 @@ jobs:
               if (!sysfs_streq(buf, "assert"))
                   return -EINVAL;
 
-              /*
-               * Only assert CP reset.
-               * Never automatically release reset.
-               */
               ret = cal_cp_reset_assert();
 
               if (ret)
@@ -380,8 +362,6 @@ jobs:
 
           cd kernel
 
-          export ARCH=arm64
-
           make \
             O=out \
             ARCH=arm64 \
@@ -433,7 +413,7 @@ jobs:
 
           fi
 
-      - name: Build kernel using LLVM
+      - name: Build kernel with GNU linker
         run: |
           set -euo pipefail
 
@@ -444,22 +424,16 @@ jobs:
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export CLANG_TRIPLE=aarch64-linux-gnu-
 
-          # LLVM tools instead of GNU objdump.
-          export OBJDUMP=llvm-objdump
-          export OBJCOPY=llvm-objcopy
-          export NM=llvm-nm
-          export STRIP=llvm-strip
-
           make \
             O=out \
             ARCH=arm64 \
             CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
+            LD=aarch64-linux-gnu-ld \
+            AR=aarch64-linux-gnu-ar \
+            NM=aarch64-linux-gnu-nm \
+            OBJCOPY=aarch64-linux-gnu-objcopy \
+            OBJDUMP=aarch64-linux-gnu-objdump \
+            STRIP=aarch64-linux-gnu-strip \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             KCFLAGS=-Wno-error \
@@ -519,7 +493,7 @@ jobs:
           - Readable CP status
           - Software lock flag (not hardware enforced)
           - No automatic CP shutdown
-          - LLVM build tools
+          - GNU linker with Clang compilation
 
           Interface:
           /sys/kernel/cp_control/status
