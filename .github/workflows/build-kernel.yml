@@ -41,14 +41,13 @@ jobs:
 
           cd kernel
 
-          echo "=== KERNEL SOURCE ==="
-          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/kernel-commit.txt"
+          git rev-parse HEAD \
+            | tee "$GITHUB_WORKSPACE/kernel-commit.txt"
 
           test -f Makefile
           test -f Kconfig
           test -f arch/arm64/Makefile
 
-          echo "=== AVAILABLE XCover4s DEFCONFIGS ==="
           find arch/arm64/configs -maxdepth 2 -type f \
             | grep -i xcover \
             | tee "$GITHUB_WORKSPACE/defconfigs.txt"
@@ -61,30 +60,51 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          trap 'rc=$?; echo "::error::KernelSU setup failed at line $LINENO (exit $rc)"; exit "$rc"' ERR
-
-          echo "=== BEFORE SETUP ==="
-          pwd
-          git status --short
-          test -f Makefile
-          test -f Kconfig
-
-          echo "=== DOWNLOAD SETUP SCRIPT ==="
+          echo "=== RUN LEGACY SETUP ==="
           curl -fL --retry 3 \
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             -o /tmp/ksu-setup.sh
 
-          echo "=== RUN SETUP WITH TRACE ==="
           bash -x /tmp/ksu-setup.sh legacy 2>&1 \
             | tee "$GITHUB_WORKSPACE/kernelsu-setup.log"
 
-          echo "=== VERIFY INTEGRATION ==="
-          ls -la
-          test -d KernelSU
-          test -f KernelSU/kernel/Makefile
-          grep -n "KernelSU" Makefile Kconfig || true
+          echo "=== CHECK RESULTING PATHS ==="
+          for path in \
+            KernelSU \
+            KernelSU-Next \
+            drivers/kernelsu \
+            drivers/KernelSU
+          do
+            if [ -e "$path" ]; then
+              echo "FOUND: $path"
+              ls -ld "$path"
+            else
+              echo "MISSING: $path"
+            fi
+          done
 
-          echo "=== SETUP COMPLETE ==="
+          echo "=== CHECK KERNELSU REFERENCES ==="
+          grep -n -i 'kernelsu' \
+            Makefile Kconfig drivers/Kconfig \
+            2>/dev/null || true
+
+          find . -maxdepth 4 \
+            \( -iname '*kernelsu*' -o -iname '*ksu*' \) \
+            -print | head -200 \
+            | tee "$GITHUB_WORKSPACE/kernelsu-paths.txt"
+
+          echo "=== VERIFY REQUIRED SOURCE ==="
+          if [ ! -f drivers/kernelsu/Kconfig ]; then
+            echo "::error::drivers/kernelsu/Kconfig is missing"
+            exit 1
+          fi
+
+          if [ ! -f drivers/kernelsu/Makefile ]; then
+            echo "::error::drivers/kernelsu/Makefile is missing"
+            exit 1
+          fi
+
+          echo "=== INTEGRATION FILES FOUND ==="
 
       - name: Configure kernel
         working-directory: kernel
@@ -99,24 +119,28 @@ jobs:
 
           make O=out lineage_xcover4s_defconfig
 
-          echo "=== KERNELSU CONFIG OPTIONS ==="
+          echo "=== KERNELSU KCONFIG OPTIONS ==="
           grep -R -n \
-            'config KSU\|config KPROBES\|config KSU_KPROBE_HOOKS' \
-            KernelSU security Kconfig 2>/dev/null \
-            | head -100 || true
+            'config KSU\|config KPROBES\|config KPROBE_EVENTS' \
+            drivers/kernelsu KernelSU-Next \
+            2>/dev/null | head -100 || true
 
-          echo "=== ENABLE KERNELSU ==="
-          scripts/config --file out/.config --enable CONFIG_KSU
+          scripts/config --file out/.config \
+            --enable CONFIG_KSU
 
           make O=out olddefconfig
 
           cp out/.config "$GITHUB_WORKSPACE/kernel.config"
 
-          grep -E '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS)=' \
+          grep -E \
+            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS)=' \
             out/.config \
             | tee "$GITHUB_WORKSPACE/ksu-config.txt" || true
 
-          grep -q '^CONFIG_KSU=y$' out/.config
+          if ! grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "::error::CONFIG_KSU is not enabled"
+            exit 1
+          fi
 
       - name: Build kernel
         working-directory: kernel
@@ -142,13 +166,14 @@ jobs:
           sha256sum "$GITHUB_WORKSPACE/Image.gz-dtb" \
             | tee "$GITHUB_WORKSPACE/kernel.sha256"
 
-      - name: Upload build results
+      - name: Upload diagnostics and build
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: XCover4s-KernelSU-Next-Diagnostics
           path: |
             kernelsu-setup.log
+            kernelsu-paths.txt
             kernel-commit.txt
             defconfigs.txt
             kernel.config
