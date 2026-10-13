@@ -14,41 +14,23 @@ jobs:
 
     steps:
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential ca-certificates \
-            cpio curl flex git libssl-dev \
-            python3 python-is-python3 \
-            unzip wget xz-utils zip \
-            gcc-aarch64-linux-gnu
-
-      - name: Download Android Clang 11
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential \
+            clang-14 lld-14 llvm-14 \
+            cpio curl flex git libssl-dev \
+            python3 python-is-python3 \
+            unzip wget xz-utils zip \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
 
-          mkdir -p "$GITHUB_WORKSPACE/toolchain"
-          cd "$GITHUB_WORKSPACE/toolchain"
-
-          curl -fL --retry 3 \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r383902b/clang-r383902b.tar.gz" \
-            -o clang.tar.gz
-
-          mkdir clang
-          tar -xzf clang.tar.gz -C clang
-
-          CLANG="$(find "$PWD/clang" -type f \
-            -path '*/bin/clang' | head -n 1)"
-
-          test -n "$CLANG"
-          chmod +x "$CLANG"
-
-          "$CLANG" --version
-          echo "$(dirname "$CLANG")" \
-            >> "$GITHUB_PATH"
+          clang-14 --version
 
       - name: Checkout XCover4s kernel
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -58,7 +40,6 @@ jobs:
             kernel
 
           cd kernel
-
           test -f arch/arm64/configs/lineage_xcover4s_defconfig
 
           git rev-parse HEAD \
@@ -71,7 +52,7 @@ jobs:
           set -euo pipefail
 
           curl -fL --retry 3 \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             -o /tmp/ksu-setup.sh
 
           bash /tmp/ksu-setup.sh legacy
@@ -86,7 +67,7 @@ jobs:
           set -euo pipefail
 
           export ARCH=arm64
-          export CC=clang
+          export CC=clang-14
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
 
@@ -108,8 +89,7 @@ jobs:
           grep -q '^CONFIG_KSU=y$' out/.config
           grep -q '^CONFIG_KPROBES=y$' out/.config
 
-          cp out/.config \
-            "$GITHUB_WORKSPACE/kernel.config"
+          cp out/.config "$GITHUB_WORKSPACE/kernel.config"
 
       - name: Build kernel
         working-directory: kernel
@@ -118,7 +98,7 @@ jobs:
           set -euo pipefail
 
           export ARCH=arm64
-          export CC=clang
+          export CC=clang-14
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
 
@@ -136,15 +116,15 @@ jobs:
             | tee "$GITHUB_WORKSPACE/kernel.sha256"
 
       - name: Upload build results
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCover4s-KernelSU-Next-Legacy-BUILD-ONLY
+          name: XCover4s-KernelSU-Next-BUILD-ONLY
           path: |
             Image.gz-dtb
             kernel.config
             ksu-config.txt
             kernel-commit.txt
             kernel.sha256
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
