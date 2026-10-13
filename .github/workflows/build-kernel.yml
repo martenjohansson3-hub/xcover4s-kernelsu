@@ -1,4 +1,5 @@
-name: XCover4s SELinux-only kernel build
+
+name: XCover4s KernelSU-Next Legacy
 
 on:
   workflow_dispatch:
@@ -7,150 +8,143 @@ permissions:
   contents: read
 
 jobs:
-  kernel:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
-      - name: Dependencies
+      - name: Install build dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            git make bc bison flex build-essential \
-            clang lld gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev python3
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ca-certificates \
+            cpio curl flex git libssl-dev \
+            python3 python-is-python3 \
+            unzip wget xz-utils zip \
+            gcc-aarch64-linux-gnu
 
-      - name: Get pinned XCover4s kernel
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git kernel
-          git -C kernel fetch --depth 1 origin \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-          git -C kernel checkout --detach \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-          test "$(git -C kernel rev-parse HEAD)" = \
-            6020dfa8315134187f07ca903c9d2ed7ee0256f5
-
-      - name: Patch SELinux only
+      - name: Download Android Clang 11
+        shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
 
-          h = Path('kernel/security/selinux/hooks.c')
-          s = h.read_text()
+          mkdir -p "$GITHUB_WORKSPACE/toolchain"
+          cd "$GITHUB_WORKSPACE/toolchain"
 
-          initial = re.compile(
-              r'(?m)^(\s*int\s+selinux_enforcing\s*(?:__\w+\s*)?=\s*)[^;]+;'
-          )
-          matches = list(initial.finditer(s))
-          if len(matches) != 1:
-              raise SystemExit(
-                  f'Expected one selinux_enforcing definition, got {len(matches)}'
-              )
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r383902b/clang-r383902b.tar.gz" \
+            -o clang.tar.gz
 
-          s = initial.sub(
-              lambda m: m.group(1) + '0;',
-              s,
-              count=1
-          )
+          mkdir clang
+          tar -xzf clang.tar.gz -C clang
 
-          setup = re.search(
-              r'static\s+int\s+__init\s+enforcing_setup\s*\([^)]*\)\s*\{',
-              s
-          )
-          if not setup:
-              raise SystemExit('enforcing_setup missing')
+          CLANG="$(find "$PWD/clang" -type f \
+            -path '*/bin/clang' | head -n 1)"
 
-          start = setup.end()
-          end = s.find('\n}', start)
-          if end < 0 or end - start > 2000:
-              raise SystemExit('Cannot locate enforcing_setup end')
+          test -n "$CLANG"
+          chmod +x "$CLANG"
 
-          s = (
-              s[:start]
-              + '\n\tselinux_enforcing = 0;\n\treturn 1;'
-              + s[end:]
-          )
-          h.write_text(s)
+          "$CLANG" --version
+          echo "$(dirname "$CLANG")" \
+            >> "$GITHUB_PATH"
 
-          fs = Path('kernel/security/selinux/selinuxfs.c')
-          f = fs.read_text()
+      - name: Checkout XCover4s kernel
+        run: |
+          set -euo pipefail
 
-          match = re.search(
-              r'static\s+ssize_t\s+sel_write_enforce\s*\([^)]*\)\s*\{',
-              f
-          )
-          if not match:
-              raise SystemExit('sel_write_enforce not found')
+          git clone --depth=1 \
+            --branch lineage-18.1 \
+            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+            kernel
 
-          f = (
-              f[:match.end()]
-              + '\n\treturn -EPERM; /* Deny enforcement writes */\n'
-              + f[match.end():]
-          )
-          fs.write_text(f)
-          PY
+          cd kernel
 
-          git -C kernel diff --check
-          git -C kernel diff --name-only | tee changed-files.txt
+          test -f arch/arm64/configs/lineage_xcover4s_defconfig
 
-          test "$(wc -l < changed-files.txt)" -eq 2
-          grep -qx 'security/selinux/hooks.c' changed-files.txt
-          grep -qx 'security/selinux/selinuxfs.c' changed-files.txt
+          git rev-parse HEAD \
+            | tee "$GITHUB_WORKSPACE/kernel-commit.txt"
 
-          git -C kernel diff > selinux-only.patch
+      - name: Integrate KernelSU-Next Legacy
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Build ARM64 Image
+          curl -fL --retry 3 \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            -o /tmp/ksu-setup.sh
+
+          bash /tmp/ksu-setup.sh legacy
+
+          test -d KernelSU
+          test -f KernelSU/kernel/Makefile
+
+      - name: Configure kernel
+        working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
 
           export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
           export CC=clang
-          export LD=aarch64-linux-gnu-ld
-          export KCFLAGS=-Wno-error
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
 
-          mkdir -p out
+          make O=out lineage_xcover4s_defconfig
 
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            lineage_xcover4s_defconfig
+          scripts/config --file out/.config \
+            --enable CONFIG_KSU \
+            --enable CONFIG_KPROBES \
+            --enable CONFIG_KPROBE_EVENTS \
+            --enable CONFIG_KSU_KPROBE_HOOKS
 
-          kernel/scripts/config --file out/.config \
-            -e SECURITY_SELINUX \
-            -e SECURITY_SELINUX_DEVELOP \
-            -e SECURITY_SELINUX_BOOTPARAM \
-            -d SECURITY_SELINUX_DISABLE
+          make O=out olddefconfig
 
-          kernel/scripts/config \
-            --file out/.config \
-            --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
+          grep -E \
+            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS)=' \
+            out/.config \
+            | tee "$GITHUB_WORKSPACE/ksu-config.txt"
 
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            olddefconfig
+          grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_KPROBES=y$' out/.config
 
-          make -C kernel \
-            O="$GITHUB_WORKSPACE/out" \
-            -j2 Image 2>&1 | tee build.log
+          cp out/.config \
+            "$GITHUB_WORKSPACE/kernel.config"
 
-          test -s out/arch/arm64/boot/Image
+      - name: Build kernel
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload kernel and diagnostics
+          export ARCH=arm64
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make -j"$(nproc)" \
+            O=out \
+            KCFLAGS="-Wno-error" \
+            Image.gz-dtb
+
+          test -s out/arch/arm64/boot/Image.gz-dtb
+
+          cp out/arch/arm64/boot/Image.gz-dtb \
+            "$GITHUB_WORKSPACE/Image.gz-dtb"
+
+          sha256sum "$GITHUB_WORKSPACE/Image.gz-dtb" \
+            | tee "$GITHUB_WORKSPACE/kernel.sha256"
+
+      - name: Upload build results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-SELINUX-ONLY-IMAGE-AND-LOGS
+          name: XCover4s-KernelSU-Next-Legacy-BUILD-ONLY
           path: |
-            out/arch/arm64/boot/Image
-            out/.config
-            selinux-only.patch
-            changed-files.txt
-            build.log
+            Image.gz-dtb
+            kernel.config
+            ksu-config.txt
+            kernel-commit.txt
+            kernel.sha256
           if-no-files-found: warn
+          retention-days: 14
