@@ -1,184 +1,47 @@
 
-name: XCover4s KernelSU-Next Legacy
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
-    steps:
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential \
-            clang-14 lld-14 llvm-14 \
-            cpio curl flex git libssl-dev \
-            python3 python-is-python3 \
-            unzip wget xz-utils zip \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu
-
-          clang-14 --version
-
-      - name: Checkout XCover4s kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git clone --depth=1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
-            kernel
-
-          cd kernel
-
-          git rev-parse HEAD \
-            | tee "$GITHUB_WORKSPACE/kernel-commit.txt"
-
-          test -f Makefile
-          test -f Kconfig
-          test -f arch/arm64/Makefile
-
-          find arch/arm64/configs -maxdepth 2 -type f \
-            | grep -i xcover \
-            | tee "$GITHUB_WORKSPACE/defconfigs.txt"
-
-          test -f arch/arm64/configs/lineage_xcover4s_defconfig
-
-      - name: Integrate KernelSU-Next Legacy
+      - name: Diagnose KernelSU hooks
         working-directory: kernel
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          echo "=== RUN LEGACY SETUP ==="
-          curl -fL --retry 3 \
-            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
-            -o /tmp/ksu-setup.sh
+          echo "=== KERNEL COMMIT ==="
+          git rev-parse HEAD
 
-          bash -x /tmp/ksu-setup.sh legacy 2>&1 \
-            | tee "$GITHUB_WORKSPACE/kernelsu-setup.log"
+          echo "=== KERNELSU VERSION ==="
+          grep -n -E 'KernelSU-Next version|No hooks were defined' \
+            drivers/kernelsu/Kbuild
 
-          echo "=== CHECK RESULTING PATHS ==="
-          for path in \
-            KernelSU \
-            KernelSU-Next \
+          echo "=== HOOK DETECTION LOGIC ==="
+          sed -n '100,200p' drivers/kernelsu/Kbuild
+
+          echo "=== AVAILABLE KERNEL HOOKS ==="
+          grep -R -n -E \
+            'ksu_handle_(prctl|stat|sys_reboot|vfs_read|execveat|input)' \
+            fs kernel drivers include security \
+            --include='*.c' --include='*.h' \
+            | head -250 \
+            | tee "$GITHUB_WORKSPACE/kernel-hook-candidates.txt" || true
+
+          echo "=== KPROBE SUPPORT ==="
+          grep -E '^CONFIG_(KPROBES|KPROBE_EVENTS|KSU)=' out/.config || true
+
+          echo "=== KERNELSU HOOK REFERENCES ==="
+          grep -R -n -E \
+            'manual hooks|No hooks were defined|KSU.*HOOK|HOOKS' \
             drivers/kernelsu \
-            drivers/KernelSU
-          do
-            if [ -e "$path" ]; then
-              echo "FOUND: $path"
-              ls -ld "$path"
-            else
-              echo "MISSING: $path"
-            fi
-          done
+            --include='Kbuild' --include='Kconfig' \
+            --include='*.md' \
+            | head -200 \
+            | tee "$GITHUB_WORKSPACE/kernelsu-hook-requirements.txt" || true
 
-          echo "=== CHECK KERNELSU REFERENCES ==="
-          grep -n -i 'kernelsu' \
-            Makefile Kconfig drivers/Kconfig \
-            2>/dev/null || true
-
-          find . -maxdepth 4 \
-            \( -iname '*kernelsu*' -o -iname '*ksu*' \) \
-            -print | head -200 \
-            | tee "$GITHUB_WORKSPACE/kernelsu-paths.txt"
-
-          echo "=== VERIFY REQUIRED SOURCE ==="
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::drivers/kernelsu/Kconfig is missing"
-            exit 1
-          fi
-
-          if [ ! -f drivers/kernelsu/Makefile ]; then
-            echo "::error::drivers/kernelsu/Makefile is missing"
-            exit 1
-          fi
-
-          echo "=== INTEGRATION FILES FOUND ==="
-
-      - name: Configure kernel
-        working-directory: kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          export ARCH=arm64
-          export CC=clang-14
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make O=out lineage_xcover4s_defconfig
-
-          echo "=== KERNELSU KCONFIG OPTIONS ==="
-          grep -R -n \
-            'config KSU\|config KPROBES\|config KPROBE_EVENTS' \
-            drivers/kernelsu KernelSU-Next \
-            2>/dev/null | head -100 || true
-
-          scripts/config --file out/.config \
-            --enable CONFIG_KSU
-
-          make O=out olddefconfig
-
-          cp out/.config "$GITHUB_WORKSPACE/kernel.config"
-
-          grep -E \
-            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS)=' \
-            out/.config \
-            | tee "$GITHUB_WORKSPACE/ksu-config.txt" || true
-
-          if ! grep -q '^CONFIG_KSU=y$' out/.config; then
-            echo "::error::CONFIG_KSU is not enabled"
-            exit 1
-          fi
-
-      - name: Build kernel
-        working-directory: kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          export ARCH=arm64
-          export CC=clang-14
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make -j"$(nproc)" \
-            O=out \
-            KCFLAGS="-Wno-error" \
-            Image.gz-dtb
-
-          test -s out/arch/arm64/boot/Image.gz-dtb
-
-          cp out/arch/arm64/boot/Image.gz-dtb \
-            "$GITHUB_WORKSPACE/Image.gz-dtb"
-
-          sha256sum "$GITHUB_WORKSPACE/Image.gz-dtb" \
-            | tee "$GITHUB_WORKSPACE/kernel.sha256"
-
-      - name: Upload diagnostics and build
+      - name: Upload hook diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCover4s-KernelSU-Next-Diagnostics
+          name: XCover4s-KernelSU-Hook-Diagnostics
           path: |
-            kernelsu-setup.log
-            kernelsu-paths.txt
-            kernel-commit.txt
-            defconfigs.txt
-            kernel.config
-            ksu-config.txt
-            kernel.sha256
-            Image.gz-dtb
+            kernel-hook-candidates.txt
+            kernelsu-hook-requirements.txt
           if-no-files-found: warn
           retention-days: 14
