@@ -1,4 +1,4 @@
-name: XCOVER4S V65 SELINUX ONLY ODIN
+name: XCOVER4S V66 SELINUX ONLY ODIN
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,7 +22,9 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
+
           sudo apt-get update -qq
+
           sudo apt-get install -y \
             git make bc bison flex \
             build-essential clang llvm lld \
@@ -26,32 +32,24 @@ jobs:
             gcc-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu \
             libssl-dev libelf-dev \
-            python3 python3-pip cpio zip unzip
+            python3 cpio zip unzip
 
       - name: Reconstruct original boot image
         run: |
           set -euo pipefail
 
-          test -s boot.img.part1
-          test -s boot.img.part2
-
           cat boot.img.part1 boot.img.part2 > original-boot.img
-
-          echo "Original boot SHA256:"
-          sha256sum original-boot.img
 
           echo "f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9  original-boot.img" \
             | sha256sum -c -
 
           test "$(stat -c%s original-boot.img)" -eq 37748736
 
-      - name: Download original kernel source
+      - name: Download kernel source
         run: |
           set -euo pipefail
 
-          git clone \
-            --depth 1 \
-            --branch lineage-18.1 \
+          git clone --depth 1 --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
@@ -62,7 +60,7 @@ jobs:
             6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
           test "$(git -C kernel rev-parse HEAD)" = \
-            "6020dfa8315134187f07ca903c9d2ed7ee0256f5"
+            6020dfa8315134187f07ca903c9d2ed7ee0256f5
 
       - name: Patch SELinux only
         run: |
@@ -72,27 +70,24 @@ jobs:
           from pathlib import Path
           import re
 
-          root = Path("kernel")
-          hooks = root / "security/selinux/hooks.c"
-          fs = root / "security/selinux/selinuxfs.c"
-
+          hooks = Path("kernel/security/selinux/hooks.c")
           s = hooks.read_text()
 
-          # Inspect the actual SELinux enforcement implementation.
-          # Refuse to patch an unexpected source layout.
-          definitions = list(re.finditer(
-              r'(?m)^\s*int\s+selinux_enforcing\s*=\s*[^;]+;',
-              s
-          ))
+          pattern = (
+              r'(?m)^([ \t]*int[ \t]+selinux_enforcing'
+              r'[ \t]*=[ \t]*)[^;]+;'
+          )
 
-          if len(definitions) != 1:
+          matches = list(re.finditer(pattern, s))
+
+          if len(matches) != 1:
               raise SystemExit(
-                  "V65: unexpected selinux_enforcing definition"
+                  f"Unexpected SELinux enforcing definitions: {len(matches)}"
               )
 
           s = re.sub(
-              r'(?m)^(\s*int\s+selinux_enforcing\s*=\s*)[^;]+;',
-              r'\g<1>0;',
+              pattern,
+              lambda m: m.group(1) + "0;",
               s,
               count=1
           )
@@ -104,52 +99,45 @@ jobs:
           )
 
           if not setup:
-              raise SystemExit(
-                  "V65: enforcing_setup not found"
-              )
+              raise SystemExit("enforcing_setup not found")
 
           pos = setup.end()
+
           s = (
               s[:pos]
-              + "\n\tselinux_enforcing = 0;\n\treturn 1;\n"
+              + "\n\tselinux_enforcing = 0;\n"
+              + "\treturn 1;\n"
               + s[pos:]
           )
 
           hooks.write_text(s)
 
-          t = fs.read_text()
+          fs = Path("kernel/security/selinux/selinuxfs.c")
+          s = fs.read_text()
 
           match = re.search(
               r'static\s+ssize_t\s+sel_write_enforce'
               r'\s*\([^)]*\)\s*\{',
-              t
+              s
           )
 
           if not match:
-              raise SystemExit(
-                  "V65: sel_write_enforce not found"
-              )
+              raise SystemExit("sel_write_enforce not found")
 
           pos = match.end()
 
-          t = (
-              t[:pos]
-              + "\n\treturn -EPERM;\n"
-              + t[pos:]
-          )
+          s = s[:pos] + "\n\treturn -EPERM;\n" + s[pos:]
 
-          fs.write_text(t)
+          fs.write_text(s)
           PY
 
           git -C kernel diff --check
-          git -C kernel diff > selinux-v65.patch
-
-          echo "Changed source files:"
-          git -C kernel diff --name-only | tee changed-files.txt
+          git -C kernel diff > selinux.patch
+          git -C kernel diff --name-only > changed-files.txt
 
           test "$(wc -l < changed-files.txt)" -eq 2
-          grep -qx "security/selinux/hooks.c" changed-files.txt
-          grep -qx "security/selinux/selinuxfs.c" changed-files.txt
+          grep -qx 'security/selinux/hooks.c' changed-files.txt
+          grep -qx 'security/selinux/selinuxfs.c' changed-files.txt
 
       - name: Configure kernel
         run: |
@@ -171,31 +159,23 @@ jobs:
             -e SECURITY_SELINUX \
             -e SECURITY_SELINUX_DEVELOP \
             -e SECURITY_SELINUX_BOOTPARAM \
-            -d SECURITY_SELINUX_DISABLE
-
-          kernel/scripts/config --file out/.config \
             --set-val SECURITY_SELINUX_BOOTPARAM_VALUE 0
 
           make -C kernel \
             O="$GITHUB_WORKSPACE/out" \
             olddefconfig
 
-          grep -E \
-            'CONFIG_(SECURITY_SELINUX|ALWAYS_ENFORCE)' \
-            out/.config | tee selinux-config.txt
-
-          if grep -qx "CONFIG_ALWAYS_ENFORCE=y" out/.config; then
-            echo "ERROR: Samsung ALWAYS_ENFORCE is active"
+          if grep -qx 'CONFIG_ALWAYS_ENFORCE=y' out/.config; then
+            echo "ERROR: Samsung ALWAYS_ENFORCE enabled"
             exit 1
           fi
 
-          grep -qx \
-            "CONFIG_SECURITY_SELINUX_DEVELOP=y" \
+          grep -qx 'CONFIG_SECURITY_SELINUX_DEVELOP=y' \
             out/.config
 
       - name: Compile kernel
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
@@ -205,180 +185,212 @@ jobs:
           export LD=aarch64-linux-gnu-ld
           export KCFLAGS=-Wno-error
 
+          set +e
+
           make -C kernel \
             O="$GITHUB_WORKSPACE/out" \
-            -j2 Image 2>&1 | tee build.log
+            -j2 Image > build.log 2>&1
+
+          result=$?
+
+          set -e
+
+          tail -100 build.log
+
+          if [ "$result" -ne 0 ]; then
+            exit "$result"
+          fi
 
           test -s out/arch/arm64/boot/Image
 
-      - name: Repack original Android boot image
+      - name: Download Android boot image tools
         run: |
           set -euo pipefail
 
+          git clone --depth 1 \
+            https://github.com/aosp-mirror/platform_system_tools_mkbootimg.git \
+            boottools
+
+          test -f boottools/mkbootimg.py
+          test -f boottools/unpack_bootimg.py
+
+      - name: Repack Android boot header v1
+        run: |
+          set -euo pipefail
+
+          mkdir -p unpacked
+
+          python3 boottools/unpack_bootimg.py \
+            --boot_img original-boot.img \
+            --out unpacked \
+            --format mkbootimg \
+            > boot-arguments.txt
+
           python3 - <<'PY'
           from pathlib import Path
+          import subprocess
           import struct
-          import hashlib
+          import shlex
+          import sys
 
           original = Path("original-boot.img").read_bytes()
-          kernel = Path(
-              "out/arch/arm64/boot/Image"
-          ).read_bytes()
 
           if original[:8] != b"ANDROID!":
-              raise SystemExit("Not a standard Android boot image")
+              raise SystemExit("Invalid Android boot magic")
 
-          old_kernel_size = struct.unpack_from(
-              "<I", original, 8
-          )[0]
+          if len(original) != 37748736:
+              raise SystemExit("Unexpected original image size")
 
-          ramdisk_size = struct.unpack_from(
-              "<I", original, 16
-          )[0]
-
-          second_size = struct.unpack_from(
-              "<I", original, 24
-          )[0]
-
-          page_size = struct.unpack_from(
-              "<I", original, 36
-          )[0]
-
-          dt_size = struct.unpack_from(
+          header_version = struct.unpack_from(
               "<I", original, 40
           )[0]
 
-          if page_size not in (2048, 4096, 8192, 16384):
+          if header_version != 1:
               raise SystemExit(
-                  f"Unsupported boot page size: {page_size}"
+                  f"Expected Android boot header v1, got {header_version}"
               )
 
-          if not (10000000 < old_kernel_size < 40000000):
-              raise SystemExit("Unexpected original kernel size")
+          new_kernel = Path(
+              "out/arch/arm64/boot/Image"
+          ).resolve()
 
-          if not (10000000 < len(kernel) < 40000000):
-              raise SystemExit("Unexpected new kernel size")
+          if not new_kernel.is_file():
+              raise SystemExit("Compiled kernel missing")
 
-          def align(n):
-              return (n + page_size - 1) // page_size * page_size
+          raw = Path("boot-arguments.txt").read_text().strip()
+          args = shlex.split(raw)
 
-          # This packer supports legacy Android boot header v0.
-          # Reject v1/v2 instead of producing a misleading Odin file.
-          header_version = struct.unpack_from(
-              "<I", original, 44
+          if args and (
+              args[0].endswith("mkbootimg.py")
+              or args[0] == "mkbootimg"
+          ):
+              args.pop(0)
+
+          if "--kernel" not in args:
+              raise SystemExit("Missing kernel argument")
+
+          if "--header_version" not in args:
+              raise SystemExit("Missing header version argument")
+
+          idx = args.index("--header_version")
+
+          if args[idx + 1] != "1":
+              raise SystemExit("Incorrect unpacked header version")
+
+          idx = args.index("--kernel")
+          args[idx + 1] = str(new_kernel)
+
+          if "--output" in args:
+              idx = args.index("--output")
+              args[idx + 1] = "boot.img"
+          else:
+              args.extend(["--output", "boot.img"])
+
+          command = [
+              sys.executable,
+              "boottools/mkbootimg.py",
+              *args
+          ]
+
+          print("Repacking Android boot header v1")
+
+          subprocess.run(command, check=True)
+
+          result = Path("boot.img").read_bytes()
+
+          if result[:8] != b"ANDROID!":
+              raise SystemExit("Repacked image invalid")
+
+          version = struct.unpack_from(
+              "<I", result, 40
           )[0]
 
-          if header_version != 0:
-              raise SystemExit(
-                  "V65: boot header requires additional "
-                  "format-specific repacking verification"
-              )
+          if version != 1:
+              raise SystemExit("Repacked header version changed")
 
-          old_kernel_offset = page_size
-          ramdisk_offset = (
-              old_kernel_offset + align(old_kernel_size)
-          )
-
-          second_offset = (
-              ramdisk_offset + align(ramdisk_size)
-          )
-
-          dt_offset = (
-              second_offset + align(second_size)
-          )
-
-          end = dt_offset + align(dt_size)
-
-          if end > len(original):
-              raise SystemExit(
-                  "Original boot sections exceed file size"
-              )
-
-          ramdisk = original[
-              ramdisk_offset:ramdisk_offset + ramdisk_size
-          ]
-
-          second = original[
-              second_offset:second_offset + second_size
-          ]
-
-          dt = original[
-              dt_offset:dt_offset + dt_size
-          ]
-
-          trailer = original[end:]
-
-          if len(trailer) > 1048576:
-              raise SystemExit(
-                  "Unexpected trailing boot data; "
-                  "manual inspection required"
-              )
-
-          header = bytearray(original[:page_size])
-
-          struct.pack_into(
-              "<I", header, 8, len(kernel)
-          )
-
-          digest = hashlib.sha1()
-
-          for data in (kernel, ramdisk, second, dt):
-              digest.update(data)
-              digest.update(struct.pack("<I", len(data)))
-
-          header[576:596] = digest.digest()
-          header[596:608] = bytes(12)
-
-          output = bytearray(header)
-
-          for data in (kernel, ramdisk, second, dt):
-              output.extend(data)
-              output.extend(
-                  bytes(align(len(data)) - len(data))
-              )
-
-          output.extend(trailer)
-
-          Path("boot.img").write_bytes(output)
-
-          print("Original kernel:", old_kernel_size)
-          print("New kernel:", len(kernel))
-          print("Ramdisk preserved:", len(ramdisk))
-          print("Second preserved:", len(second))
-          print("Device tree preserved:", len(dt))
-          print("Trailing data preserved:", len(trailer))
-          print("Output size:", len(output))
-
-          assert Path("boot.img").read_bytes()[:8] == b"ANDROID!"
+          print("Repacked boot.img:", len(result), "bytes")
           PY
 
-      - name: Create Odin package
+      - name: Verify repacked boot sections
+        run: |
+          set -euo pipefail
+
+          mkdir -p verified-original verified-new
+
+          python3 boottools/unpack_bootimg.py \
+            --boot_img original-boot.img \
+            --out verified-original \
+            > original-header.txt
+
+          python3 boottools/unpack_bootimg.py \
+            --boot_img boot.img \
+            --out verified-new \
+            > new-header.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          old = Path("verified-original")
+          new = Path("verified-new")
+
+          for name in ("ramdisk", "second", "recovery_dtbo", "dtb"):
+              a = old / name
+              b = new / name
+
+              if a.exists() != b.exists():
+                  raise SystemExit(
+                      f"Boot section changed presence: {name}"
+                  )
+
+              if a.exists() and a.read_bytes() != b.read_bytes():
+                  raise SystemExit(
+                      f"Boot section changed contents: {name}"
+                  )
+
+          compiled = Path(
+              "out/arch/arm64/boot/Image"
+          ).read_bytes()
+
+          unpacked = (new / "kernel").read_bytes()
+
+          if unpacked != compiled:
+              raise SystemExit("Repacked kernel does not match build")
+
+          print("Kernel verified")
+          print("Ramdisk and other extracted sections preserved")
+          print("SHA256:", hashlib.sha256(
+              Path("boot.img").read_bytes()
+          ).hexdigest())
+          PY
+
+      - name: Create Odin TAR
         run: |
           set -euo pipefail
 
           test -s boot.img
 
-          tar --format=ustar -cf XCOVER4S-V65-ODIN.tar boot.img
+          tar --format=ustar \
+            -cf XCOVER4S-V66-ODIN.tar boot.img
 
-          tar -tf XCOVER4S-V65-ODIN.tar \
+          tar -tf XCOVER4S-V66-ODIN.tar \
             | grep -qx boot.img
 
           sha256sum \
             original-boot.img \
             boot.img \
-            XCOVER4S-V65-ODIN.tar \
+            XCOVER4S-V66-ODIN.tar \
             > checksums.txt
 
-          echo "ODIN PACKAGE CREATED"
-          ls -lh XCOVER4S-V65-ODIN.tar
+          ls -lh boot.img XCOVER4S-V66-ODIN.tar
 
       - name: Upload Odin package
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V65-ODIN
+          name: XCOVER4S-V66-ODIN
           path: |
-            XCOVER4S-V65-ODIN.tar
+            XCOVER4S-V66-ODIN.tar
             boot.img
             checksums.txt
           if-no-files-found: error
@@ -387,12 +399,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCOVER4S-V65-DIAGNOSTICS
+          name: XCOVER4S-V66-DIAGNOSTICS
           path: |
             build.log
-            selinux-v65.patch
+            selinux.patch
             changed-files.txt
-            selinux-config.txt
+            boot-arguments.txt
+            original-header.txt
+            new-header.txt
             out/.config
             checksums.txt
           if-no-files-found: warn
