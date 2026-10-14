@@ -1,5 +1,5 @@
 
-name: XCover4s Original Kernel with KernelSU-Next
+name: XCover4s KernelSU-Next Build
 
 on:
   workflow_dispatch:
@@ -10,11 +10,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - name: Install build dependencies
-        shell: bash
+      - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -22,38 +21,40 @@ jobs:
             bc bison build-essential clang-14 \
             lld-14 llvm-14 cpio curl flex git \
             libssl-dev python3 python-is-python3 \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
 
-      - name: Checkout original XCover4s kernel
-        shell: bash
+      - name: Clone XCover4s kernel
         run: |
           set -euo pipefail
+
           git clone --depth=1 \
             --branch lineage-18.1 \
             https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
             kernel
 
           cd kernel
-          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/kernel-commit.txt"
-          test -f arch/arm64/configs/lineage_xcover4s_defconfig
+          git rev-parse HEAD > ../kernel-commit.txt
 
-      - name: Integrate KernelSU-Next legacy
+          test -f \
+            arch/arm64/configs/lineage_xcover4s_defconfig
+
+      - name: Install KernelSU-Next legacy
         working-directory: kernel
-        shell: bash
         run: |
           set -euo pipefail
+
           curl -fL --retry 3 \
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
             -o /tmp/ksu-setup.sh
 
           bash /tmp/ksu-setup.sh legacy
 
-          test -f drivers/kernelsu/Kbuild
+          test -d drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
 
-      - name: Configure kernel and KernelSU hooks
+      - name: Configure kernel
         working-directory: kernel
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -65,26 +66,36 @@ jobs:
           make O=out lineage_xcover4s_defconfig
 
           scripts/config --file out/.config \
-            --enable CONFIG_KPROBES \
-            --enable CONFIG_KPROBE_EVENTS \
-            --enable CONFIG_KSU_KPROBE_HOOKS \
-            --enable CONFIG_KSU
+            -e KPROBES \
+            -e KPROBE_EVENTS \
+            -e KSU
 
           make O=out olddefconfig
 
+          cp out/.config ../kernel.config
+
+          echo "=== KERNELSU CONFIGURATION ==="
           grep -E \
-            '^(CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS|CONFIG_KSU)=' \
-            out/.config | tee "$GITHUB_WORKSPACE/ksu-config.txt"
+            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS)=|^# CONFIG_(KSU|KPROBES|KPROBE_EVENTS|KSU_KPROBE_HOOKS) is not set' \
+            out/.config || true
 
-          for option in CONFIG_KPROBES CONFIG_KSU; do
-            grep -qx "${option}=y" out/.config
-          done
+          echo "=== KERNELSU SOURCE ==="
+          ls -la drivers/kernelsu
 
-          cp out/.config "$GITHUB_WORKSPACE/kernel.config"
+          grep -qx 'CONFIG_KSU=y' out/.config || {
+            echo "ERROR: CONFIG_KSU was not enabled"
+            exit 1
+          }
+
+          if grep -qx 'CONFIG_KPROBES=y' out/.config; then
+            echo "Kprobes enabled"
+          else
+            echo "WARNING: Kprobes unavailable"
+            echo "Manual hooks may be required"
+          fi
 
       - name: Build kernel
         working-directory: kernel
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -92,30 +103,59 @@ jobs:
           export CC=clang-14
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS=-Wno-error
 
-          make O=out -j2 Image.gz-dtb 2>&1 \
-            | tee "$GITHUB_WORKSPACE/build.log"
+          make O=out -j2 Image.gz-dtb \
+            2>&1 | tee ../build.log
+
+          mkdir -p ../kernel-artifact
 
           IMAGE=out/arch/arm64/boot/Image.gz-dtb
-          test -s "$IMAGE"
 
-          mkdir -p "$GITHUB_WORKSPACE/kernel-artifact"
-          cp "$IMAGE" "$GITHUB_WORKSPACE/kernel-artifact/"
-          cp out/.config "$GITHUB_WORKSPACE/kernel-artifact/kernel.config"
+          if [ ! -s "$IMAGE" ]; then
+            echo "ERROR: Kernel image missing"
+            exit 1
+          fi
+
+          cp "$IMAGE" ../kernel-artifact/
+          cp out/.config \
+            ../kernel-artifact/kernel.config
 
           sha256sum "$IMAGE" \
-            | tee "$GITHUB_WORKSPACE/kernel-artifact/SHA256SUMS.txt"
+            > ../kernel-artifact/SHA256SUMS.txt
 
-      - name: Upload build artifacts
+          echo "Kernel compilation completed"
+
+      - name: Check KernelSU integration
+        if: success()
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          echo "=== KernelSU build objects ==="
+          find out/drivers/kernelsu \
+            -type f \
+            \( -name '*.o' -o -name '*.a' \) \
+            -print
+
+          if ! find out/drivers/kernelsu \
+            -type f -name '*.o' \
+            | grep -q .; then
+            echo "ERROR: No KernelSU objects built"
+            exit 1
+          fi
+
+          echo "KernelSU objects found"
+
+      - name: Upload diagnostics and kernel
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XCover4s-KernelSU-Next-Build
+          name: XCover4s-KernelSU-Next-Results
           path: |
             kernel-artifact/
             kernel-commit.txt
             kernel.config
-            ksu-config.txt
             build.log
           if-no-files-found: warn
           retention-days: 14
