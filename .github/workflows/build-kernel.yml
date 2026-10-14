@@ -1,161 +1,60 @@
 
-name: XCover4s KernelSU-Next Build
+name: XCover4s Automatic CP Reset
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
-          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential clang-14 \
-            lld-14 llvm-14 cpio curl flex git \
-            libssl-dev python3 python-is-python3 \
+            git make python3 clang llvm lld \
             gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu
+            binutils-aarch64-linux-gnu \
+            bc bison flex libssl-dev libelf-dev
 
-      - name: Clone XCover4s kernel
+      - name: Download XCover4s kernel
         run: |
-          set -euo pipefail
-
-          git clone --depth=1 \
-            --branch lineage-18.1 \
-            https://github.com/exynos7885-dev/kernel_samsung_exynos7885.git \
+          git clone --depth 1 \
+            https://github.com/AlexFurina/android_kernel_samsung_xcover4s.git \
             kernel
 
-          cd kernel
-          git rev-parse HEAD > ../kernel-commit.txt
-
-          test -f \
-            arch/arm64/configs/lineage_xcover4s_defconfig
-
-      - name: Install KernelSU-Next legacy
+      - name: Require CP reset and restart protection
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
 
-          curl -fL --retry 3 \
-            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
-            -o /tmp/ksu-setup.sh
+          echo "Checking Samsung CP functions"
 
-          bash /tmp/ksu-setup.sh legacy
+          grep -R -l \
+            'pmucal_cp_reset_assert' \
+            drivers/soc/samsung \
+            > /tmp/cp-reset-sources.txt
 
-          test -d drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig
+          cat /tmp/cp-reset-sources.txt
 
-      - name: Configure kernel
+          echo
+          echo "Automatic CP reset and restart protection"
+          echo "must be implemented before compilation."
+
+          echo "::error::CP lock implementation not yet integrated."
+          exit 1
+
+      - name: Compile kernel
+        if: success()
         working-directory: kernel
         run: |
-          set -euo pipefail
-
           export ARCH=arm64
-          export CC=clang-14
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-
-          make O=out lineage_xcover4s_defconfig
-
-          scripts/config --file out/.config \
-            -e KPROBES \
-            -e KPROBE_EVENTS \
-            -e KSU
-
-          make O=out olddefconfig
-
-          cp out/.config ../kernel.config
-
-          echo "=== KERNELSU CONFIGURATION ==="
-          grep -E \
-            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_KPROBE_HOOKS)=|^# CONFIG_(KSU|KPROBES|KPROBE_EVENTS|KSU_KPROBE_HOOKS) is not set' \
-            out/.config || true
-
-          echo "=== KERNELSU SOURCE ==="
-          ls -la drivers/kernelsu
-
-          grep -qx 'CONFIG_KSU=y' out/.config || {
-            echo "ERROR: CONFIG_KSU was not enabled"
-            exit 1
-          }
-
-          if grep -qx 'CONFIG_KPROBES=y' out/.config; then
-            echo "Kprobes enabled"
-          else
-            echo "WARNING: Kprobes unavailable"
-            echo "Manual hooks may be required"
-          fi
-
-      - name: Build kernel
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          export ARCH=arm64
-          export CC=clang-14
+          export CC=clang
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KCFLAGS=-Wno-error
 
-          make O=out -j2 Image.gz-dtb \
-            2>&1 | tee ../build.log
-
-          mkdir -p ../kernel-artifact
-
-          IMAGE=out/arch/arm64/boot/Image.gz-dtb
-
-          if [ ! -s "$IMAGE" ]; then
-            echo "ERROR: Kernel image missing"
-            exit 1
-          fi
-
-          cp "$IMAGE" ../kernel-artifact/
-          cp out/.config \
-            ../kernel-artifact/kernel.config
-
-          sha256sum "$IMAGE" \
-            > ../kernel-artifact/SHA256SUMS.txt
-
-          echo "Kernel compilation completed"
-
-      - name: Check KernelSU integration
-        if: success()
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          echo "=== KernelSU build objects ==="
-          find out/drivers/kernelsu \
-            -type f \
-            \( -name '*.o' -o -name '*.a' \) \
-            -print
-
-          if ! find out/drivers/kernelsu \
-            -type f -name '*.o' \
-            | grep -q .; then
-            echo "ERROR: No KernelSU objects built"
-            exit 1
-          fi
-
-          echo "KernelSU objects found"
-
-      - name: Upload diagnostics and kernel
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: XCover4s-KernelSU-Next-Results
-          path: |
-            kernel-artifact/
-            kernel-commit.txt
-            kernel.config
-            build.log
-          if-no-files-found: warn
-          retention-days: 14
+          make -j"$(nproc)" Image
