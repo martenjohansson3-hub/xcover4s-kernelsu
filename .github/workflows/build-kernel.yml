@@ -1,5 +1,4 @@
-
-name: XCover4s Automatic CP Reset
+name: XCover4s CP status boot.img
 
 on:
   workflow_dispatch:
@@ -7,54 +6,183 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - name: Install build dependencies
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git make python3 clang llvm lld \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev libelf-dev
+            bc bison flex make git python3 curl jq unzip zip xz-utils \
+            libssl-dev libelf-dev clang llvm lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
 
-      - name: Download XCover4s kernel
+      - name: Verify kernel source and original boot
+        shell: bash
         run: |
-          git clone --depth 1 \
-            https://github.com/AlexFurina/android_kernel_samsung_xcover4s.git \
-            kernel
+          set -euo pipefail
+          test -f drivers/soc/samsung/exynos-pmu.c
+          test -f boot.img
+          test -f arch/arm64/configs/lineage_xcover4s_defconfig
+          sha256sum boot.img
 
-      - name: Require CP reset and restart protection
-        working-directory: kernel
+      - name: Add read-only CP PMU status
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking Samsung CP functions"
+          python3 - <<'PY'
+          from pathlib import Path
 
-          grep -R -l \
-            'pmucal_cp_reset_assert' \
-            drivers/soc/samsung \
-            > /tmp/cp-reset-sources.txt
+          p = Path("drivers/soc/samsung/exynos-pmu.c")
+          s = p.read_text()
 
-          cat /tmp/cp-reset-sources.txt
+          assert "cp_hw_status_show" not in s
 
-          echo
-          echo "Automatic CP reset and restart protection"
-          echo "must be implemented before compilation."
+          anchor = "static struct regmap *pmureg;"
+          assert s.count(anchor) == 1
 
-          echo "::error::CP lock implementation not yet integrated."
-          exit 1
+          addition = r'''
+
+          #ifdef CONFIG_SOC_EXYNOS7885
+          static ssize_t cp_hw_status_show(
+                  struct device *dev,
+                  struct device_attribute *attr,
+                  char *buf)
+          {
+                  static const struct {
+                          const char *name;
+                          unsigned int offset;
+                  } regs[] = {
+                          { "CP_CTRL_NS", 0x0030 },
+                          { "CP_CTRL_S", 0x0034 },
+                          { "RESET_SEQUENCER_STATUS", 0x0504 },
+                          { "CENTRAL_SEQ_CP_STATUS", 0x0284 },
+                  };
+
+                  ssize_t len = 0;
+                  unsigned int val;
+                  int i, ret;
+
+                  if (IS_ERR_OR_NULL(pmureg))
+                          return -ENODEV;
+
+                  for (i = 0; i < ARRAY_SIZE(regs); i++) {
+                          ret = regmap_read(
+                                  pmureg,
+                                  regs[i].offset,
+                                  &val);
+
+                          if (ret)
+                                  return ret;
+
+                          len += scnprintf(
+                                  buf + len,
+                                  PAGE_SIZE - len,
+                                  "%s [PMU+0x%04x] = 0x%08x\n",
+                                  regs[i].name,
+                                  regs[i].offset,
+                                  val);
+                  }
+
+                  return len;
+          }
+
+          static DEVICE_ATTR_RO(cp_hw_status);
+          #endif
+          '''
+
+          s = s.replace(anchor, anchor + addition)
+
+          needle = "register_cpus_notifier(&exynos_pmu_cpus_nb);"
+          assert s.count(needle) == 1
+
+          s = s.replace(needle, needle + '''
+          #ifdef CONFIG_SOC_EXYNOS7885
+                  if (device_create_file(dev, &dev_attr_cp_hw_status))
+                          dev_warn(dev, "CP status file failed\\n");
+          #endif
+          ''')
+
+          p.write_text(s)
+          PY
+
+          git diff --check
 
       - name: Compile kernel
-        if: success()
-        working-directory: kernel
+        shell: bash
         run: |
+          set -euo pipefail
+
           export ARCH=arm64
           export CC=clang
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export KCFLAGS=-Wno-error
 
-          make -j"$(nproc)" Image
+          make O=out lineage_xcover4s_defconfig
+          make O=out -j"$(nproc)" Image
+
+          test -s out/arch/arm64/boot/Image
+
+      - name: Download boot image packer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL=$(curl -fsSL \
+            https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' \
+            | head -1)
+
+          test -n "$URL"
+
+          curl -fL "$URL" -o magisk.apk
+
+          unzip -p magisk.apk \
+            lib/x86_64/libmagiskboot.so > magiskboot
+
+          chmod +x magiskboot
+
+      - name: Repack boot.img
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p repack
+
+          cp boot.img repack/boot.img
+          cp magiskboot repack/magiskboot
+
+          cd repack
+
+          ./magiskboot unpack boot.img
+
+          test -s kernel
+
+          cp ../out/arch/arm64/boot/Image kernel
+
+          ./magiskboot repack boot.img boot-new.img
+
+          test -s boot-new.img
+
+          mv boot-new.img ../boot.img.new
+
+          cd ..
+
+          mv boot.img.new boot-CP-HW-STATUS.img
+
+          sha256sum boot-CP-HW-STATUS.img
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-img
+          path: boot-CP-HW-STATUS.img
+          if-no-files-found: error
