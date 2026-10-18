@@ -1,40 +1,88 @@
-name: XCover4s CP status boot.img
+name: XCover4s CP Hardware Status Boot
 
 on:
   workflow_dispatch:
+    inputs:
+      kernel_zip_url:
+        description: "Direct download URL for Exynos7885 kernel source ZIP"
+        required: true
+        type: string
+      original_boot_zip_url:
+        description: "Direct download URL for ZIP containing working original boot.img"
+        required: true
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install toolchain
+      - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison flex make git python3 curl jq unzip zip xz-utils \
-            libssl-dev libelf-dev clang llvm lld \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            bc bison flex build-essential \
+            libssl-dev libelf-dev \
+            python3 unzip zip curl \
+            clang llvm lld \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
             gcc-arm-linux-gnueabi
 
-      - name: Verify kernel source and original boot
-        shell: bash
+      - name: Download source and original boot
+        env:
+          KERNEL_URL: ${{ inputs.kernel_zip_url }}
+          BOOT_URL: ${{ inputs.original_boot_zip_url }}
         run: |
           set -euo pipefail
-          test -f drivers/soc/samsung/exynos-pmu.c
-          test -f boot.img
-          test -f arch/arm64/configs/lineage_xcover4s_defconfig
-          sha256sum boot.img
+
+          curl -fL --retry 3 "$KERNEL_URL" -o kernel.zip
+          curl -fL --retry 3 "$BOOT_URL" -o original-boot.zip
+
+          mkdir -p source original
+          unzip -q kernel.zip -d source
+          unzip -q original-boot.zip -d original
+
+          KERNEL_DIR=$(find source -type f \
+            -path '*/arch/arm64/configs/lineage_xcover4s_defconfig' \
+            -printf '%h\n' | head -1)
+
+          test -n "$KERNEL_DIR"
+
+          KERNEL_ROOT="${KERNEL_DIR%/arch/arm64/configs}"
+          test -f "$KERNEL_ROOT/Makefile"
+
+          mv "$KERNEL_ROOT" kernel
+
+          BOOT_FILE=$(find original -type f -name '*.img' | head -1)
+          test -n "$BOOT_FILE"
+
+          cp "$BOOT_FILE" original-boot.img
+
+          test "$(stat -c %s original-boot.img)" -eq 37748736
+
+          echo "Original boot SHA256:"
+          sha256sum original-boot.img
+
+      - name: Verify original boot identity
+        run: |
+          set -euo pipefail
+
+          EXPECTED="f94927e36475b2c6ba7b2c1925c3a5969d8d42b321ffc9309aa653cddc7a99e9"
+
+          ACTUAL=$(sha256sum original-boot.img | cut -d' ' -f1)
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: Original boot image does not match uploaded reference."
+            exit 1
+          fi
 
       - name: Add read-only CP PMU status
-        shell: bash
         run: |
           set -euo pipefail
+
+          cd kernel
 
           python3 - <<'PY'
           from pathlib import Path
@@ -42,13 +90,10 @@ jobs:
           p = Path("drivers/soc/samsung/exynos-pmu.c")
           s = p.read_text()
 
-          assert "cp_hw_status_show" not in s
-
           anchor = "static struct regmap *pmureg;"
-          assert s.count(anchor) == 1
+          assert s.count(anchor) == 1, "PMU anchor not found"
 
-          addition = r'''
-
+          code = r'''
           #ifdef CONFIG_SOC_EXYNOS7885
           static ssize_t cp_hw_status_show(
                   struct device *dev,
@@ -73,11 +118,7 @@ jobs:
                           return -ENODEV;
 
                   for (i = 0; i < ARRAY_SIZE(regs); i++) {
-                          ret = regmap_read(
-                                  pmureg,
-                                  regs[i].offset,
-                                  &val);
-
+                          ret = regmap_read(pmureg, regs[i].offset, &val);
                           if (ret)
                                   return ret;
 
@@ -97,92 +138,104 @@ jobs:
           #endif
           '''
 
-          s = s.replace(anchor, anchor + addition)
+          s = s.replace(anchor, anchor + "\n" + code)
 
-          needle = "register_cpus_notifier(&exynos_pmu_cpus_nb);"
-          assert s.count(needle) == 1
+          anchor2 = "register_cpus_notifier(&exynos_pmu_cpus_nb);"
+          assert s.count(anchor2) == 1, "Probe anchor not found"
 
-          s = s.replace(needle, needle + '''
+          s = s.replace(anchor2, anchor2 + '''
           #ifdef CONFIG_SOC_EXYNOS7885
                   if (device_create_file(dev, &dev_attr_cp_hw_status))
-                          dev_warn(dev, "CP status file failed\\n");
+                          dev_warn(dev, "CP status file unavailable\\n");
           #endif
           ''')
 
           p.write_text(s)
           PY
 
-          git diff --check
-
-      - name: Compile kernel
-        shell: bash
+      - name: Build XCover4s kernel
         run: |
           set -euo pipefail
+
+          cd kernel
 
           export ARCH=arm64
           export CC=clang
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          export KCFLAGS=-Wno-error
+          export KCFLAGS="-Wno-error"
 
           make O=out lineage_xcover4s_defconfig
-          make O=out -j"$(nproc)" Image
+
+          grep -q '^CONFIG_SOC_EXYNOS7885=y' out/.config
+          grep -q '^CONFIG_CP_PMUCAL=y' out/.config
+
+          make O=out -j"$(nproc)" Image dtbs
 
           test -s out/arch/arm64/boot/Image
 
-      - name: Download boot image packer
-        shell: bash
+      - name: Get boot image packer
         run: |
           set -euo pipefail
 
-          URL=$(curl -fsSL \
-            https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
-            | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' \
-            | head -1)
-
-          test -n "$URL"
-
-          curl -fL "$URL" -o magisk.apk
+          curl -fL --retry 3 \
+            https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v30.7.apk \
+            -o magisk.apk
 
           unzip -p magisk.apk \
             lib/x86_64/libmagiskboot.so > magiskboot
 
           chmod +x magiskboot
 
-      - name: Repack boot.img
-        shell: bash
+          ./magiskboot 2>&1 | head -20 || true
+
+      - name: Repack original boot image
         run: |
           set -euo pipefail
 
           mkdir -p repack
 
-          cp boot.img repack/boot.img
+          cp original-boot.img repack/original-boot.img
           cp magiskboot repack/magiskboot
 
           cd repack
+
+          ./magiskboot unpack original-boot.img
+
+          test -s kernel
+
+          cp ../kernel/out/arch/arm64/boot/Image kernel
+
+          ./magiskboot repack original-boot.img boot.img
+
+          test -s boot.img
+
+          echo "Generated boot image:"
+          ls -lh boot.img
+          sha256sum boot.img
+
+      - name: Verify boot image can be unpacked
+        run: |
+          set -euo pipefail
+
+          mkdir -p verify
+
+          cp repack/boot.img verify/boot.img
+          cp magiskboot verify/magiskboot
+
+          cd verify
 
           ./magiskboot unpack boot.img
 
           test -s kernel
 
-          cp ../out/arch/arm64/boot/Image kernel
-
-          ./magiskboot repack boot.img boot-new.img
-
-          test -s boot-new.img
-
-          mv boot-new.img ../boot.img.new
-
-          cd ..
-
-          mv boot.img.new boot-CP-HW-STATUS.img
-
-          sha256sum boot-CP-HW-STATUS.img
+          echo "Boot image structure verified."
 
       - name: Upload boot.img
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img
-          path: boot-CP-HW-STATUS.img
+          name: XCover4s-boot-img
+          path: repack/boot.img
           if-no-files-found: error
+          retention-days: 7
